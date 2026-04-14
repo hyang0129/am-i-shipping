@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
-import sys
 from pathlib import Path
 
 from config_loader import Config, load_config

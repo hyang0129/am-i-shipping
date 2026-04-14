@@ -16,7 +16,7 @@ import json
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
+from typing import List, Tuple, Union
 
 
 EXPECTED_COLLECTORS = ["session_parser", "github_poller", "appswitch_export"]
