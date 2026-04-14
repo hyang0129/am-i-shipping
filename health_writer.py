@@ -46,6 +46,12 @@ def write_health(
     health_path = data_dir / "health.json"
 
     # Read existing data (if any)
+    # TODO: This read-modify-write is not process-safe. If two collectors
+    #   call write_health concurrently (e.g. hook-triggered session_parser
+    #   overlapping with a nightly batch run), one update can be lost.
+    #   Add file locking (fcntl/msvcrt) when concurrent execution becomes
+    #   a real scenario. For now collectors run sequentially and a lost
+    #   health update is re-written on the next run.
     existing: dict = {}
     if health_path.exists():
         try:
