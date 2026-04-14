@@ -1,0 +1,45 @@
+# am-i-shipping configuration
+# All fields with defaults are optional; fields marked REQUIRED must be set.
+
+# -------------------------------------------------------------------
+# Session parser (Collector 1)
+# -------------------------------------------------------------------
+session:
+  # REQUIRED — path to Claude Code projects directory
+  # Typical: C:/Users/<you>/.claude/projects
+  projects_path: ""
+
+  # Minutes of inactivity before a new session is inferred (batch mode)
+  session_gap_minutes: 30
+
+  # Re-prompt threshold: consecutive human turns with equivalent intent
+  # that trigger the bail-out flag
+  reprompt_threshold: 3
+
+# -------------------------------------------------------------------
+# GitHub poller (Collector 2)
+# -------------------------------------------------------------------
+github:
+  # REQUIRED — list of repos to poll (owner/repo format)
+  repos: []
+
+  # Days of history to fetch on first run (backfill window)
+  backfill_days: 90
+
+# -------------------------------------------------------------------
+# App-switch logger (Collector 3)
+# -------------------------------------------------------------------
+appswitch:
+  # ActivityWatch REST API base URL
+  aw_endpoint: "http://localhost:5600"
+
+  # Polling interval in seconds for the bridge script
+  poll_interval_seconds: 30
+
+# -------------------------------------------------------------------
+# Storage
+# -------------------------------------------------------------------
+data:
+  # Directory for SQLite databases and health.json
+  # Relative paths are resolved from the repo root
+  data_dir: "data"
