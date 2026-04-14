@@ -43,14 +43,20 @@ class Config:
     github: GitHubConfig
     appswitch: AppSwitchConfig = field(default_factory=AppSwitchConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    _config_dir: Path = field(
+        default_factory=lambda: Path(__file__).resolve().parent, repr=False
+    )
 
     @property
     def data_path(self) -> Path:
-        """Return the resolved data directory as an absolute Path."""
+        """Return the resolved data directory as an absolute Path.
+
+        Relative paths are resolved from the directory that contained the
+        config.yaml file passed to ``load_config``.
+        """
         p = Path(self.data.data_dir)
         if not p.is_absolute():
-            # Resolve relative to the repo root (directory containing config.yaml)
-            p = Path(__file__).resolve().parent / p
+            p = self._config_dir / p
         return p
 
 
@@ -137,4 +143,5 @@ def load_config(config_path: str | Path | None = None) -> Config:
         github=github_cfg,
         appswitch=appswitch_cfg,
         data=data_cfg,
+        _config_dir=Path(config_path).resolve().parent,
     )
