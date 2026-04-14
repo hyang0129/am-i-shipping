@@ -4,6 +4,9 @@ __pycache__/
 .venv/
 *.egg-info/
 
+# User config (copy from config.yaml.example)
+config.yaml
+
 # Data (generated at runtime)
 data/
 logs/

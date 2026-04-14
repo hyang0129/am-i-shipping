@@ -55,9 +55,15 @@ Replace `<REPO_ROOT>` with the absolute path to this repository.
 
 ---
 
-## Step 3 — Edit config.yaml
+## Step 3 — Create config.yaml
 
-Open `config.yaml` in the repository root and fill in the required fields:
+Copy the example config and fill in the required fields:
+
+```bash
+cp config.yaml.example config.yaml
+```
+
+Open `config.yaml` and set the required values:
 
 ```yaml
 session:
@@ -71,7 +77,7 @@ github:
     - "your-org/another-repo"
 ```
 
-All other fields have sensible defaults. See the comments in `config.yaml` for optional settings.
+All other fields have sensible defaults. See the comments in `config.yaml.example` for optional settings.
 
 **Verify:** Run `python config_loader.py` (or `python -c "from config_loader import load_config; print(load_config())"`) — it should print the config object without errors.
 

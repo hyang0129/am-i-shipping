@@ -1,15 +1,10 @@
 """Tests for health_writer.py and health_check.py."""
 
 import json
-import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pytest
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 from health_writer import write_health
 from health_check import check_health
