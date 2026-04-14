@@ -6,6 +6,13 @@ All analysis is conducted under the idealized workflow paradigm defined in `idea
 
 ---
 
+## Goals
+
+1. **Accuracy** — 95%+ of sessions resolve all steps without deviation between user expectation and Claude's actual output. Accuracy is the floor; it must be maintained before velocity is optimized.
+2. **Velocity** — while maintaining accuracy, reduce reprompting and increase Claude autonomy. Fewer exchanges to reach the same outcome; more sessions where Claude executes the accepted plan without user intervention.
+
+---
+
 ## Workflow Reference
 
 The idealized workflow has three phases. Phase 0 is tool setup — CLAUDE.md current, hooks registered, environment correct — and is a standing precondition, not a session step. The design phase (steps 1–5) begins with the user stating intent, Claude disambiguating motivation by asking whether the user wants X because A or because B, the user confirming, Claude proposing a bounded plan, and the user accepting it. Time in the design phase is investment, not waste. The execution phase (steps 6–7) is Claude delivering against the accepted plan and the user reviewing against both the plan and the confirmed motivation. All deviations are user errors — something in Phase 0 or steps 1–5 that was missing, skipped, or accepted without verification. The only productive response to a gap between expected and actual output is to identify which precondition failed and change the user's behavior at that step. Full detail in `idealized-workflow.md`.

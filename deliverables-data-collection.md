@@ -92,14 +92,16 @@ INFRA ──► I-1 ──► I-2 ──► I-3 (entry point + docs, non-blockin
 **Complexity: S**
 
 **Artifacts:**
-- `collector/session_parser.py` — core parsing module (no DB, no hook); adapted from ccusage; extracts: turn count, tool call count, tool failure count, session duration, working directory, raw per-turn message list
+- `collector/session_parser.py` — core parsing module (no DB, no hook); adapted from ccusage; extracts: turn count, tool call count, tool failure count, session duration, working directory, git branch (from working dir via `git rev-parse --abbrev-ref HEAD`), raw per-turn message list, and `raw_content_json` (session JSON with `type: thinking`, `type: tool_use`, and `type: tool_result` blocks stripped — leaving only user and assistant text turns)
 - `tests/fixtures/sample_session.jsonl` — canonical test fixture (real or hand-crafted)
 - `tests/test_parser.py` — unit tests asserting exact field values against fixture
 
 **Acceptance criteria:**
 - [ ] `pytest tests/test_parser.py` passes with zero failures
-- [ ] Parser returns correct values for all six fields against the fixture
+- [ ] Parser returns correct values for all fields against the fixture, including `git_branch` and `raw_content_json`
+- [ ] `raw_content_json` contains no `type: thinking`, `type: tool_use`, or `type: tool_result` blocks; user and assistant text turns preserved verbatim
 - [ ] Parser raises a named exception (not a crash) on malformed/truncated JSONL
+- [ ] `git_branch` is `None` (not a crash) when working directory is not a git repo
 
 ---
 
@@ -126,8 +128,7 @@ INFRA ──► I-1 ──► I-2 ──► I-3 (entry point + docs, non-blockin
 - `session_parser.py` updated to wire `parse → reprompt → store` into a single `process_session(filepath)` call
 - `tests/test_store.py` — uses `:memory:` SQLite; asserts no duplicate on second upsert of same `session_uuid`
 
-**Full `SessionRecord` schema (contract for C1-3 onward):**
-`session_uuid`, `turn_count`, `tool_call_count`, `tool_failure_count`, `rephrase_count`, `session_duration_seconds`, `working_directory`, `bail_out`
+Schema is deferred to Phase 2. For now, the session record stores raw content and identity fields sufficient to locate and link the session. Exact column list TBD.
 
 **Acceptance criteria:**
 - [ ] Running `process_session(fixture)` twice produces exactly one row
@@ -178,12 +179,12 @@ INFRA ──► I-1 ──► I-2 ──► I-3 (entry point + docs, non-blockin
 
 **Artifacts:**
 - `collector/github_poller/gh_client.py` — thin `gh` subprocess wrapper; handles pagination, rate-limit backoff, JSON deserialization; raises typed exception on non-zero exit
-- `collector/github_poller/fetch_issues.py` — wraps `gh issue list`; returns normalized dicts: `number`, `title`, `type_label`, `created_at`, `closed_at`, `state`
-- `collector/github_poller/fetch_prs.py` — wraps `gh pr list`; returns: `number`, `created_at`, `merged_at`, `review_comment_count`, `head_ref`, `body`
+- `collector/github_poller/fetch_issues.py` — wraps `gh issue list` + `gh issue view` + `gh api` for comments; returns normalized dicts: `number`, `title`, `type_label`, `created_at`, `closed_at`, `state`, `body`, `comments` (list of `{author, body, created_at}`)
+- `collector/github_poller/fetch_prs.py` — wraps `gh pr list` + `gh pr view` + `gh api` for review comments; returns: `number`, `created_at`, `merged_at`, `review_comment_count`, `head_ref`, `body`, `review_comments` (list of `{author, body, created_at}`)
 - Unit tests using recorded fixture JSON (no live network calls)
 
 **Acceptance criteria:**
-- [ ] Given fixture JSON, both fetch modules return correct field types
+- [ ] Given fixture JSON, both fetch modules return correct field types including body and comments list
 - [ ] `gh_client` raises typed exception on non-zero exit code
 - [ ] All tests pass with zero live network calls
 
@@ -230,17 +231,23 @@ INFRA ──► I-1 ──► I-2 ──► I-3 (entry point + docs, non-blockin
 
 ---
 
-### C2-5 — Orchestrator + Health Write
+### C2-5 — Orchestrator + Session Linkage + Health Write
 **Complexity: L** | **Depends on: C2-4, I-2**
 
 **Artifacts:**
 - `collector/github_poller/run.py` — entry point; for each repo: reads cursor → fetches → resolves links → derives push counts → upserts → advances cursor; writes `last_success` to `health.json` only after all repos succeed
+- `collector/github_poller/session_linker.py` — after PR upsert, queries `sessions.db` for sessions where `git_branch = pr.head_ref` AND `working_directory` matches repo root; inserts matched pairs into `pr_sessions`; idempotent (`INSERT OR IGNORE`)
 - `--dry-run` flag: fetch and parse, skip writes
 - E2E integration test against one real repo
+
+**Note:** Session linkage requires `sessions.db` to exist and be populated (C1 track). In environments where C1 has not run, `session_linker.py` exits 0 with zero rows inserted. It does not block the poller.
 
 **Acceptance criteria:**
 - [ ] Full run produces correct row counts (verifiable against GitHub UI)
 - [ ] Re-run produces identical row count
+- [ ] `pr_sessions` contains correct entries for PRs whose `head_ref` matches a known session's `git_branch`
+- [ ] Running session linkage twice produces no duplicate rows
+- [ ] Session linker exits 0 with zero insertions when `sessions.db` is absent
 - [ ] `health.json` updated only when all repos succeed; prior `last_success` preserved on failure
 - [ ] `--dry-run` exits 0 with no DB writes
 

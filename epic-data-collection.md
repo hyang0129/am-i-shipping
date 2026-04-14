@@ -38,8 +38,22 @@ The collection layer must be:
 - Tool call count and failure count
 - Re-prompt count (same intent restated 3+ turns — requires turn-level analysis)
 - Session duration
-- Working directory (for session → issue correlation join)
+- Working directory
+- Git branch (captured from working directory at parse time — join key to PR)
 - Bail-out flag (high rephrase count + zero committed lines)
+- `raw_content_json` — session JSON with three block types stripped: `type: thinking`, `type: tool_use`, `type: tool_result`; stored as TEXT
+
+**What survives stripping:** user turn text and assistant turn text. Assistant turns are kept for context only — they make user turns interpretable (a one-word user response means something different after a disambiguation question than after a plan proposal). The system tracks user behavior, not Claude's. The deviations it measures are always user-driven:
+
+- Claude asked three bad disambiguation questions and the user gave up → the root cause is a missing or insufficient disambiguation skill in CLAUDE.md, not Claude's behavior. Fix: update CLAUDE.md.
+- Claude proposed an over-scoped plan and the user accepted it → the root cause is the user accepting without verifying fit. Fix: user behavior at Step 5.
+- Claude's tool calls failed → the root cause is the user's environment setup (Phase 0). Fix: session start checklist.
+
+Tool call content (what Claude looked up, what files it read) is Claude's execution trace. It is not the user's behavior. It does not belong in a store whose purpose is to feed a synthesis engine that asks "what did the user do or fail to do?"
+
+What the synthesis engine needs from session content: the user's turn text (what they said and how they said it) and the assistant's turn text (did Claude ask a disambiguation question, did it propose a plan). Tool use and thinking are noise for this purpose.
+
+Stripping thinking + tool_use + tool_result reduces session size substantially. Thinking alone runs 6–78% of file size per session. Tool content (read results, search output, code output) often exceeds thinking in long sessions. Storage cost after stripping: ~1–1.5 GB historical, ~1–5 MB/week ongoing.
 
 **Storage:** `data/sessions.db` (SQLite), primary key: `session_uuid`
 
@@ -52,13 +66,16 @@ The collection layer must be:
 **Prior art:** github/issue-metrics, simonw/claude-code-transcripts
 
 **Data to collect:**
-- Issues: number, title, type label, created_at, closed_at, state
-- PRs: number, linked issue, created_at, merged_at, review_comment_count, push_count (review cycles)
-- PR-to-issue linkage (via branch name or `closes #N` references)
+- Issues: number, title, type label, created_at, closed_at, state, body text, all comments (author, body, created_at) — issue text and comment thread are critical for tracking the state of the issue and for synthesis
+- PRs: number, head_ref (branch name), created_at, merged_at, review_comment_count, push_count (review cycles), body text, review comments (author, body, created_at)
+- PR→issue linkage (via branch name or `closes #N` references) — one PR may close multiple issues
+- PR→session linkage — join `pr.head_ref` to `session.git_branch` within matching working directory; multiple sessions may feed one PR
+
+**The PR is the unit of delivery.** Issues and sessions are foreign-keyed to PRs, not treated as parallel peers.
 
 **Cursor strategy:** Store `last_polled_at` per repo. First run: 90-day backfill. Subsequent runs: `updated:>last_polled_at` filter.
 
-**Storage:** `data/github.db` (SQLite), primary keys: `(repo, issue_number)` and `(repo, pr_number)`
+**Storage:** `data/github.db` (SQLite), primary keys: `(repo, issue_number)` and `(repo, pr_number)`. Linkage stored in `pr_issues` and `pr_sessions` join tables.
 
 ---
 
@@ -67,6 +84,10 @@ The collection layer must be:
 **Source:** Windows foreground window events
 **Trigger:** Always-on background process (ActivityWatch + PowerShell POST bridge)
 **Prior art:** ActivityWatch (cross-platform, local REST API, crash-resilient)
+
+**Primary use:** Classify sessions as co-coding (user present in IDE during Step 6) vs. issue→PR (user absent during Step 6). This changes how all other signals are interpreted — a high re-prompt count in a co-coding session has a different root cause than in an issue→PR session.
+
+**Secondary use:** Gap detection. Days with IDE/browser activity but no session records indicate the hook is likely unregistered. This distinguishes "collector failed" (health.json stale) from "user worked but nothing was captured."
 
 **Data to collect:**
 - Window title + application name
@@ -85,6 +106,8 @@ The collection layer must be:
 - **Synthesis export:** JSONL files (`data/sessions.jsonl`, `data/github.jsonl`, `data/appswitch.jsonl`) — written on-demand by synthesis engine, not by collectors
 - **Health tracking:** `data/health.json` — each collector writes `last_success` timestamp after every successful run
 - **Config:** `config.yaml` — repo list, GitHub token ref, session path, ActivityWatch endpoint
+
+Schema is intentionally deferred. Phase 1 stores raw collected data; schema is defined when Phase 2 synthesis requirements are known.
 
 ---
 
@@ -152,6 +175,8 @@ C2 is the longest track (only L-complexity stage is C2-5). Run C1 and C3 in para
 - Experiment loop
 - Any UI or dashboard
 - Cloud sync (config option reserved but not implemented)
+- **Design-phase signal detection (Steps 2–5)** — detecting whether Claude asked a disambiguation question, proposed a plan, or received a one-turn acceptance requires reading `raw_content_json`. This is Phase 2 synthesis work. Phase 1 stores the content; Phase 2 classifies it.
+- **CLAUDE.md staleness signal** — no collector captures whether the user is re-supplying project context each session that should be in CLAUDE.md. This signal is currently unaddressed.
 
 ---
 

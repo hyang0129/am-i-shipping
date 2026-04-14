@@ -27,8 +27,8 @@ Both modes are valid. Both are subject to the same failure modes. The preconditi
 Deviations almost always originate earlier than they appear. A failure visible in the execution phase (steps 6–7) is typically rooted in the design phase (steps 1–5). A failure in the design phase is often rooted in Phase 0. **Look for where the problem started, not where it surfaced.**
 
 ```
-Phase 0  →  Design Phase  →  Execution Phase
-(setup)       (steps 1–5)       (steps 6–7)
+Setup Phase  →  Design Phase  →  Execution Phase
+              (steps 1–5)       (steps 6–7)
 
 Cause                              Effect
 originates ───────────────────► surfaces here
@@ -45,7 +45,7 @@ Symptoms are downstream. Causes are upstream. Fixing the symptom without finding
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  PHASE 0  —  Tool Setup
+  SETUP PHASE
   Precondition for everything else.
   Failures here corrupt all downstream phases.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -62,11 +62,11 @@ Symptoms are downstream. Causes are upstream. Fixing the symptom without finding
        ↓
 2. Claude disambiguates motivation
        ↓
-3. User confirms motivation
+3. Motivation confirmed
        ↓
 4. Claude proposes plan
        ↓
-5. User accepts plan
+5. Plan confirmed
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   EXECUTION PHASE  (steps 6–7)
@@ -81,15 +81,35 @@ Symptoms are downstream. Causes are upstream. Fixing the symptom without finding
 
 ---
 
-### Phase 0 — Tool Setup
+### Setup Phase
 
-The environment must be correctly configured before any session begins. This includes: CLAUDE.md files present and current, Claude Code hooks registered, the relevant repo's venv active, `gh` CLI authenticated, and any project-specific tooling in place.
+The Setup Phase is the most important part of the workflow. Everything else depends on it. A well-executed Setup Phase is what allows Claude to confirm motivation, propose correct plans, and deliver without constant user intervention. A poor Setup Phase forces the user back into the loop at every step — supplying context verbally, correcting misaligned plans, catching errors that should have been impossible.
 
-Phase 0 is not a step the user takes during a session — it is a standing precondition. Its failures are silent: Claude proceeds without the context it needs, results degrade, and the diagnosis happens sessions later (if at all).
+The Setup Phase is not a step the user takes during a session. It is an ongoing investment in the conditions under which Claude operates. Its failures are silent: Claude proceeds without the context it needs, results degrade, and the diagnosis happens sessions later (if at all).
 
-**Healthy signal:** Session starts with Claude reading the correct CLAUDE.md. Tool calls succeed on first attempt. No time spent re-explaining project context that should have been in config.
+#### What the Setup Phase covers
 
-**Deviation — CLAUDE.md missing or stale:** The user did not maintain the project's context file. Claude operates without project-specific constraints and produces generic plans. The user has to supply context verbally each session that should be automatic. Fix: update CLAUDE.md before starting work in a repo.
+**Goals and intent model.** The most important thing to document is *what the project is trying to achieve and why*. Not just what the code does — what problem it solves, what good looks like, what trade-offs have already been made. When Claude understands the goals deeply, it can resolve ambiguous intents without asking. "Make this better" becomes actionable when Claude knows what better means in this repo.
+
+**Ambiguity resolution rules.** Every project has recurring forks — places where a request could reasonably go in two directions. Document how to resolve them. Which direction does this repo take when performance and readability conflict? When a fix could be minimal or structural, which is preferred? When a feature could be scoped narrowly or broadly, what's the default? These rules are what allow Claude to confirm motivation at Step 3 without asking.
+
+**Coding practices and patterns.** Document how the codebase is structured, what conventions are in use, and what patterns are preferred. This is what allows Claude to produce a correct plan at Step 4 without discretionary choices — the conventions resolve the plan.
+
+**Known weaknesses and recurring issues.** Document the areas of the codebase that have caused problems before, the failure modes that have surfaced, and the constraints that are easy to violate. This allows Claude to avoid them proactively rather than discovering them during delivery.
+
+**Environment and tooling.** CLAUDE.md files present and current, Claude Code hooks registered, the relevant repo's venv active, `gh` CLI authenticated, and any project-specific tooling in place. These are the mechanical preconditions — necessary but not sufficient.
+
+#### The leverage point
+
+The Setup Phase is where the user's investment has the highest return. One hour spent documenting goals and ambiguity resolution rules can eliminate user confirmation at Steps 3 and 5 across every future session. The alternative is paying that cost turn by turn, indefinitely.
+
+**Healthy signal:** Claude reads the correct CLAUDE.md at session start. Steps 3 and 5 resolve without user input. Tool calls succeed on first attempt. No time spent re-explaining context that should have been in config.
+
+**Deviation — Goals not documented:** CLAUDE.md describes the codebase mechanically but not what the project is trying to achieve. Claude cannot resolve motivational ambiguity and falls back to asking. Fix: add a goals section that explains what the project is for and what good outcomes look like.
+
+**Deviation — Ambiguity resolution rules missing:** Recurring forks are not documented. Claude asks the same clarifying questions across multiple sessions. Fix: each time the user has to answer a clarifying question, ask whether the answer belongs in CLAUDE.md so it doesn't need to be asked again.
+
+**Deviation — CLAUDE.md missing or stale:** The user did not create or maintain the project's context file. Claude operates without project-specific constraints and produces generic plans. Fix: update CLAUDE.md before starting work in a repo. Treat it as a living document — every session where context had to be supplied verbally is a signal that something is missing.
 
 **Deviation — Hook not registered:** The user did not register the Claude Code session hook. Session data is not captured. Fix: register the hook as documented in `setup.md`.
 
@@ -123,11 +143,15 @@ Format: *"Do you want X because A — or X because B?"*
 
 ---
 
-### Step 3 — User Confirms Motivation
+### Step 3 — Motivation Confirmed
 
-The user selects or states the actual reason behind the intent. This confirmation is the anchor for everything that follows.
+The motivation is confirmed — either by Claude selecting it from context, or by the user when Claude cannot. This confirmation is the anchor for everything that follows.
 
-**Healthy signal:** One short response. The user picks a branch or adds a brief clarification.
+**Claude confirms when:** the Setup Phase is sufficient for Claude to identify the correct motivation behind the intent. With complete setup, this should cover almost any intent that isn't completely vague — even something like "make this better" should be resolvable if the repo's goals, quality standards, and known weaknesses are correctly defined in the Setup Phase. Claude states the inferred motivation and proceeds.
+
+**User confirmation is required when:** the Setup Phase is insufficient for Claude to select the correct motivation with confidence. User confirmation is not a normal step — it is a signal that the Setup Phase is incomplete. The more often user confirmation is needed, the more the Setup Phase needs work.
+
+**Healthy signal:** Claude states the motivation and moves to Step 4 without asking. User confirmation should be rare.
 
 **Deviation — Confirmation is "both" or "neither":** The user had not resolved the ambiguity in their own thinking before the session began. Fix: stop the session, clarify the goal offline, restart with a cleaner prompt.
 
@@ -147,11 +171,15 @@ With confirmed motivation in hand, Claude proposes a specific, bounded plan. The
 
 ---
 
-### Step 5 — User Accepts Plan
+### Step 5 — Plan Confirmed
 
-The user reviews the proposed plan and accepts it as stated.
+The plan is confirmed — either by the user explicitly accepting it, or by Claude proceeding when the Setup Phase has predefined the correct approach with no discretionary decisions remaining.
 
-**Healthy signal:** One-turn acceptance. "Yes", "go ahead", "looks good."
+**User confirmation is required when:** the plan involves judgment calls not resolved by repo patterns, the scope has any ambiguity, or accuracy would be at risk if Claude proceeded without explicit sign-off. User confirmation here is the safeguard against executing a plan the user cannot evaluate.
+
+**Claude proceeds without explicit acceptance when:** the Setup Phase defined repo-specific coding practices and patterns that fully determine the plan, and no discretionary choices remain.
+
+**Healthy signal:** One-turn acceptance or a pattern-resolved proceed. "Yes", "go ahead", "looks good" — or Claude states the plan is fully determined by established conventions and begins delivery.
 
 **Deviation — User accepted a plan they don't fully understand:** No signal until Step 7 when the delivery surprises them. Fix: if any part of the plan is unclear, ask before accepting — not after seeing the result.
 
@@ -191,7 +219,7 @@ That gap is not fixed by reacting after Step 6. It is fixed by adjusting the pre
 
 When the gap appears, the question is never "why did Claude do that." It is always: **which precondition was missing or wrong?**
 
-- Phase 0 broken → Claude lacked context before the session started
+- Setup Phase broken → Claude lacked context before the session started
 - Step 1 underspecified → Claude engaged with the wrong problem
 - Step 2 skipped or wrong → motivation was assumed, not confirmed
 - Step 3 unresolved → the anchor for the plan was ambiguous
@@ -208,9 +236,9 @@ Steps 1–5 are the design phase. Time spent here is not a problem. What matters
 
 | Signal | Root phase | User behavior it reflects | Healthy value |
 |--------|-----------|--------------------------|---------------|
-| Missing session data | Phase 0 | Hook not registered | 0 gaps |
-| Tool call failure rate | Phase 0 or Step 6 | Environment not set up correctly | 0 per session |
-| User re-supplying context each session | Phase 0 | CLAUDE.md not maintained | 0 per session |
+| Missing session data | Setup Phase | Hook not registered | 0 gaps |
+| Tool call failure rate | Setup Phase or Step 6 | Environment not set up correctly | 0 per session |
+| User re-supplying context each session | Setup Phase | CLAUDE.md not maintained | 0 per session |
 | Re-prompt count | Design (1–2) | User repeated rather than added context | 0 per session |
 | Bail-out sessions | Design (1–3) | User's motivation was unresolved at session start | 0 per week |
 | Push count on PR | Execution (6–7), root in Design | User accepted a plan without verifying fit | 0–1 post-review |
