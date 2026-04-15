@@ -90,13 +90,16 @@ def _strip_content_blocks(content: Any) -> Any:
     return content
 
 
-def parse_session(filepath: str | Path) -> SessionRecord:
+def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
     """Parse a Claude Code JSONL session file into a SessionRecord.
 
     Parameters
     ----------
     filepath:
         Path to the .jsonl session file.
+    threshold:
+        Reprompt count at or above which ``bail_out`` is set to True.
+        Defaults to 3.
 
     Returns
     -------
@@ -222,11 +225,8 @@ def parse_session(filepath: str | Path) -> SessionRecord:
         duration = (timestamps[-1] - timestamps[0]).total_seconds()
 
     # Detect reprompts
-    from am_i_shipping.config_loader import SessionConfig
-
-    default_threshold = SessionConfig.reprompt_threshold
     reprompt_count, bail_out = detect_reprompts(
-        messages, threshold=default_threshold
+        messages, threshold=threshold
     )
 
     raw_content_json = json.dumps(raw_content_turns, ensure_ascii=False)
@@ -255,25 +255,7 @@ def process_session(
 
     Returns the session_uuid.
     """
-    record = parse_session(filepath)
-    # Re-detect with explicit threshold if different from default
-    if threshold != 3:
-        reprompt_count, bail_out = detect_reprompts(
-            _load_messages(filepath), threshold=threshold
-        )
-        record = SessionRecord(
-            session_uuid=record.session_uuid,
-            turn_count=record.turn_count,
-            tool_call_count=record.tool_call_count,
-            tool_failure_count=record.tool_failure_count,
-            reprompt_count=reprompt_count,
-            bail_out=bail_out,
-            session_duration_seconds=record.session_duration_seconds,
-            working_directory=record.working_directory,
-            git_branch=record.git_branch,
-            raw_content_json=record.raw_content_json,
-        )
-
+    record = parse_session(filepath, threshold=threshold)
     upsert_session(record, db_path=db_path, data_dir=data_dir)
     return record.session_uuid
 
