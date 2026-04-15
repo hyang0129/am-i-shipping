@@ -117,6 +117,50 @@ class TestParseSession:
         assert "Please fix the bug in main.py" in texts
         assert "Thanks, looks good!" in texts
 
+    def test_input_tokens(self):
+        """Sum of input_tokens across all assistant messages: 100+200+300+400+150=1150."""
+        record = parse_session(SAMPLE)
+        assert record.input_tokens == 1150
+
+    def test_output_tokens(self):
+        """Sum of output_tokens across all assistant messages: 50+80+20+100+30=280."""
+        record = parse_session(SAMPLE)
+        assert record.output_tokens == 280
+
+    def test_cache_creation_tokens(self):
+        """Only a2 has cache_creation_input_tokens=100."""
+        record = parse_session(SAMPLE)
+        assert record.cache_creation_tokens == 100
+
+    def test_cache_read_tokens(self):
+        """a3=100, a4=200, a5=300 → total 600."""
+        record = parse_session(SAMPLE)
+        assert record.cache_read_tokens == 600
+
+    def test_fast_mode_turns(self):
+        """a2 and a4 have speed='fast' → 2 fast turns."""
+        record = parse_session(SAMPLE)
+        assert record.fast_mode_turns == 2
+
+    def test_tokens_zero_when_no_usage(self, tmp_path):
+        """Sessions without usage fields default to zero tokens."""
+        session_file = tmp_path / "no_usage.jsonl"
+        lines = [
+            json.dumps({"type": "user", "message": {"role": "user", "content": "hi"},
+                        "uuid": "x1", "timestamp": "2026-01-01T00:00:00.000Z",
+                        "sessionId": "no-usage-session"}),
+            json.dumps({"type": "assistant", "message": {"role": "assistant", "content": "hello"},
+                        "uuid": "x2", "timestamp": "2026-01-01T00:00:01.000Z",
+                        "sessionId": "no-usage-session"}),
+        ]
+        session_file.write_text("\n".join(lines) + "\n")
+        record = parse_session(session_file)
+        assert record.input_tokens == 0
+        assert record.output_tokens == 0
+        assert record.cache_creation_tokens == 0
+        assert record.cache_read_tokens == 0
+        assert record.fast_mode_turns == 0
+
     def test_record_is_dataclass(self):
         record = parse_session(SAMPLE)
         assert isinstance(record, SessionRecord)

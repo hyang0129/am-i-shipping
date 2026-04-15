@@ -45,6 +45,11 @@ class SessionRecord:
     working_directory: Optional[str]
     git_branch: Optional[str]
     raw_content_json: str
+    input_tokens: int
+    output_tokens: int
+    cache_creation_tokens: int
+    cache_read_tokens: int
+    fast_mode_turns: int
 
 
 def _git_branch_from_dir(cwd: str) -> Optional[str]:
@@ -123,6 +128,11 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
     tool_failure_count = 0
     turn_count = 0
     raw_content_turns: List[Dict[str, Any]] = []
+    input_tokens = 0
+    output_tokens = 0
+    cache_creation_tokens = 0
+    cache_read_tokens = 0
+    fast_mode_turns = 0
 
     try:
         with open(filepath, "r", encoding="utf-8") as f:
@@ -198,6 +208,17 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
                             if block.get("is_error"):
                                 tool_failure_count += 1
 
+                # Accumulate token usage from assistant messages
+                if entry_type == "assistant":
+                    usage = msg.get("usage", {})
+                    if usage:
+                        input_tokens += usage.get("input_tokens", 0) or 0
+                        output_tokens += usage.get("output_tokens", 0) or 0
+                        cache_creation_tokens += usage.get("cache_creation_input_tokens", 0) or 0
+                        cache_read_tokens += usage.get("cache_read_input_tokens", 0) or 0
+                        if usage.get("speed") == "fast":
+                            fast_mode_turns += 1
+
                 # Build per-turn message list for reprompt detection
                 messages.append({"role": role, "content": content})
 
@@ -241,6 +262,11 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
         working_directory=working_directory,
         git_branch=git_branch,
         raw_content_json=raw_content_json,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+        cache_read_tokens=cache_read_tokens,
+        fast_mode_turns=fast_mode_turns,
     )
 
 

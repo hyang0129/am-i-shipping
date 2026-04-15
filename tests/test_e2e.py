@@ -81,25 +81,31 @@ class TestE2ESmoke:
         conn.close()
         assert count > 0, "Batch mode should have processed at least one session"
 
-    def test_rerun_batch_zero_new_rows(self, tmp_path):
-        """Re-running batch mode produces zero new rows."""
+    def test_rerun_batch_no_duplicates(self, tmp_path):
+        """Re-running batch mode produces no duplicate rows.
+
+        New sessions may appear on disk between runs (this is a live system),
+        so we assert idempotency — no session_uuid appears more than once —
+        rather than asserting the row count is frozen.
+        """
         config_path = _create_e2e_config(tmp_path)
+        db_path = tmp_path / "data" / "sessions.db"
 
         # First run
         run_batch(config_path=str(config_path))
-        db_path = tmp_path / "data" / "sessions.db"
-        conn = sqlite3.connect(str(db_path))
-        count1 = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
-        conn.close()
 
-        # Second run
+        # Second run — may pick up sessions created during the first run
         run_batch(config_path=str(config_path))
+
         conn = sqlite3.connect(str(db_path))
-        count2 = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        duplicates = conn.execute(
+            "SELECT session_uuid, COUNT(*) as n FROM sessions "
+            "GROUP BY session_uuid HAVING n > 1"
+        ).fetchall()
         conn.close()
 
-        assert count1 == count2, (
-            f"Second batch run added rows: {count1} -> {count2}"
+        assert duplicates == [], (
+            f"Duplicate session_uuids after second batch run: {duplicates}"
         )
 
     def test_known_session_fields(self):

@@ -31,6 +31,11 @@ def _make_record(**overrides) -> SessionRecord:
         "working_directory": "/tmp/test",
         "git_branch": "main",
         "raw_content_json": "[]",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
+        "fast_mode_turns": 0,
     }
     defaults.update(overrides)
     return SessionRecord(**defaults)
