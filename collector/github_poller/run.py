@@ -6,8 +6,9 @@ For each configured repo:
 3. Resolve PR→issue links
 4. Derive push-after-review counts
 5. Upsert into github.db
-6. Link PRs to sessions (via head_ref matching)
-7. Advance cursor
+6. Fetch and store edit history (body + comment edits)
+7. Link PRs to sessions (via head_ref matching)
+8. Advance cursor
 
 Writes ``health.json`` only after all repos succeed.  Supports
 ``--dry-run`` flag (fetch and parse, skip all DB writes).
@@ -19,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Optional
@@ -28,12 +30,48 @@ from am_i_shipping.db import init_github_db
 from am_i_shipping.health_writer import write_health
 
 from .cursor import advance_cursor, compute_since, read_cursor
-from .fetch_issues import fetch_issues
-from .fetch_prs import fetch_prs
+from .fetch_issues import (
+    fetch_issue_edit_history,
+    fetch_issue_edit_history_batch,
+    fetch_issues,
+)
+from .fetch_prs import fetch_pr_edit_history, fetch_prs
 from .link_resolver import resolve_link
 from .push_counter import count_pushes_after_review
 from .session_linker import link_sessions
-from .store import upsert_issue, upsert_pr, upsert_pr_issue_link
+from .store import (
+    insert_issue_body_edit,
+    insert_issue_comment_edit,
+    insert_pr_body_edit,
+    insert_pr_review_comment_edit,
+    upsert_issue,
+    upsert_pr,
+    upsert_pr_issue_link,
+)
+
+
+def _get_stored_updated_at(
+    table: str,
+    repo: str,
+    number_col: str,
+    number: int,
+    db_path: Path,
+) -> Optional[str]:
+    """Return the stored ``updated_at`` value for a row, or None if not found."""
+    assert table in ("issues", "pull_requests"), f"unexpected table: {table}"
+    assert number_col in ("issue_number", "pr_number"), f"unexpected number_col: {number_col}"
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                f"SELECT updated_at FROM {table} WHERE repo = ? AND {number_col} = ?",
+                (repo, number),
+            ).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
 
 
 def run(
@@ -114,10 +152,93 @@ def _poll_repo(
         return len(issues) + len(prs)
 
     # 3–5. Process and upsert issues
-    for issue in issues:
-        upsert_issue(repo, issue, github_db)
+    is_backfill = cursor_value is None
 
-    # 3–5. Process PRs: resolve links, derive push counts, upsert
+    if is_backfill:
+        # Backfill: upsert all issues first, then batch-fetch edit history
+        for issue in issues:
+            upsert_issue(repo, issue, github_db)
+
+        # Batch-fetch edit history for all issues in chunks of 20
+        issue_numbers = [issue["number"] for issue in issues]
+        if issue_numbers:
+            try:
+                batch_results = fetch_issue_edit_history_batch(repo, issue_numbers)
+            except Exception as exc:
+                print(f"  {repo}: edit history batch fetch error: {exc}", file=sys.stderr)
+                batch_results = {}
+
+            for issue_number, edits in batch_results.items():
+                for edit in edits.get("body_edits", []):
+                    try:
+                        insert_issue_body_edit(
+                            repo,
+                            issue_number,
+                            edit["edited_at"],
+                            edit.get("diff"),
+                            edit.get("editor"),
+                            github_db,
+                        )
+                    except Exception as exc:
+                        print(f"  {repo}: insert issue body edit error (issue #{issue_number}): {exc}", file=sys.stderr)
+
+                for edit in edits.get("comment_edits", []):
+                    try:
+                        insert_issue_comment_edit(
+                            repo,
+                            issue_number,
+                            edit["comment_id"],
+                            edit["edited_at"],
+                            edit.get("diff"),
+                            edit.get("editor"),
+                            github_db,
+                        )
+                    except Exception as exc:
+                        print(f"  {repo}: insert issue comment edit error (issue #{issue_number}): {exc}", file=sys.stderr)
+    else:
+        # Delta: upsert each issue and fetch edit history if updated_at changed
+        for issue in issues:
+            prev_updated_at = _get_stored_updated_at(
+                "issues", repo, "issue_number", issue["number"], github_db
+            )
+            upsert_issue(repo, issue, github_db)
+
+            current_updated_at = issue.get("updated_at")
+            if current_updated_at and current_updated_at != prev_updated_at:
+                try:
+                    edits = fetch_issue_edit_history(repo, issue["number"])
+                except Exception as exc:
+                    print(f"  {repo}: edit history fetch error (issue #{issue['number']}): {exc}", file=sys.stderr)
+                    continue
+
+                for edit in edits.get("body_edits", []):
+                    try:
+                        insert_issue_body_edit(
+                            repo,
+                            issue["number"],
+                            edit["edited_at"],
+                            edit.get("diff"),
+                            edit.get("editor"),
+                            github_db,
+                        )
+                    except Exception as exc:
+                        print(f"  {repo}: insert issue body edit error (issue #{issue['number']}): {exc}", file=sys.stderr)
+
+                for edit in edits.get("comment_edits", []):
+                    try:
+                        insert_issue_comment_edit(
+                            repo,
+                            issue["number"],
+                            edit["comment_id"],
+                            edit["edited_at"],
+                            edit.get("diff"),
+                            edit.get("editor"),
+                            github_db,
+                        )
+                    except Exception as exc:
+                        print(f"  {repo}: insert issue comment edit error (issue #{issue['number']}): {exc}", file=sys.stderr)
+
+    # 3–5. Process PRs: resolve links, derive push counts, upsert, edit history
     for pr in prs:
         # Resolve PR→issue link
         linked_issue = resolve_link(
@@ -129,12 +250,89 @@ def _poll_repo(
         push_count = count_pushes_after_review(repo, pr["number"])
         pr["push_count"] = push_count
 
-        # Upsert PR
-        upsert_pr(repo, pr, github_db)
+        if is_backfill:
+            # Backfill: upsert without updated_at gating
+            upsert_pr(repo, pr, github_db)
+        else:
+            # Delta: check updated_at before upsert
+            prev_updated_at = _get_stored_updated_at(
+                "pull_requests", repo, "pr_number", pr["number"], github_db
+            )
+            upsert_pr(repo, pr, github_db)
+
+            current_updated_at = pr.get("updated_at")
+            if current_updated_at and current_updated_at != prev_updated_at:
+                try:
+                    edits = fetch_pr_edit_history(repo, pr["number"])
+                except Exception as exc:
+                    print(f"  {repo}: edit history fetch error (PR #{pr['number']}): {exc}", file=sys.stderr)
+                else:
+                    for edit in edits.get("body_edits", []):
+                        try:
+                            insert_pr_body_edit(
+                                repo,
+                                pr["number"],
+                                edit["edited_at"],
+                                edit.get("diff"),
+                                edit.get("editor"),
+                                github_db,
+                            )
+                        except Exception as exc:
+                            print(f"  {repo}: insert PR body edit error (PR #{pr['number']}): {exc}", file=sys.stderr)
+
+                    for edit in edits.get("review_comment_edits", []):
+                        try:
+                            insert_pr_review_comment_edit(
+                                repo,
+                                pr["number"],
+                                edit["comment_id"],
+                                edit["edited_at"],
+                                edit.get("diff"),
+                                edit.get("editor"),
+                                github_db,
+                            )
+                        except Exception as exc:
+                            print(f"  {repo}: insert PR review comment edit error (PR #{pr['number']}): {exc}", file=sys.stderr)
 
         # Insert PR→issue link if resolved
         if linked_issue is not None:
             upsert_pr_issue_link(repo, pr["number"], linked_issue, github_db)
+
+    # Backfill: fetch PR edit history in bulk after all upserts
+    if is_backfill and prs:
+        for pr in prs:
+            try:
+                edits = fetch_pr_edit_history(repo, pr["number"])
+            except Exception as exc:
+                print(f"  {repo}: edit history fetch error (PR #{pr['number']}): {exc}", file=sys.stderr)
+                continue
+
+            for edit in edits.get("body_edits", []):
+                try:
+                    insert_pr_body_edit(
+                        repo,
+                        pr["number"],
+                        edit["edited_at"],
+                        edit.get("diff"),
+                        edit.get("editor"),
+                        github_db,
+                    )
+                except Exception as exc:
+                    print(f"  {repo}: insert PR body edit error (PR #{pr['number']}): {exc}", file=sys.stderr)
+
+            for edit in edits.get("review_comment_edits", []):
+                try:
+                    insert_pr_review_comment_edit(
+                        repo,
+                        pr["number"],
+                        edit["comment_id"],
+                        edit["edited_at"],
+                        edit.get("diff"),
+                        edit.get("editor"),
+                        github_db,
+                    )
+                except Exception as exc:
+                    print(f"  {repo}: insert PR review comment edit error (PR #{pr['number']}): {exc}", file=sys.stderr)
 
     # 6. Link PRs to sessions
     session_links = link_sessions(repo, github_db, sessions_db)

@@ -85,8 +85,32 @@ class TestInitDb:
         }
         conn.close()
 
-        expected = {"issues", "pull_requests", "pr_issues", "pr_sessions", "poll_cursor"}
+        expected = {
+            "issues", "pull_requests", "pr_issues", "pr_sessions", "poll_cursor",
+            "issue_body_edits", "issue_comment_edits",
+            "pr_body_edits", "pr_review_comment_edits",
+        }
         assert expected.issubset(tables)
+
+    def test_issues_has_updated_at_column(self, tmp_path):
+        config = _make_config(tmp_path)
+        init_all(config)
+
+        conn = sqlite3.connect(str(tmp_path / "data" / "github.db"))
+        cursor = conn.execute("PRAGMA table_info(issues)")
+        columns = {row[1] for row in cursor.fetchall()}
+        conn.close()
+        assert "updated_at" in columns
+
+    def test_pull_requests_has_updated_at_column(self, tmp_path):
+        config = _make_config(tmp_path)
+        init_all(config)
+
+        conn = sqlite3.connect(str(tmp_path / "data" / "github.db"))
+        cursor = conn.execute("PRAGMA table_info(pull_requests)")
+        columns = {row[1] for row in cursor.fetchall()}
+        conn.close()
+        assert "updated_at" in columns
 
     def test_appswitch_db_schema(self, tmp_path):
         config = _make_config(tmp_path)

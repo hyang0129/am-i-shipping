@@ -10,8 +10,13 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from collector.github_poller.fetch_issues import fetch_issues, _extract_type_label
-from collector.github_poller.fetch_prs import fetch_prs
+from collector.github_poller.fetch_issues import (
+    fetch_issues,
+    fetch_issue_edit_history,
+    fetch_issue_edit_history_batch,
+    _extract_type_label,
+)
+from collector.github_poller.fetch_prs import fetch_prs, fetch_pr_edit_history
 from collector.github_poller.gh_client import GhCliError
 
 
@@ -40,6 +45,7 @@ ISSUE_FIXTURE = [
 
 ISSUE_COMMENTS_FIXTURE = [
     {
+        "id": 12345,
         "user": {"login": "alice"},
         "body": "Looks good!",
         "created_at": "2024-01-15T12:00:00Z",
@@ -59,6 +65,7 @@ PR_FIXTURE = [
 
 PR_REVIEW_COMMENTS_FIXTURE = [
     {
+        "id": 67890,
         "user": {"login": "bob"},
         "body": "Consider using pathlib here.",
         "created_at": "2024-01-19T10:00:00Z",
@@ -176,3 +183,227 @@ class TestFetchPRs:
         results = fetch_prs("owner/repo")
         assert results[0]["review_comments"] == []
         assert results[0]["review_comment_count"] == 0
+
+
+class TestCommentIds:
+    @patch("collector.github_poller.fetch_issues.gh_api")
+    @patch("collector.github_poller.fetch_issues.run_gh_json")
+    def test_issue_comment_has_id(self, mock_list, mock_api):
+        """Issue comment dicts include the 'id' key from the REST response."""
+        mock_list.return_value = [ISSUE_FIXTURE[0]]
+        mock_api.return_value = ISSUE_COMMENTS_FIXTURE
+
+        results = fetch_issues("owner/repo")
+        assert results[0]["comments"][0]["id"] == 12345
+
+    @patch("collector.github_poller.fetch_issues.gh_api")
+    @patch("collector.github_poller.fetch_issues.run_gh_json")
+    def test_issue_has_updated_at(self, mock_list, mock_api):
+        """Issue dicts include 'updated_at' from the REST updatedAt field."""
+        fixture = [{**ISSUE_FIXTURE[0], "updatedAt": "2024-01-20T16:00:00Z"}]
+        mock_list.return_value = fixture
+        mock_api.return_value = []
+
+        results = fetch_issues("owner/repo")
+        assert results[0]["updated_at"] == "2024-01-20T16:00:00Z"
+
+    @patch("collector.github_poller.fetch_prs.gh_api")
+    @patch("collector.github_poller.fetch_prs.run_gh_json")
+    def test_pr_review_comment_has_id(self, mock_list, mock_api):
+        """PR review comment dicts include the 'id' key from the REST response."""
+        mock_list.return_value = [PR_FIXTURE[0]]
+        mock_api.return_value = PR_REVIEW_COMMENTS_FIXTURE
+
+        results = fetch_prs("owner/repo")
+        assert results[0]["review_comments"][0]["id"] == 67890
+
+    @patch("collector.github_poller.fetch_prs.gh_api")
+    @patch("collector.github_poller.fetch_prs.run_gh_json")
+    def test_pr_has_updated_at(self, mock_list, mock_api):
+        """PR dicts include 'updated_at' from the REST updatedAt field."""
+        fixture = [{**PR_FIXTURE[0], "updatedAt": "2024-01-22T10:00:00Z"}]
+        mock_list.return_value = fixture
+        mock_api.return_value = []
+
+        results = fetch_prs("owner/repo")
+        assert results[0]["updated_at"] == "2024-01-22T10:00:00Z"
+
+
+class TestFetchIssueEditHistory:
+    @patch("collector.github_poller.fetch_issues.gh_graphql")
+    def test_returns_body_and_comment_edits(self, mock_gql):
+        """fetch_issue_edit_history returns body_edits and comment_edits lists."""
+        mock_gql.return_value = {
+            "data": {"repository": {"issue": {
+                "userContentEdits": {"nodes": [
+                    {
+                        "editedAt": "2024-01-20T16:00:00Z",
+                        "diff": "- old\n+ new",
+                        "editor": {"login": "alice"},
+                    }
+                ]},
+                "comments": {"nodes": [
+                    {
+                        "databaseId": 123,
+                        "userContentEdits": {"nodes": [
+                            {
+                                "editedAt": "2024-01-20T17:00:00Z",
+                                "diff": "- old comment\n+ new comment",
+                                "editor": {"login": "bob"},
+                            }
+                        ]},
+                    }
+                ]},
+            }}}
+        }
+
+        result = fetch_issue_edit_history("owner/repo", 1)
+        assert len(result["body_edits"]) == 1
+        assert result["body_edits"][0]["editor"] == "alice"
+        assert result["body_edits"][0]["edited_at"] == "2024-01-20T16:00:00Z"
+        assert len(result["comment_edits"]) == 1
+        assert result["comment_edits"][0]["comment_id"] == 123
+        assert result["comment_edits"][0]["editor"] == "bob"
+
+    @patch("collector.github_poller.fetch_issues.gh_graphql")
+    def test_graceful_empty_on_graphql_error(self, mock_gql):
+        """fetch_issue_edit_history returns empty dict on GraphQL error response."""
+        mock_gql.return_value = {"errors": [{"message": "not found"}]}
+
+        result = fetch_issue_edit_history("owner/repo", 999)
+        assert result == {}
+
+    @patch("collector.github_poller.fetch_issues.gh_graphql")
+    def test_graceful_empty_on_exception(self, mock_gql):
+        """fetch_issue_edit_history returns empty dict when gh_graphql raises."""
+        mock_gql.side_effect = GhCliError(["gh", "api", "graphql"], 1, "network error")
+
+        result = fetch_issue_edit_history("owner/repo", 1)
+        assert result == {}
+
+    @patch("collector.github_poller.fetch_issues.gh_graphql")
+    def test_empty_edits_when_no_edits(self, mock_gql):
+        """Returns empty lists for body_edits and comment_edits when there are none."""
+        mock_gql.return_value = {
+            "data": {"repository": {"issue": {
+                "userContentEdits": {"nodes": []},
+                "comments": {"nodes": []},
+            }}}
+        }
+
+        result = fetch_issue_edit_history("owner/repo", 1)
+        assert result["body_edits"] == []
+        assert result["comment_edits"] == []
+
+
+class TestFetchIssueEditHistoryBatch:
+    @patch("collector.github_poller.fetch_issues.gh_graphql")
+    def test_chunks_large_list(self, mock_gql):
+        """fetch_issue_edit_history_batch makes multiple calls for >20 issues."""
+        mock_gql.return_value = {
+            "data": {"repository": {
+                f"issue{i}": {
+                    "number": i + 1,
+                    "userContentEdits": {"nodes": []},
+                    "comments": {"nodes": []},
+                }
+                for i in range(20)
+            }}
+        }
+
+        issue_numbers = list(range(1, 42))  # 41 issues -> 3 calls (20+20+1)
+        result = fetch_issue_edit_history_batch("owner/repo", issue_numbers)
+
+        assert mock_gql.call_count == 3
+        assert len(result) == 41
+
+    @patch("collector.github_poller.fetch_issues.gh_graphql")
+    def test_returns_mapping_of_issue_number_to_edits(self, mock_gql):
+        """Batch result maps issue_number -> edit history dict."""
+        mock_gql.return_value = {
+            "data": {"repository": {
+                "issue0": {
+                    "number": 1,
+                    "userContentEdits": {"nodes": [
+                        {"editedAt": "2024-01-20T16:00:00Z", "diff": "x", "editor": {"login": "alice"}}
+                    ]},
+                    "comments": {"nodes": []},
+                },
+                "issue1": {
+                    "number": 2,
+                    "userContentEdits": {"nodes": []},
+                    "comments": {"nodes": []},
+                },
+            }}
+        }
+
+        result = fetch_issue_edit_history_batch("owner/repo", [1, 2])
+        assert 1 in result
+        assert 2 in result
+        assert len(result[1]["body_edits"]) == 1
+        assert result[1]["body_edits"][0]["editor"] == "alice"
+        assert result[2]["body_edits"] == []
+
+    @patch("collector.github_poller.fetch_issues.gh_graphql")
+    def test_skips_chunk_on_graphql_error(self, mock_gql):
+        """Batch silently skips chunks that return GraphQL errors."""
+        mock_gql.return_value = {"errors": [{"message": "server error"}]}
+
+        result = fetch_issue_edit_history_batch("owner/repo", [1, 2, 3])
+        assert result == {}
+
+
+class TestFetchPrEditHistory:
+    @patch("collector.github_poller.fetch_prs.gh_graphql")
+    def test_returns_body_and_review_comment_edits(self, mock_gql):
+        """fetch_pr_edit_history returns body_edits and review_comment_edits."""
+        mock_gql.return_value = {
+            "data": {"repository": {"pullRequest": {
+                "userContentEdits": {"nodes": [
+                    {
+                        "editedAt": "2024-01-21T10:00:00Z",
+                        "diff": "- old pr\n+ new pr",
+                        "editor": {"login": "carol"},
+                    }
+                ]},
+                "reviews": {"nodes": [
+                    {
+                        "comments": {"nodes": [
+                            {
+                                "databaseId": 456,
+                                "userContentEdits": {"nodes": [
+                                    {
+                                        "editedAt": "2024-01-21T11:00:00Z",
+                                        "diff": "- old review\n+ new review",
+                                        "editor": {"login": "dave"},
+                                    }
+                                ]},
+                            }
+                        ]}
+                    }
+                ]},
+            }}}
+        }
+
+        result = fetch_pr_edit_history("owner/repo", 6)
+        assert len(result["body_edits"]) == 1
+        assert result["body_edits"][0]["editor"] == "carol"
+        assert len(result["review_comment_edits"]) == 1
+        assert result["review_comment_edits"][0]["comment_id"] == 456
+        assert result["review_comment_edits"][0]["editor"] == "dave"
+
+    @patch("collector.github_poller.fetch_prs.gh_graphql")
+    def test_graceful_empty_on_graphql_error(self, mock_gql):
+        """fetch_pr_edit_history returns empty dict on GraphQL error response."""
+        mock_gql.return_value = {"errors": [{"message": "not found"}]}
+
+        result = fetch_pr_edit_history("owner/repo", 999)
+        assert result == {}
+
+    @patch("collector.github_poller.fetch_prs.gh_graphql")
+    def test_graceful_empty_on_exception(self, mock_gql):
+        """fetch_pr_edit_history returns empty dict when gh_graphql raises."""
+        mock_gql.side_effect = GhCliError(["gh", "api", "graphql"], 1, "timeout")
+
+        result = fetch_pr_edit_history("owner/repo", 6)
+        assert result == {}

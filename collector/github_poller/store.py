@@ -46,8 +46,8 @@ def upsert_issue(
             """
             INSERT INTO issues (
                 repo, issue_number, title, type_label, state,
-                body, comments_json, created_at, closed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                body, comments_json, created_at, closed_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(repo, issue_number) DO UPDATE SET
                 title = excluded.title,
                 type_label = excluded.type_label,
@@ -55,7 +55,8 @@ def upsert_issue(
                 body = excluded.body,
                 comments_json = excluded.comments_json,
                 created_at = excluded.created_at,
-                closed_at = excluded.closed_at
+                closed_at = excluded.closed_at,
+                updated_at = excluded.updated_at
             """,
             (
                 repo,
@@ -67,6 +68,7 @@ def upsert_issue(
                 json.dumps(issue.get("comments", []), ensure_ascii=False),
                 issue.get("created_at"),
                 issue.get("closed_at"),
+                issue.get("updated_at"),
             ),
         )
         conn.commit()
@@ -96,8 +98,8 @@ def upsert_pr(
             INSERT INTO pull_requests (
                 repo, pr_number, head_ref, title, body,
                 review_comments_json, review_comment_count,
-                push_count, created_at, merged_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                push_count, created_at, merged_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(repo, pr_number) DO UPDATE SET
                 head_ref = excluded.head_ref,
                 title = excluded.title,
@@ -106,7 +108,8 @@ def upsert_pr(
                 review_comment_count = excluded.review_comment_count,
                 push_count = excluded.push_count,
                 created_at = excluded.created_at,
-                merged_at = excluded.merged_at
+                merged_at = excluded.merged_at,
+                updated_at = excluded.updated_at
             """,
             (
                 repo,
@@ -119,6 +122,7 @@ def upsert_pr(
                 pr.get("push_count", 0),
                 pr.get("created_at"),
                 pr.get("merged_at"),
+                pr.get("updated_at"),
             ),
         )
         conn.commit()
@@ -142,6 +146,108 @@ def upsert_pr_issue_link(
             VALUES (?, ?, ?)
             """,
             (repo, pr_number, issue_number),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_issue_body_edit(
+    repo: str,
+    issue_number: int,
+    edited_at: str,
+    diff: Optional[str],
+    editor: Optional[str],
+    db_path: Union[str, Path],
+) -> None:
+    """Record an issue body edit.  Idempotent (INSERT OR IGNORE)."""
+    db_path = Path(db_path)
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO issue_body_edits
+                (repo, issue_number, edited_at, diff, editor)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (repo, issue_number, edited_at, diff, editor),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_issue_comment_edit(
+    repo: str,
+    issue_number: int,
+    comment_id: int,
+    edited_at: str,
+    diff: Optional[str],
+    editor: Optional[str],
+    db_path: Union[str, Path],
+) -> None:
+    """Record an issue comment edit.  Idempotent (INSERT OR IGNORE)."""
+    db_path = Path(db_path)
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO issue_comment_edits
+                (repo, issue_number, comment_id, edited_at, diff, editor)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (repo, issue_number, comment_id, edited_at, diff, editor),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_pr_body_edit(
+    repo: str,
+    pr_number: int,
+    edited_at: str,
+    diff: Optional[str],
+    editor: Optional[str],
+    db_path: Union[str, Path],
+) -> None:
+    """Record a PR body edit.  Idempotent (INSERT OR IGNORE)."""
+    db_path = Path(db_path)
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO pr_body_edits
+                (repo, pr_number, edited_at, diff, editor)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (repo, pr_number, edited_at, diff, editor),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_pr_review_comment_edit(
+    repo: str,
+    pr_number: int,
+    comment_id: int,
+    edited_at: str,
+    diff: Optional[str],
+    editor: Optional[str],
+    db_path: Union[str, Path],
+) -> None:
+    """Record a PR review comment edit.  Idempotent (INSERT OR IGNORE)."""
+    db_path = Path(db_path)
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO pr_review_comment_edits
+                (repo, pr_number, comment_id, edited_at, diff, editor)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (repo, pr_number, comment_id, edited_at, diff, editor),
         )
         conn.commit()
     finally:
