@@ -7,6 +7,7 @@ body, comments (list of {author, body, created_at}).
 
 from __future__ import annotations
 
+import sys
 from typing import Any, Dict, List, Optional
 
 from .gh_client import GhCliError, run_gh_json, gh_api, gh_graphql
@@ -183,7 +184,8 @@ def fetch_issue_edit_history(repo: str, issue_number: int) -> Dict[str, Any]:
             _ISSUE_EDIT_HISTORY_QUERY,
             {"owner": owner, "name": name, "number": issue_number},
         )
-    except Exception:
+    except Exception as exc:
+        print(f"  warning: edit history fetch failed for issue {issue_number}: {exc}", file=sys.stderr)
         return {}
 
     if response.get("errors"):
@@ -254,7 +256,7 @@ def fetch_issue_edit_history_batch(
         except Exception:
             continue
 
-        if response.get("errors"):
+        if response.get("errors") and not response.get("data"):
             continue
 
         repo_data = (response.get("data") or {}).get("repository") or {}

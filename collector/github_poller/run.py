@@ -58,6 +58,8 @@ def _get_stored_updated_at(
     db_path: Path,
 ) -> Optional[str]:
     """Return the stored ``updated_at`` value for a row, or None if not found."""
+    assert table in ("issues", "pull_requests"), f"unexpected table: {table}"
+    assert number_col in ("issue_number", "pr_number"), f"unexpected number_col: {number_col}"
     try:
         conn = sqlite3.connect(str(db_path))
         try:

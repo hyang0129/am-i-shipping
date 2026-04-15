@@ -315,6 +315,7 @@ class TestFetchIssueEditHistoryBatch:
         result = fetch_issue_edit_history_batch("owner/repo", issue_numbers)
 
         assert mock_gql.call_count == 3
+        assert len(result) == 41
 
     @patch("collector.github_poller.fetch_issues.gh_graphql")
     def test_returns_mapping_of_issue_number_to_edits(self, mock_gql):
