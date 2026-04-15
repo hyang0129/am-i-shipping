@@ -1,7 +1,7 @@
 """Idempotent database initialization for all three collector DBs.
 
 Usage:
-    python init_db.py [--config path/to/config.yaml]
+    python -m am_i_shipping.db [--config path/to/config.yaml]
 
 Creates sessions.db, github.db, and appswitch.db under the configured data
 directory. Safe to run multiple times — uses CREATE TABLE IF NOT EXISTS.
@@ -13,7 +13,7 @@ import argparse
 import sqlite3
 from pathlib import Path
 
-from config_loader import Config, load_config
+from .config_loader import Config, load_config
 
 
 # ---------------------------------------------------------------------------

@@ -82,7 +82,7 @@ foreach ($Collector in $Collectors) {
 # --- Health check ---
 Write-Log "=== Running health check ==="
 try {
-    $healthOutput = & python (Join-Path $ScriptDir "health_check.py") 2>&1
+    $healthOutput = & python -m am_i_shipping.health_check 2>&1
     $healthOutput | ForEach-Object { Write-Log "  $_" }
     if ($LASTEXITCODE -ne 0) {
         Write-Log "WARNING: Health check reports stale or missing collectors"

@@ -1,7 +1,7 @@
 """Atomically update data/health.json for a single collector.
 
 Usage:
-    from health_writer import write_health
+    from am_i_shipping.health_writer import write_health
     write_health("session_parser", 42)
     write_health("session_parser", 42, data_dir="data")
 """
@@ -34,11 +34,11 @@ def write_health(
     record_count:
         Number of records processed in this run.
     data_dir:
-        Directory containing health.json. Defaults to ``data/`` relative
-        to the repo root (directory containing this file).
+        Directory containing health.json. Defaults to ``data/`` in the
+        repo root.
     """
     if data_dir is None:
-        data_dir = Path(__file__).resolve().parent / "data"
+        data_dir = Path(__file__).resolve().parent.parent / "data"
     else:
         data_dir = Path(data_dir)
 

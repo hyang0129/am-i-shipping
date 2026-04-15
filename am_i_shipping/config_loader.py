@@ -44,7 +44,7 @@ class Config:
     appswitch: AppSwitchConfig = field(default_factory=AppSwitchConfig)
     data: DataConfig = field(default_factory=DataConfig)
     _config_dir: Path = field(
-        default_factory=lambda: Path(__file__).resolve().parent, repr=False
+        default_factory=lambda: Path(__file__).resolve().parent.parent, repr=False
     )
 
     @property
@@ -61,13 +61,13 @@ class Config:
 
 
 def load_config(config_path: str | Path | None = None) -> Config:
-    """Load config.yaml from *config_path* (default: config.yaml next to this file).
+    """Load config.yaml from *config_path* (default: config.yaml in repo root).
 
     Raises ``ConfigError`` on missing file, missing required fields, or
     invalid types.
     """
     if config_path is None:
-        config_path = Path(__file__).resolve().parent / "config.yaml"
+        config_path = Path(__file__).resolve().parent.parent / "config.yaml"
     else:
         config_path = Path(config_path)
 

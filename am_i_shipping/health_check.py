@@ -1,11 +1,11 @@
 """Check collector health by reading data/health.json.
 
 Standalone usage:
-    python health_check.py [--data-dir path/to/data]
+    python -m am_i_shipping.health_check [--data-dir path/to/data]
     Exit code 0 = all healthy, 1 = stale or missing.
 
 Importable:
-    from health_check import check_health
+    from am_i_shipping.health_check import check_health
     results = check_health()  # no side effects
 """
 
@@ -36,7 +36,7 @@ def check_health(
     This function has no side effects — it only reads health.json.
     """
     if data_dir is None:
-        data_dir = Path(__file__).resolve().parent / "data"
+        data_dir = Path(__file__).resolve().parent.parent / "data"
     else:
         data_dir = Path(data_dir)
 

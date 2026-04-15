@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from config_loader import Config, SessionConfig, GitHubConfig, AppSwitchConfig, DataConfig
-from init_db import init_all
+from am_i_shipping.config_loader import Config, SessionConfig, GitHubConfig, AppSwitchConfig, DataConfig
+from am_i_shipping.db import init_all
 
 
 def _make_config(tmp_path: Path) -> Config:

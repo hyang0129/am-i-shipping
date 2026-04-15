@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from config_loader import Config, ConfigError, load_config
+from am_i_shipping.config_loader import Config, ConfigError, load_config
 
 
 def _write_config(tmp_path: Path, data: dict) -> Path:

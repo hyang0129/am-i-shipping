@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from health_writer import write_health
-from health_check import check_health
+from am_i_shipping.health_writer import write_health
+from am_i_shipping.health_check import check_health
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +118,7 @@ class TestCheckHealth:
         """from health_check import check_health works without side effects."""
         # This test passing proves importability. check_health with a
         # non-existent dir should not create files or print to stdout.
-        from health_check import check_health as imported_fn
+        from am_i_shipping.health_check import check_health as imported_fn
         healthy, msgs = imported_fn(data_dir="/tmp/nonexistent_dir_test_12345")
         assert not healthy
 
