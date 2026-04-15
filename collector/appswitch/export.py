@@ -21,7 +21,7 @@ import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Optional, Union
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -42,7 +42,7 @@ def fetch_events(
     bucket_id: str = "aw-watcher-window-appswitch",
     start: Optional[datetime] = None,
     end: Optional[datetime] = None,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Fetch events from ActivityWatch REST API for a time range.
 
     Parameters
@@ -96,7 +96,7 @@ def fetch_events(
     return data
 
 
-def deduplicate(events: List[Dict[str, Any]], interval: int = 30) -> List[Dict[str, Any]]:
+def deduplicate(events: list[dict[str, Any]], interval: int = 30) -> list[dict[str, Any]]:
     """Deduplicate events on ``(timestamp_bucket, window_hash)``.
 
     For duplicate keys, the first occurrence (by list order) wins.
@@ -115,8 +115,8 @@ def deduplicate(events: List[Dict[str, Any]], interval: int = 30) -> List[Dict[s
     -------
     Deduplicated list of event dicts ready for DB insertion.
     """
-    seen: dict[tuple[int, str], bool] = {}
-    result: List[Dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    result: list[dict[str, Any]] = []
 
     for event in events:
         # Parse timestamp
@@ -139,7 +139,7 @@ def deduplicate(events: List[Dict[str, Any]], interval: int = 30) -> List[Dict[s
         key = (bucket, w_hash)
 
         if key not in seen:
-            seen[key] = True
+            seen.add(key)
             result.append(
                 {
                     "timestamp_bucket": bucket,
@@ -154,7 +154,7 @@ def deduplicate(events: List[Dict[str, Any]], interval: int = 30) -> List[Dict[s
 
 
 def upsert_events(
-    events: List[Dict[str, Any]],
+    events: list[dict[str, Any]],
     db_path: Union[str, Path],
 ) -> int:
     """Insert deduplicated events into ``appswitch.db``.
@@ -179,26 +179,26 @@ def upsert_events(
     db_path.parent.mkdir(parents=True, exist_ok=True)
     init_appswitch_db(db_path)
 
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), isolation_level="DEFERRED")
     inserted = 0
     try:
-        for ev in events:
-            cursor = conn.execute(
-                """
-                INSERT OR IGNORE INTO app_events
-                    (timestamp_bucket, window_hash, app_name, window_title, duration_seconds)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    ev["timestamp_bucket"],
-                    ev["window_hash"],
-                    ev["app_name"],
-                    ev["window_title"],
-                    ev["duration_seconds"],
-                ),
-            )
-            inserted += cursor.rowcount
-        conn.commit()
+        with conn:
+            for ev in events:
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO app_events
+                        (timestamp_bucket, window_hash, app_name, window_title, duration_seconds)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ev["timestamp_bucket"],
+                        ev["window_hash"],
+                        ev["app_name"],
+                        ev["window_title"],
+                        ev["duration_seconds"],
+                    ),
+                )
+                inserted += cursor.rowcount
     finally:
         conn.close()
 
