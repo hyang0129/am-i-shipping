@@ -1,0 +1,168 @@
+"""GitHub poller orchestrator — entry point for nightly collection.
+
+For each configured repo:
+1. Read cursor (last_polled_at)
+2. Fetch issues and PRs (delta or backfill)
+3. Resolve PR→issue links
+4. Derive push-after-review counts
+5. Upsert into github.db
+6. Link PRs to sessions (via head_ref matching)
+7. Advance cursor
+
+Writes ``health.json`` only after all repos succeed.  Supports
+``--dry-run`` flag (fetch and parse, skip all DB writes).
+
+Usage:
+    python -m collector.github_poller.run [--config path/to/config.yaml] [--dry-run]
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+from typing import Optional
+
+from am_i_shipping.config_loader import load_config
+from am_i_shipping.db import init_github_db
+from am_i_shipping.health_writer import write_health
+
+from .cursor import advance_cursor, compute_since, read_cursor
+from .fetch_issues import fetch_issues
+from .fetch_prs import fetch_prs
+from .link_resolver import resolve_link
+from .push_counter import count_pushes_after_review
+from .session_linker import link_sessions
+from .store import upsert_issue, upsert_pr, upsert_pr_issue_link
+
+
+def run(
+    config_path: Optional[str] = None,
+    dry_run: bool = False,
+) -> int:
+    """Run the poller for all configured repos.
+
+    Parameters
+    ----------
+    config_path:
+        Path to config.yaml. If None, uses the default location.
+    dry_run:
+        If True, fetch and parse but skip all DB writes.
+
+    Returns
+    -------
+    Total number of records (issues + PRs) processed across all repos.
+    """
+    config = load_config(config_path)
+    data_dir = config.data_path
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    github_db = data_dir / "github.db"
+    sessions_db = data_dir / "sessions.db"
+
+    if not dry_run:
+        init_github_db(github_db)
+
+    total_records = 0
+    all_succeeded = True
+
+    for repo in config.github.repos:
+        try:
+            count = _poll_repo(
+                repo=repo,
+                github_db=github_db,
+                sessions_db=sessions_db,
+                backfill_days=config.github.backfill_days,
+                dry_run=dry_run,
+            )
+            total_records += count
+            print(f"OK: {repo} — {count} records", file=sys.stderr)
+        except Exception as exc:
+            print(f"ERROR: {repo} — {exc}", file=sys.stderr)
+            all_succeeded = False
+
+    # Write health only if all repos succeeded and not in dry-run mode
+    if all_succeeded and not dry_run:
+        write_health("github_poller", total_records, data_dir=data_dir)
+
+    return total_records
+
+
+def _poll_repo(
+    repo: str,
+    github_db: Path,
+    sessions_db: Path,
+    backfill_days: int,
+    dry_run: bool,
+) -> int:
+    """Poll a single repo.  Returns the number of records processed."""
+    # 1. Read cursor
+    cursor_value = None if dry_run else read_cursor(repo, github_db)
+    since = compute_since(cursor_value, backfill_days=backfill_days)
+
+    print(f"  {repo}: fetching since {since} (cursor={'backfill' if cursor_value is None else 'delta'})", file=sys.stderr)
+
+    # 2. Fetch issues and PRs
+    issues = fetch_issues(repo, since=since)
+    prs = fetch_prs(repo, since=since)
+
+    print(f"  {repo}: fetched {len(issues)} issues, {len(prs)} PRs", file=sys.stderr)
+
+    if dry_run:
+        return len(issues) + len(prs)
+
+    # 3–5. Process and upsert issues
+    for issue in issues:
+        upsert_issue(repo, issue, github_db)
+
+    # 3–5. Process PRs: resolve links, derive push counts, upsert
+    for pr in prs:
+        # Resolve PR→issue link
+        linked_issue = resolve_link(
+            head_ref=pr.get("head_ref", ""),
+            body=pr.get("body", ""),
+        )
+
+        # Derive push count
+        push_count = count_pushes_after_review(repo, pr["number"])
+        pr["push_count"] = push_count
+
+        # Upsert PR
+        upsert_pr(repo, pr, github_db)
+
+        # Insert PR→issue link if resolved
+        if linked_issue is not None:
+            upsert_pr_issue_link(repo, pr["number"], linked_issue, github_db)
+
+    # 6. Link PRs to sessions
+    session_links = link_sessions(repo, github_db, sessions_db)
+    if session_links:
+        print(f"  {repo}: linked {session_links} PR-session pairs", file=sys.stderr)
+
+    # 7. Advance cursor
+    advance_cursor(repo, github_db)
+
+    return len(issues) + len(prs)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="GitHub poller — fetch issues, PRs, and linkages"
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to config.yaml",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch and parse without writing to the database",
+    )
+    args = parser.parse_args()
+
+    run(config_path=args.config, dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    main()
