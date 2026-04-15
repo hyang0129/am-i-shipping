@@ -53,10 +53,6 @@ $Collectors = @(
         Name = "GitHub Poller"
         Command = @("python", "-m", "collector.github_poller.run") + $ConfigArg
     },
-    @{
-        Name = "App-Switch Export"
-        Command = @("python", (Join-Path $ScriptDir "collector" "appswitch" "export.py")) + $ConfigArg
-    }
 )
 
 $FailCount = 0

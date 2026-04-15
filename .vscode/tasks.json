@@ -1,0 +1,26 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run Collectors (if stale)",
+      "type": "shell",
+      "command": "python3",
+      "args": [
+        "-c",
+        "import json, sys; from pathlib import Path; from datetime import datetime, timezone, timedelta; h = Path('data/health.json'); fresh = False;\nif h.exists():\n    try:\n        d = json.loads(h.read_text()); ts = max((e.get('last_success','') for e in d.values() if isinstance(e,dict)), default='');\n        if ts: fresh = (datetime.now(timezone.utc) - datetime.fromisoformat(ts)) < timedelta(hours=4)\n    except Exception: pass\nif fresh: print('Skipping: data is fresh'); sys.exit(0)\nimport subprocess; sys.exit(subprocess.call(['bash', 'run_collectors.sh']))"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared",
+        "close": true
+      },
+      "runOptions": {
+        "runOn": "folderOpen"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

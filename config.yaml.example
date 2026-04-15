@@ -16,6 +16,16 @@ session:
   # that trigger the bail-out flag
   reprompt_threshold: 3
 
+  # Resource limiters for batch mode
+  limiter:
+    # Max session files to parse per batch run. Remaining files are
+    # picked up on subsequent runs (UUID skip ensures idempotency).
+    max_files_per_run: 200
+
+    # Sleep between file parses in batch mode (seconds).
+    # Gives the CPU scheduler a chance to yield under load.
+    inter_file_delay_seconds: 0.05
+
 # -------------------------------------------------------------------
 # GitHub poller (Collector 2)
 # -------------------------------------------------------------------
@@ -26,15 +36,28 @@ github:
   # Days of history to fetch on first run (backfill window)
   backfill_days: 90
 
-# -------------------------------------------------------------------
-# App-switch logger (Collector 3)
-# -------------------------------------------------------------------
-appswitch:
-  # ActivityWatch REST API base URL
-  aw_endpoint: "http://localhost:5600"
+  # Resource limiters for background-safe operation
+  limiter:
+    # Sleep between gh CLI API calls (seconds). Prevents triggering
+    # GitHub's secondary rate limits during sustained bursts.
+    inter_request_delay_seconds: 1.0
 
-  # Polling interval in seconds for the bridge script
-  poll_interval_seconds: 30
+    # Max issues + PRs to process per repo per run. The cursor means
+    # subsequent runs pick up remaining items automatically.
+    max_items_per_repo: 500
+
+    # os.nice() increment applied at process startup. Higher values
+    # make the process yield more readily under load.
+    # Ignored on platforms where os.nice() is unavailable.
+    process_nice_increment: 10
+
+# -------------------------------------------------------------------
+# App-switch logger (Collector 3) — DISABLED
+# Uncomment to re-enable. Code remains in collector/appswitch/.
+# -------------------------------------------------------------------
+# appswitch:
+#   aw_endpoint: "http://localhost:5600"
+#   poll_interval_seconds: 30
 
 # -------------------------------------------------------------------
 # Storage

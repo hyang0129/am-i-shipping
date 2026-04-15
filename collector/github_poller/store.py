@@ -6,6 +6,12 @@ Provides idempotent upsert operations that use ``INSERT OR REPLACE``
 Validates required fields before writing — raises ``ValueError`` on
 missing repo, number, or other mandatory columns rather than silently
 inserting NULLs.
+
+All public functions accept an optional ``conn`` parameter.  When
+provided, the caller owns the connection lifecycle (open/commit/close)
+and the function skips ``_connect()``/commit/close.  When ``None``
+(default), each function opens its own connection, commits, and closes
+— preserving backward compatibility.
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ def upsert_issue(
     repo: str,
     issue: Dict[str, Any],
     db_path: Union[str, Path],
+    conn: Optional[sqlite3.Connection] = None,
 ) -> None:
     """Insert or update a single issue row.
 
@@ -39,8 +46,10 @@ def upsert_issue(
     if "number" not in issue or issue["number"] is None:
         raise ValueError("issue number is required")
 
-    db_path = Path(db_path)
-    conn = _connect(db_path)
+    own_conn = conn is None
+    if own_conn:
+        db_path = Path(db_path)
+        conn = _connect(db_path)
     try:
         conn.execute(
             """
@@ -71,15 +80,18 @@ def upsert_issue(
                 issue.get("updated_at"),
             ),
         )
-        conn.commit()
+        if own_conn:
+            conn.commit()
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 def upsert_pr(
     repo: str,
     pr: Dict[str, Any],
     db_path: Union[str, Path],
+    conn: Optional[sqlite3.Connection] = None,
 ) -> None:
     """Insert or update a single PR row.
 
@@ -90,8 +102,10 @@ def upsert_pr(
     if "number" not in pr or pr["number"] is None:
         raise ValueError("pr number is required")
 
-    db_path = Path(db_path)
-    conn = _connect(db_path)
+    own_conn = conn is None
+    if own_conn:
+        db_path = Path(db_path)
+        conn = _connect(db_path)
     try:
         conn.execute(
             """
@@ -125,9 +139,11 @@ def upsert_pr(
                 pr.get("updated_at"),
             ),
         )
-        conn.commit()
+        if own_conn:
+            conn.commit()
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 def upsert_pr_issue_link(
@@ -135,10 +151,13 @@ def upsert_pr_issue_link(
     pr_number: int,
     issue_number: int,
     db_path: Union[str, Path],
+    conn: Optional[sqlite3.Connection] = None,
 ) -> None:
     """Link a PR to an issue.  Idempotent (INSERT OR IGNORE)."""
-    db_path = Path(db_path)
-    conn = _connect(db_path)
+    own_conn = conn is None
+    if own_conn:
+        db_path = Path(db_path)
+        conn = _connect(db_path)
     try:
         conn.execute(
             """
@@ -147,9 +166,11 @@ def upsert_pr_issue_link(
             """,
             (repo, pr_number, issue_number),
         )
-        conn.commit()
+        if own_conn:
+            conn.commit()
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 def insert_issue_body_edit(
@@ -159,10 +180,13 @@ def insert_issue_body_edit(
     diff: Optional[str],
     editor: Optional[str],
     db_path: Union[str, Path],
+    conn: Optional[sqlite3.Connection] = None,
 ) -> None:
     """Record an issue body edit.  Idempotent (INSERT OR IGNORE)."""
-    db_path = Path(db_path)
-    conn = _connect(db_path)
+    own_conn = conn is None
+    if own_conn:
+        db_path = Path(db_path)
+        conn = _connect(db_path)
     try:
         conn.execute(
             """
@@ -172,9 +196,11 @@ def insert_issue_body_edit(
             """,
             (repo, issue_number, edited_at, diff, editor),
         )
-        conn.commit()
+        if own_conn:
+            conn.commit()
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 def insert_issue_comment_edit(
@@ -185,10 +211,13 @@ def insert_issue_comment_edit(
     diff: Optional[str],
     editor: Optional[str],
     db_path: Union[str, Path],
+    conn: Optional[sqlite3.Connection] = None,
 ) -> None:
     """Record an issue comment edit.  Idempotent (INSERT OR IGNORE)."""
-    db_path = Path(db_path)
-    conn = _connect(db_path)
+    own_conn = conn is None
+    if own_conn:
+        db_path = Path(db_path)
+        conn = _connect(db_path)
     try:
         conn.execute(
             """
@@ -198,9 +227,11 @@ def insert_issue_comment_edit(
             """,
             (repo, issue_number, comment_id, edited_at, diff, editor),
         )
-        conn.commit()
+        if own_conn:
+            conn.commit()
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 def insert_pr_body_edit(
@@ -210,10 +241,13 @@ def insert_pr_body_edit(
     diff: Optional[str],
     editor: Optional[str],
     db_path: Union[str, Path],
+    conn: Optional[sqlite3.Connection] = None,
 ) -> None:
     """Record a PR body edit.  Idempotent (INSERT OR IGNORE)."""
-    db_path = Path(db_path)
-    conn = _connect(db_path)
+    own_conn = conn is None
+    if own_conn:
+        db_path = Path(db_path)
+        conn = _connect(db_path)
     try:
         conn.execute(
             """
@@ -223,9 +257,11 @@ def insert_pr_body_edit(
             """,
             (repo, pr_number, edited_at, diff, editor),
         )
-        conn.commit()
+        if own_conn:
+            conn.commit()
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()
 
 
 def insert_pr_review_comment_edit(
@@ -236,10 +272,13 @@ def insert_pr_review_comment_edit(
     diff: Optional[str],
     editor: Optional[str],
     db_path: Union[str, Path],
+    conn: Optional[sqlite3.Connection] = None,
 ) -> None:
     """Record a PR review comment edit.  Idempotent (INSERT OR IGNORE)."""
-    db_path = Path(db_path)
-    conn = _connect(db_path)
+    own_conn = conn is None
+    if own_conn:
+        db_path = Path(db_path)
+        conn = _connect(db_path)
     try:
         conn.execute(
             """
@@ -249,6 +288,8 @@ def insert_pr_review_comment_edit(
             """,
             (repo, pr_number, comment_id, edited_at, diff, editor),
         )
-        conn.commit()
+        if own_conn:
+            conn.commit()
     finally:
-        conn.close()
+        if own_conn:
+            conn.close()

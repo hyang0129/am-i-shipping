@@ -74,7 +74,6 @@ class TestCheckHealth:
         health = {
             "session_parser": {"last_success": now, "last_record_count": 10},
             "github_poller": {"last_success": now, "last_record_count": 20},
-            "appswitch_export": {"last_success": now, "last_record_count": 5},
         }
         (data_dir / "health.json").write_text(json.dumps(health))
 
@@ -91,7 +90,6 @@ class TestCheckHealth:
         health = {
             "session_parser": {"last_success": stale, "last_record_count": 10},
             "github_poller": {"last_success": fresh, "last_record_count": 20},
-            "appswitch_export": {"last_success": fresh, "last_record_count": 5},
         }
         (data_dir / "health.json").write_text(json.dumps(health))
 
@@ -103,10 +101,9 @@ class TestCheckHealth:
         data_dir = tmp_path / "data"
         data_dir.mkdir()
         now = datetime.now(timezone.utc).isoformat()
-        # Only two of three collectors present
+        # Only one of two expected collectors present
         health = {
             "session_parser": {"last_success": now, "last_record_count": 10},
-            "github_poller": {"last_success": now, "last_record_count": 20},
         }
         (data_dir / "health.json").write_text(json.dumps(health))
 

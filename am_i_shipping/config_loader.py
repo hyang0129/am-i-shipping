@@ -14,16 +14,31 @@ class ConfigError(Exception):
 
 
 @dataclass
+class SessionLimiterConfig:
+    max_files_per_run: int = 200
+    inter_file_delay_seconds: float = 0.05
+
+
+@dataclass
 class SessionConfig:
     projects_path: str
     session_gap_minutes: int = 30
     reprompt_threshold: int = 3
+    limiter: SessionLimiterConfig = field(default_factory=SessionLimiterConfig)
+
+
+@dataclass
+class GitHubLimiterConfig:
+    inter_request_delay_seconds: float = 1.0
+    max_items_per_repo: int = 500
+    process_nice_increment: int = 10
 
 
 @dataclass
 class GitHubConfig:
     repos: List[str]
     backfill_days: int = 90
+    limiter: GitHubLimiterConfig = field(default_factory=GitHubLimiterConfig)
 
 
 @dataclass
@@ -91,6 +106,20 @@ def load_config(config_path: str | Path | None = None) -> Config:
             "Missing required field: session.projects_path "
             "(path to ~/.claude/projects)"
         )
+    session_limiter_raw = session_raw.get("limiter", {}) or {}
+    session_limiter = SessionLimiterConfig(
+        max_files_per_run=int(
+            session_limiter_raw.get(
+                "max_files_per_run", SessionLimiterConfig.max_files_per_run
+            )
+        ),
+        inter_file_delay_seconds=float(
+            session_limiter_raw.get(
+                "inter_file_delay_seconds",
+                SessionLimiterConfig.inter_file_delay_seconds,
+            )
+        ),
+    )
     session_cfg = SessionConfig(
         projects_path=str(projects_path),
         session_gap_minutes=int(
@@ -99,6 +128,7 @@ def load_config(config_path: str | Path | None = None) -> Config:
         reprompt_threshold=int(
             session_raw.get("reprompt_threshold", SessionConfig.reprompt_threshold)
         ),
+        limiter=session_limiter,
     )
 
     # --- github (required section) ---
@@ -112,11 +142,32 @@ def load_config(config_path: str | Path | None = None) -> Config:
             "Missing required field: github.repos "
             "(list of owner/repo strings to poll)"
         )
+    github_limiter_raw = github_raw.get("limiter", {}) or {}
+    github_limiter = GitHubLimiterConfig(
+        inter_request_delay_seconds=float(
+            github_limiter_raw.get(
+                "inter_request_delay_seconds",
+                GitHubLimiterConfig.inter_request_delay_seconds,
+            )
+        ),
+        max_items_per_repo=int(
+            github_limiter_raw.get(
+                "max_items_per_repo", GitHubLimiterConfig.max_items_per_repo
+            )
+        ),
+        process_nice_increment=int(
+            github_limiter_raw.get(
+                "process_nice_increment",
+                GitHubLimiterConfig.process_nice_increment,
+            )
+        ),
+    )
     github_cfg = GitHubConfig(
         repos=[str(r) for r in repos],
         backfill_days=int(
             github_raw.get("backfill_days", GitHubConfig.backfill_days)
         ),
+        limiter=github_limiter,
     )
 
     # --- appswitch (optional section — defaults are fine) ---

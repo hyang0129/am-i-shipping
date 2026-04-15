@@ -13,6 +13,15 @@ import time
 from typing import Any, Dict, List, Optional
 
 
+_inter_request_delay: float = 0.0
+
+
+def configure_limiter(delay: float) -> None:
+    """Set the inter-request delay applied after each successful ``gh`` call."""
+    global _inter_request_delay
+    _inter_request_delay = delay
+
+
 class GhCliError(Exception):
     """Raised when a ``gh`` subprocess exits with a non-zero code."""
 
@@ -49,6 +58,8 @@ def run_gh(
             cmd, capture_output=True, text=True, timeout=120
         )
         if result.returncode == 0:
+            if _inter_request_delay > 0:
+                time.sleep(_inter_request_delay)
             return result.stdout
 
         last_err = GhCliError(cmd, result.returncode, result.stderr)
