@@ -75,6 +75,51 @@ def run_gh_json(
     return json.loads(stdout)
 
 
+def gh_graphql(
+    query: str,
+    variables: Optional[Dict[str, Any]] = None,
+    *,
+    max_retries: int = 3,
+    backoff_base: float = 2.0,
+) -> Dict[str, Any]:
+    """Call the GitHub GraphQL API via ``gh api graphql``.
+
+    Parameters
+    ----------
+    query:
+        GraphQL query string.
+    variables:
+        Dict of variable name -> value.  String values are passed with
+        ``-f`` (untyped); all other types are serialized with ``-F``
+        (typed) so that integers, booleans, etc. are interpreted correctly
+        by the ``gh`` CLI.
+    max_retries:
+        Number of retries on failure (same semantics as ``run_gh``).
+    backoff_base:
+        Base for exponential back-off between retries.
+
+    Returns
+    -------
+    Parsed JSON dict (the full GraphQL response, including ``data`` and
+    any ``errors`` keys).
+
+    Raises
+    ------
+    GhCliError
+        After exhausting retries.
+    """
+    args: List[str] = ["api", "graphql", "-f", f"query={query}"]
+
+    for k, v in (variables or {}).items():
+        if isinstance(v, str):
+            args.extend(["-f", f"{k}={v}"])
+        else:
+            args.extend(["-F", f"{k}={v}"])
+
+    stdout = run_gh(args, max_retries=max_retries, backoff_base=backoff_base)
+    return json.loads(stdout)
+
+
 def gh_api(
     endpoint: str,
     *,
