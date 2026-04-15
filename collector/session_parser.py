@@ -262,19 +262,26 @@ def process_session(
 
 def _load_messages(filepath: str | Path) -> List[Dict[str, Any]]:
     """Load user/assistant messages from a session file."""
+    filepath = Path(filepath)
     messages = []
-    with open(filepath, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            entry = json.loads(line)
-            if entry.get("type") not in ("user", "assistant"):
-                continue
-            msg = entry.get("message", {})
-            messages.append(
-                {"role": msg.get("role", entry["type"]), "content": msg.get("content", "")}
-            )
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # skip malformed lines
+                if entry.get("type") not in ("user", "assistant"):
+                    continue
+                msg = entry.get("message", {})
+                messages.append(
+                    {"role": msg.get("role", entry["type"]), "content": msg.get("content", "")}
+                )
+    except OSError as exc:
+        raise SessionParseError(f"Cannot read session file {filepath}: {exc}") from exc
     return messages
 
 
