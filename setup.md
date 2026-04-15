@@ -41,9 +41,45 @@ Add a `SessionEnd` hook that triggers the session parser after every Claude Code
 
 ## Step 2 — Schedule Nightly Collection
 
-### macOS — launchd
+The easiest way to set up scheduled collection is with the provided install scripts. Each script is idempotent — safe to re-run.
 
-1. Create a file at `~/Library/LaunchAgents/com.<yourname>.am-i-shipping.plist`:
+### Quick install (recommended)
+
+```bash
+# Linux
+bash scripts/install-cron.sh
+
+# macOS
+bash scripts/install-launchd.sh
+
+# Windows (PowerShell, run as Administrator)
+.\scripts\install-task.ps1
+```
+
+To remove the scheduled task later:
+
+```bash
+# Linux
+bash scripts/uninstall-cron.sh
+
+# macOS
+bash scripts/uninstall-launchd.sh
+
+# Windows (PowerShell)
+.\scripts\uninstall-task.ps1
+```
+
+All install scripts default to daily at 02:00 and run the full entry point (`run_collectors.sh` or `run_collectors.ps1`), which executes all collectors sequentially.
+
+---
+
+### Manual setup (alternative)
+
+If you prefer to configure the service manually instead of using the scripts above:
+
+#### macOS — launchd
+
+1. Create a file at `~/Library/LaunchAgents/com.am-i-shipping.collectors.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -51,23 +87,14 @@ Add a `SessionEnd` hook that triggers the session parser after every Claude Code
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.<yourname>.am-i-shipping</string>
+    <string>com.am-i-shipping.collectors</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/env</string>
-        <string>python3</string>
-        <string>-m</string>
-        <string>collector.session_parser</string>
-        <string>--mode</string>
-        <string>batch</string>
-        <string>--config</string>
-        <string><REPO_ROOT>/config.yaml</string>
+        <string>/bin/bash</string>
+        <string><REPO_ROOT>/run_collectors.sh</string>
     </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PYTHONPATH</key>
-        <string><REPO_ROOT></string>
-    </dict>
+    <key>WorkingDirectory</key>
+    <string><REPO_ROOT></string>
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
@@ -79,8 +106,6 @@ Add a `SessionEnd` hook that triggers the session parser after every Claude Code
     <string><REPO_ROOT>/logs/launchd.out.log</string>
     <key>StandardErrorPath</key>
     <string><REPO_ROOT>/logs/launchd.err.log</string>
-    <key>WorkingDirectory</key>
-    <string><REPO_ROOT></string>
     <key>RunAtLoad</key>
     <false/>
 </dict>
@@ -90,14 +115,14 @@ Add a `SessionEnd` hook that triggers the session parser after every Claude Code
 2. Load it:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.<yourname>.am-i-shipping.plist
+launchctl load ~/Library/LaunchAgents/com.am-i-shipping.collectors.plist
 ```
 
-**Verify:** `launchctl list | grep am-i-shipping` should show an entry. To test immediately: `launchctl start com.<yourname>.am-i-shipping`, then check `logs/` for output.
+**Verify:** `launchctl list | grep am-i-shipping` should show an entry. To test immediately: `launchctl start com.am-i-shipping.collectors`, then check `logs/` for output.
 
 ---
 
-### Windows — Task Scheduler
+#### Windows — Task Scheduler
 
 1. Open Task Scheduler (`taskschd.msc`).
 2. Click **Create Task** (not "Create Basic Task").
@@ -120,19 +145,13 @@ Replace `<REPO_ROOT>` with the absolute path to this repository.
 
 ---
 
-### Linux — cron
+#### Linux — cron
 
 Add a crontab entry:
 
 ```bash
 crontab -e
 ```
-
-```
-0 2 * * * PYTHONPATH=<REPO_ROOT> python3 <REPO_ROOT>/run_collectors.sh
-```
-
-Or use `run_collectors.sh` directly:
 
 ```
 0 2 * * * cd <REPO_ROOT> && bash run_collectors.sh >> logs/cron.log 2>&1
