@@ -46,9 +46,13 @@ def _run_collectors() -> subprocess.CompletedProcess:
 class TestIntegrationGate:
     """Smoke tests for the full collector pipeline."""
 
-    def test_run_collectors_produces_log(self, tmp_path: Path) -> None:
+    def test_run_collectors_produces_log(self) -> None:
         """run_collectors.sh creates a dated log file under logs/."""
         result = _run_collectors()
+        assert result.returncode == 0, (
+            f"run_collectors.sh exited {result.returncode}:\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
         log_dir = REPO_ROOT / "logs"
         assert log_dir.exists(), "logs/ directory was not created"
         log_files = sorted(log_dir.glob("run_*.log"))
@@ -56,7 +60,11 @@ class TestIntegrationGate:
 
     def test_health_check_passes(self) -> None:
         """health_check.py exits 0 after a clean collector run."""
-        _run_collectors()
+        run_result = _run_collectors()
+        assert run_result.returncode == 0, (
+            f"run_collectors.sh exited {run_result.returncode}:\n"
+            f"stdout: {run_result.stdout}\nstderr: {run_result.stderr}"
+        )
         result = subprocess.run(
             [sys.executable, "-m", "am_i_shipping.health_check"],
             cwd=str(REPO_ROOT),
@@ -69,9 +77,16 @@ class TestIntegrationGate:
             f"stdout: {result.stdout}\nstderr: {result.stderr}"
         )
 
+    # Known tables for each database — avoids dynamic SQL construction
+    GITHUB_TABLES = ("issues", "pull_requests", "pushes", "issue_pr_links")
+
     def test_databases_have_data(self) -> None:
         """After a run, implemented collector DBs contain rows."""
-        _run_collectors()
+        run_result = _run_collectors()
+        assert run_result.returncode == 0, (
+            f"run_collectors.sh exited {run_result.returncode}:\n"
+            f"stdout: {run_result.stdout}\nstderr: {run_result.stderr}"
+        )
         data_dir = REPO_ROOT / "data"
 
         # sessions.db — session parser
@@ -88,25 +103,29 @@ class TestIntegrationGate:
         github_db = data_dir / "github.db"
         if github_db.exists():
             conn = sqlite3.connect(str(github_db))
-            # Check any table has data
-            tables = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
             has_data = False
-            for (table_name,) in tables:
-                count = conn.execute(
-                    f"SELECT COUNT(*) FROM [{table_name}]"
-                ).fetchone()[0]
-                if count > 0:
-                    has_data = True
-                    break
+            for table_name in self.GITHUB_TABLES:
+                try:
+                    count = conn.execute(
+                        f"SELECT COUNT(*) FROM [{table_name}]"
+                    ).fetchone()[0]
+                    if count > 0:
+                        has_data = True
+                        break
+                except sqlite3.OperationalError:
+                    # Table may not exist yet
+                    continue
             conn.close()
             assert has_data, "github.db has no data in any table after collector run"
 
     def test_no_duplicate_rows_on_rerun(self) -> None:
         """Re-running collectors over the same period produces no duplicates."""
         # First run
-        _run_collectors()
+        run_result = _run_collectors()
+        assert run_result.returncode == 0, (
+            f"First run_collectors.sh exited {run_result.returncode}:\n"
+            f"stdout: {run_result.stdout}\nstderr: {run_result.stderr}"
+        )
         data_dir = REPO_ROOT / "data"
 
         # Capture row counts before second run
@@ -123,17 +142,21 @@ class TestIntegrationGate:
         github_db = data_dir / "github.db"
         if github_db.exists():
             conn = sqlite3.connect(str(github_db))
-            tables = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-            for (table_name,) in tables:
-                counts_before[f"github.{table_name}"] = conn.execute(
-                    f"SELECT COUNT(*) FROM [{table_name}]"
-                ).fetchone()[0]
+            for table_name in self.GITHUB_TABLES:
+                try:
+                    counts_before[f"github.{table_name}"] = conn.execute(
+                        f"SELECT COUNT(*) FROM [{table_name}]"
+                    ).fetchone()[0]
+                except sqlite3.OperationalError:
+                    continue
             conn.close()
 
         # Second run
-        _run_collectors()
+        run_result2 = _run_collectors()
+        assert run_result2.returncode == 0, (
+            f"Second run_collectors.sh exited {run_result2.returncode}:\n"
+            f"stdout: {run_result2.stdout}\nstderr: {run_result2.stderr}"
+        )
 
         # Verify counts are unchanged (idempotency)
         if sessions_db.exists():
@@ -149,13 +172,13 @@ class TestIntegrationGate:
 
         if github_db.exists():
             conn = sqlite3.connect(str(github_db))
-            tables = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-            for (table_name,) in tables:
-                count_after = conn.execute(
-                    f"SELECT COUNT(*) FROM [{table_name}]"
-                ).fetchone()[0]
+            for table_name in self.GITHUB_TABLES:
+                try:
+                    count_after = conn.execute(
+                        f"SELECT COUNT(*) FROM [{table_name}]"
+                    ).fetchone()[0]
+                except sqlite3.OperationalError:
+                    continue
                 expected = counts_before.get(f"github.{table_name}", 0)
                 assert count_after == expected, (
                     f"github.db.{table_name} row count changed: "
@@ -168,7 +191,11 @@ class TestIntegrationGate:
         import json
         from datetime import datetime, timezone, timedelta
 
-        _run_collectors()
+        run_result = _run_collectors()
+        assert run_result.returncode == 0, (
+            f"run_collectors.sh exited {run_result.returncode}:\n"
+            f"stdout: {run_result.stdout}\nstderr: {run_result.stderr}"
+        )
         health_path = REPO_ROOT / "data" / "health.json"
         assert health_path.exists(), "health.json not found after collector run"
 
