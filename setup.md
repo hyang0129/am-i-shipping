@@ -17,7 +17,22 @@ Add a `SessionEnd` hook that triggers the session parser after every Claude Code
     "SessionEnd": [
       {
         "type": "command",
-        "command": "python \"<REPO_ROOT>/collector/session_parser.py\" --mode hook --session-file \"$SESSION_FILE\""
+        "command": "python -m collector.session_parser --mode hook --session-file \"$SESSION_FILE\" --config \"<REPO_ROOT>/config.yaml\""
+      }
+    ]
+  }
+}
+```
+
+Alternatively, if you installed with `pip install -e .`:
+
+```json
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "type": "command",
+        "command": "am-session-parser --mode hook --session-file \"$SESSION_FILE\" --config \"<REPO_ROOT>/config.yaml\""
       }
     ]
   }
