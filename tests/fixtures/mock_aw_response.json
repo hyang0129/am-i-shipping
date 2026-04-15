@@ -1,0 +1,74 @@
+[
+  {
+    "id": 1,
+    "timestamp": "2025-04-14T10:00:00.000Z",
+    "duration": 30.0,
+    "data": {
+      "app": "Code.exe",
+      "title": "main.py - my-project - Visual Studio Code"
+    }
+  },
+  {
+    "id": 2,
+    "timestamp": "2025-04-14T10:00:15.000Z",
+    "duration": 15.0,
+    "data": {
+      "app": "Code.exe",
+      "title": "main.py - my-project - Visual Studio Code"
+    }
+  },
+  {
+    "id": 3,
+    "timestamp": "2025-04-14T10:00:30.000Z",
+    "duration": 30.0,
+    "data": {
+      "app": "chrome.exe",
+      "title": "Stack Overflow - Google Chrome"
+    }
+  },
+  {
+    "id": 4,
+    "timestamp": "2025-04-14T10:01:00.000Z",
+    "duration": 28.0,
+    "data": {
+      "app": "Code.exe",
+      "title": "main.py - my-project - Visual Studio Code"
+    }
+  },
+  {
+    "id": 5,
+    "timestamp": "2025-04-14T10:01:30.000Z",
+    "duration": 30.0,
+    "data": {
+      "app": "chrome.exe",
+      "title": "Stack Overflow - Google Chrome"
+    }
+  },
+  {
+    "id": 6,
+    "timestamp": "2025-04-14T10:02:00.000Z",
+    "duration": 30.0,
+    "data": {
+      "app": "WindowsTerminal.exe",
+      "title": "Windows PowerShell"
+    }
+  },
+  {
+    "id": 7,
+    "timestamp": "2025-04-14T10:02:05.000Z",
+    "duration": 5.0,
+    "data": {
+      "app": "WindowsTerminal.exe",
+      "title": "Windows PowerShell"
+    }
+  },
+  {
+    "id": 8,
+    "timestamp": "2025-04-14T10:00:00.000Z",
+    "duration": 30.0,
+    "data": {
+      "app": "Code.exe",
+      "title": "main.py - my-project - Visual Studio Code"
+    }
+  }
+]
