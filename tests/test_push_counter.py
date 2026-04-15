@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
+from collector.github_poller.gh_client import GhCliError
 from collector.github_poller.push_counter import count_pushes_after_review
 
 
@@ -83,5 +84,5 @@ class TestPushCounter:
     @patch("collector.github_poller.push_counter.gh_api")
     def test_api_failure_returns_zero(self, mock_api):
         """If API calls fail, returns 0 rather than raising."""
-        mock_api.side_effect = Exception("timeout")
+        mock_api.side_effect = GhCliError(["gh", "api"], 1, "timeout")
         assert count_pushes_after_review("owner/repo", 1) == 0

@@ -64,7 +64,7 @@ def _fetch_reviews(owner: str, name: str, pr_number: int) -> List[Dict[str, Any]
     try:
         result = gh_api(endpoint, paginate=True)
         return result if isinstance(result, list) else []
-    except (GhCliError, Exception):
+    except GhCliError:
         return []
 
 
@@ -74,7 +74,7 @@ def _fetch_commits(owner: str, name: str, pr_number: int) -> List[Dict[str, Any]
     try:
         result = gh_api(endpoint, paginate=True)
         return result if isinstance(result, list) else []
-    except (GhCliError, Exception):
+    except GhCliError:
         return []
 
 

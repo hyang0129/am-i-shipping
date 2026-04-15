@@ -84,7 +84,6 @@ def link_sessions(
         return 0
 
     # Match and insert links
-    inserted = 0
     gh_conn = sqlite3.connect(str(github_db_path))
     try:
         for pr_number, head_ref in prs:
@@ -102,7 +101,6 @@ def link_sessions(
                         """,
                         (repo, pr_number, session_uuid),
                     )
-                    inserted += gh_conn.total_changes  # approximate
                 except sqlite3.IntegrityError:
                     pass  # already linked
         gh_conn.commit()

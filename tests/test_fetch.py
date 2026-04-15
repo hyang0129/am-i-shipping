@@ -12,6 +12,7 @@ import pytest
 
 from collector.github_poller.fetch_issues import fetch_issues, _extract_type_label
 from collector.github_poller.fetch_prs import fetch_prs
+from collector.github_poller.gh_client import GhCliError
 
 
 # --- Fixture data ---
@@ -105,7 +106,7 @@ class TestFetchIssues:
     def test_comments_on_api_failure(self, mock_list, mock_api):
         """If comment fetch fails, returns empty list, not an error."""
         mock_list.return_value = [ISSUE_FIXTURE[0]]
-        mock_api.side_effect = Exception("rate limited")
+        mock_api.side_effect = GhCliError(["gh", "api"], 1, "rate limited")
 
         results = fetch_issues("owner/repo")
         assert len(results) == 1
@@ -170,7 +171,7 @@ class TestFetchPRs:
     def test_review_comments_on_api_failure(self, mock_list, mock_api):
         """If review comment fetch fails, returns empty list."""
         mock_list.return_value = [PR_FIXTURE[0]]
-        mock_api.side_effect = Exception("timeout")
+        mock_api.side_effect = GhCliError(["gh", "api"], 1, "timeout")
 
         results = fetch_prs("owner/repo")
         assert results[0]["review_comments"] == []

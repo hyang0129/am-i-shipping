@@ -7,7 +7,6 @@ body, comments (list of {author, body, created_at}).
 
 from __future__ import annotations
 
-import json
 from typing import Any, Dict, List, Optional
 
 from .gh_client import GhCliError, run_gh_json, gh_api
@@ -81,7 +80,7 @@ def _fetch_issue_comments(
 
     try:
         raw = gh_api(endpoint, paginate=True)
-    except (GhCliError, Exception):
+    except GhCliError:
         return []
 
     if not isinstance(raw, list):
