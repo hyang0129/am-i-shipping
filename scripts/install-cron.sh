@@ -10,6 +10,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Ensure logs directory exists (cron command redirects output there)
+mkdir -p "$REPO_ROOT/logs"
+
 CRON_TAG="am-i-shipping-collectors"
 CRON_CMD="cd \"$REPO_ROOT\" && bash run_collectors.sh >> logs/cron.log 2>&1"
 CRON_LINE="0 2 * * * $CRON_CMD # $CRON_TAG"
