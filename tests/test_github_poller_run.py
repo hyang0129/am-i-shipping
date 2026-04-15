@@ -56,8 +56,9 @@ class TestDryRun:
         ]
         mock_push.return_value = 0
 
-        count = run(config_path=config_file, dry_run=True)
+        count, ok = run(config_path=config_file, dry_run=True)
         assert count == 2  # 1 issue + 1 PR
+        assert ok is True
 
         # Verify no DB was created
         data_dir = tmp_path / "data"

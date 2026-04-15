@@ -39,7 +39,7 @@ from .store import upsert_issue, upsert_pr, upsert_pr_issue_link
 def run(
     config_path: Optional[str] = None,
     dry_run: bool = False,
-) -> int:
+) -> tuple[int, bool]:
     """Run the poller for all configured repos.
 
     Parameters
@@ -51,7 +51,9 @@ def run(
 
     Returns
     -------
-    Total number of records (issues + PRs) processed across all repos.
+    A tuple of (total_records, all_succeeded) where *total_records* is
+    the number of issues + PRs processed, and *all_succeeded* is True
+    only if every configured repo was polled without error.
     """
     config = load_config(config_path)
     data_dir = config.data_path
@@ -85,7 +87,7 @@ def run(
     if all_succeeded and not dry_run:
         write_health("github_poller", total_records, data_dir=data_dir)
 
-    return total_records
+    return total_records, all_succeeded
 
 
 def _poll_repo(
@@ -161,7 +163,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    run(config_path=args.config, dry_run=args.dry_run)
+    _total, ok = run(config_path=args.config, dry_run=args.dry_run)
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

@@ -34,8 +34,8 @@ def link_sessions(
 
     Returns
     -------
-    Number of new links inserted (0 if sessions.db is absent or empty,
-    or if no matches are found).
+    Total number of PR-session links for this repo (0 if sessions.db
+    is absent or empty, or if no matches are found).
     """
     sessions_db_path = Path(sessions_db_path)
     github_db_path = Path(github_db_path)
