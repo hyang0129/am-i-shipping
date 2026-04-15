@@ -80,6 +80,21 @@ class TestWindowHash:
         h = _window_hash("", "")
         assert len(h) == 8
 
+    def test_similar_inputs_differ(self):
+        """Near-identical inputs must produce different hashes."""
+        h1 = _window_hash("Code.exe", "main.py - my-project")
+        h2 = _window_hash("Code.exe", "main.py - my-projec")
+        assert h1 != h2
+
+    def test_collision_risk_documented(self):
+        """Hash is 8 hex chars = 32 bits. With N unique (bucket, app+title) pairs
+        the birthday-paradox collision probability is ~N^2 / 2^33. At 10k daily
+        events that is ~1 in 800k — acceptable for dedup, not for a primary key
+        in a multi-year archive. This test documents the design choice."""
+        # 100 distinct inputs should all produce distinct hashes (overwhelmingly likely)
+        hashes = {_window_hash(f"app{i}", f"title{i}") for i in range(100)}
+        assert len(hashes) == 100
+
 
 # ---------------------------------------------------------------------------
 # deduplicate

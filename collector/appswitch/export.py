@@ -86,7 +86,14 @@ def fetch_events(
         print(f"ERROR: Failed to fetch events from {url}: {exc}", file=sys.stderr)
         raise
 
-    return data if isinstance(data, list) else []
+    if not isinstance(data, list):
+        print(
+            f"WARNING: AW API returned non-list response ({type(data).__name__}), "
+            f"treating as empty",
+            file=sys.stderr,
+        )
+        return []
+    return data
 
 
 def deduplicate(events: List[Dict[str, Any]], interval: int = 30) -> List[Dict[str, Any]]:
