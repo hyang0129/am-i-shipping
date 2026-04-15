@@ -9,45 +9,95 @@ Three steps to get the workflow monitor collecting data.
 Add a `SessionEnd` hook that triggers the session parser after every Claude Code session.
 
 1. Open your Claude Code settings (or create `~/.claude/settings.json` if it does not exist).
-2. Add the following hook configuration:
+2. Add the following hook configuration, replacing `<REPO_ROOT>` with the absolute path to this repository:
 
 ```json
 {
   "hooks": {
     "SessionEnd": [
       {
-        "type": "command",
-        "command": "python -m collector.session_parser --mode hook --session-file \"$SESSION_FILE\" --config \"<REPO_ROOT>/config.yaml\""
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -m collector.session_parser --mode hook --session-file \"$SESSION_FILE\" --config \"<REPO_ROOT>/config.yaml\""
+          }
+        ]
       }
     ]
   }
 }
 ```
 
-Alternatively, if you installed with `pip install -e .`:
-
-```json
-{
-  "hooks": {
-    "SessionEnd": [
-      {
-        "type": "command",
-        "command": "am-session-parser --mode hook --session-file \"$SESSION_FILE\" --config \"<REPO_ROOT>/config.yaml\""
-      }
-    ]
-  }
-}
-```
-
-Replace `<REPO_ROOT>` with the absolute path to this repository (e.g., `C:\Users\you\repos\am-i-shipping`).
+> **Note:** `python3` must resolve to the interpreter for which this package is installed. If your environment uses a different name or path (e.g. a virtualenv), replace `python3` with the full path, for example `/usr/local/bin/python3`.
+>
+> If the `collector` package is not on the interpreter's path (common with Homebrew Python and editable installs), prefix the command with `PYTHONPATH=<REPO_ROOT>`:
+> ```
+> PYTHONPATH=<REPO_ROOT> python3 -m collector.session_parser ...
+> ```
 
 **Verify:** Start and end a short Claude Code session. Check `data/health.json` — the `session_parser` entry should have a recent `last_success` timestamp.
 
 ---
 
-## Step 2 — Add Task Scheduler Entry
+## Step 2 — Schedule Nightly Collection
 
-Create a Windows Task Scheduler task that runs the collector pipeline nightly.
+### macOS — launchd
+
+1. Create a file at `~/Library/LaunchAgents/com.<yourname>.am-i-shipping.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.<yourname>.am-i-shipping</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>python3</string>
+        <string>-m</string>
+        <string>collector.session_parser</string>
+        <string>--mode</string>
+        <string>batch</string>
+        <string>--config</string>
+        <string><REPO_ROOT>/config.yaml</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string><REPO_ROOT></string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>2</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string><REPO_ROOT>/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string><REPO_ROOT>/logs/launchd.err.log</string>
+    <key>WorkingDirectory</key>
+    <string><REPO_ROOT></string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
+```
+
+2. Load it:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.<yourname>.am-i-shipping.plist
+```
+
+**Verify:** `launchctl list | grep am-i-shipping` should show an entry. To test immediately: `launchctl start com.<yourname>.am-i-shipping`, then check `logs/` for output.
+
+---
+
+### Windows — Task Scheduler
 
 1. Open Task Scheduler (`taskschd.msc`).
 2. Click **Create Task** (not "Create Basic Task").
@@ -70,6 +120,26 @@ Replace `<REPO_ROOT>` with the absolute path to this repository.
 
 ---
 
+### Linux — cron
+
+Add a crontab entry:
+
+```bash
+crontab -e
+```
+
+```
+0 2 * * * PYTHONPATH=<REPO_ROOT> python3 <REPO_ROOT>/run_collectors.sh
+```
+
+Or use `run_collectors.sh` directly:
+
+```
+0 2 * * * cd <REPO_ROOT> && bash run_collectors.sh >> logs/cron.log 2>&1
+```
+
+---
+
 ## Step 3 — Create config.yaml
 
 Copy the example config and fill in the required fields:
@@ -83,7 +153,9 @@ Open `config.yaml` and set the required values:
 ```yaml
 session:
   # REQUIRED — path to your Claude Code projects directory
-  projects_path: "C:/Users/<you>/.claude/projects"
+  # macOS/Linux: /Users/<you>/.claude/projects
+  # Windows:     C:/Users/<you>/.claude/projects
+  projects_path: "/Users/<you>/.claude/projects"
 
 github:
   # REQUIRED — repos to poll (owner/repo format)
@@ -94,7 +166,11 @@ github:
 
 All other fields have sensible defaults. See the comments in `config.yaml.example` for optional settings.
 
-**Verify:** Run `python config_loader.py` (or `python -c "from config_loader import load_config; print(load_config())"`) — it should print the config object without errors.
+**Verify:** Run the following from the repo root — it should print the config without errors:
+
+```bash
+PYTHONPATH=. python3 -c "from am_i_shipping.config_loader import load_config; print(load_config())"
+```
 
 ---
 
@@ -102,7 +178,9 @@ All other fields have sensible defaults. See the comments in `config.yaml.exampl
 
 | Symptom | Fix |
 |---------|-----|
-| `config_loader.py` raises `ConfigError` | Check that `session.projects_path` and `github.repos` are set in `config.yaml` |
-| `health_check.py` exits 1 | Run `python health_check.py` — it prints which collector is stale or missing |
-| No log files in `logs/` | Make sure `run_collectors.ps1` has the correct `Start in` directory in Task Scheduler |
-| Session parser not triggering | Verify the hook is registered: check `~/.claude/settings.json` for the `SessionEnd` entry |
+| `ConfigError` on startup | Check that `session.projects_path` and `github.repos` are set in `config.yaml` |
+| `health_check.py` exits 1 | Run `PYTHONPATH=. python3 -m am_i_shipping.health_check` — it prints which collector is stale or missing |
+| No log files in `logs/` | Make sure `logs/` directory exists (`mkdir -p logs`); on Windows verify `Start in` is set correctly in Task Scheduler |
+| Session parser not triggering | Verify the hook is registered in `~/.claude/settings.json`; check that the `SessionEnd` array items have a nested `hooks` array (see Step 1) |
+| `ModuleNotFoundError: No module named 'collector'` | The `PYTHONPATH` env var must point to the repo root; set it explicitly in the hook command or launchd plist |
+| `am-session-parser: command not found` | Use `python3 -m collector.session_parser` instead — editable installs with Homebrew Python do not always place scripts on `$PATH` |
