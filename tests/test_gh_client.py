@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from collector.github_poller.gh_client import GhCliError, run_gh, run_gh_json, gh_api
+from collector.github_poller.gh_client import GhCliError, run_gh, run_gh_json, gh_api, gh_graphql
 
 
 class TestGhCliError:
@@ -102,3 +102,46 @@ class TestGhApi:
         )
         result = gh_api("/repos/owner/repo/issues", paginate=True)
         assert result == [{"id": 1}, {"id": 2}]
+
+
+class TestGhGraphql:
+    @patch("collector.github_poller.gh_client.subprocess.run")
+    def test_basic_query_returns_parsed_data(self, mock_run):
+        """gh_graphql returns parsed data from GraphQL response."""
+        response = {"data": {"repository": {"issue": {"number": 1}}}}
+        mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(response))
+        result = gh_graphql("query { ... }", {"owner": "test", "name": "repo"})
+        assert result == response
+
+    @patch("collector.github_poller.gh_client.time.sleep")
+    @patch("collector.github_poller.gh_client.subprocess.run")
+    def test_retries_on_failure(self, mock_run, mock_sleep):
+        """gh_graphql retries with backoff like run_gh."""
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="rate limited")
+        with pytest.raises(GhCliError):
+            gh_graphql("query { ... }", {}, max_retries=1)
+        # 2 total attempts: initial + 1 retry
+        assert mock_run.call_count == 2
+
+    @patch("collector.github_poller.gh_client.subprocess.run")
+    def test_string_vars_use_lowercase_f(self, mock_run):
+        """String variables are passed with -f (untyped)."""
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"data":{}}')
+        gh_graphql("query($owner: String!) { ... }", {"owner": "myorg"})
+        cmd = mock_run.call_args[0][0]
+        # Find the index of "-f" that precedes "owner=myorg"
+        assert "-f" in cmd
+        f_indices = [i for i, a in enumerate(cmd) if a == "-f"]
+        owner_args = [cmd[i + 1] for i in f_indices if i + 1 < len(cmd)]
+        assert any("owner=myorg" in arg for arg in owner_args)
+
+    @patch("collector.github_poller.gh_client.subprocess.run")
+    def test_non_string_vars_use_uppercase_f(self, mock_run):
+        """Non-string variables (int, bool) are passed with -F (typed)."""
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"data":{}}')
+        gh_graphql("query($n: Int!) { ... }", {"n": 42})
+        cmd = mock_run.call_args[0][0]
+        assert "-F" in cmd
+        F_indices = [i for i, a in enumerate(cmd) if a == "-F"]
+        n_args = [cmd[i + 1] for i in F_indices if i + 1 < len(cmd)]
+        assert any("n=" in arg for arg in n_args)

@@ -11,11 +11,11 @@ What is tested
 1. A new issue appears in the DB after the first poll.
 2. Re-polling produces no duplicate rows (upsert is idempotent).
 3. Editing the issue body is reflected on the next poll; old text is not
-   preserved (known gap — no history table).
-4. A new comment appears in ``comments_json`` after a re-poll.
+   preserved (upsert overwrites); edit history is recorded in issue_body_edits.
+4. A new comment appears in ``comments_json`` after a re-poll; each stored
+   comment dict includes an ``id`` key.
 5. Editing a comment is reflected; no duplicate comment entry is created;
-   original text is not preserved; ``updated_at`` is absent from the stored
-   comment (known gap — fetch_issues does not capture it).
+   original text is not preserved; edit history is recorded in issue_comment_edits.
 
 Cursor note
 -----------
@@ -222,10 +222,8 @@ class TestGitHubPollerE2E:
         )
 
     def test_issue_body_edit_is_reflected(self, class_tmp_path, live_issue):
-        """Editing the issue body updates the stored row on the next poll.
-
-        Known gap: old body text is not preserved — the upsert overwrites it
-        with no history table.  This test documents that gap explicitly.
+        """Editing the issue body updates the stored row on the next poll
+        and records a row in issue_body_edits.
         """
         config = _write_config(class_tmp_path)
         db_path = class_tmp_path / "data" / "github.db"
@@ -254,11 +252,20 @@ class TestGitHubPollerE2E:
             "Updated body was not reflected in DB after re-poll"
         )
 
-        # Known gap: original text is gone — no history preserved
+        # Original text is gone — upsert overwrites it
         assert "Initial body text" not in after["body"], (
             "Old body text unexpectedly still present — "
             "upsert should have overwritten it"
         )
+
+        # Edit history is now recorded
+        conn = sqlite3.connect(str(db_path))
+        edits = conn.execute(
+            "SELECT * FROM issue_body_edits WHERE repo = ? AND issue_number = ?",
+            (REPO, live_issue),
+        ).fetchall()
+        conn.close()
+        assert len(edits) >= 1, "No body edit history recorded in issue_body_edits"
 
     def test_new_comment_appears_after_poll(self, class_tmp_path, live_issue):
         """A comment added to an issue appears in ``comments_json`` after re-poll."""
@@ -290,20 +297,20 @@ class TestGitHubPollerE2E:
         assert any("First comment" in b for b in bodies), (
             "Comment body not found in stored comments"
         )
+        for c in after["comments"]:
+            assert "id" in c, "comment_id missing from stored comment"
 
     def test_comment_edit_reflected_no_duplicate_no_history(
         self, class_tmp_path, live_issue
     ):
-        """Editing a comment updates the stored text on re-poll.
+        """Editing a comment updates the stored text on re-poll and records
+        a row in issue_comment_edits.
 
         Asserts:
         - Edited text appears in ``comments_json``
         - Comment count does not increase (no duplication)
-
-        Known gaps documented:
         - Original comment text is not preserved (overwritten by upsert)
-        - ``updated_at`` is absent from stored comment dicts (not fetched)
-          — if this assertion fails, the gap has been fixed; remove it
+        - At least one row is recorded in issue_comment_edits
         """
         config = _write_config(class_tmp_path)
         db_path = class_tmp_path / "data" / "github.db"
@@ -359,14 +366,16 @@ class TestGitHubPollerE2E:
             "after comment edit — possible duplication in comments_json"
         )
 
-        # Known gap: original text is gone
+        # Original text is gone — upsert overwrites it
         assert not any("ORIGINAL TEXT" in b for b in bodies), (
             "Original comment text still present — expected upsert to overwrite it"
         )
 
-        # Known gap: no updated_at on stored comments
-        for c in after["comments"]:
-            assert "updated_at" not in c, (
-                "updated_at present on stored comment — "
-                "remove this assertion if the gap is intentionally fixed"
-            )
+        # Comment edit history is now recorded
+        conn = sqlite3.connect(str(db_path))
+        edits = conn.execute(
+            "SELECT * FROM issue_comment_edits WHERE repo = ? AND issue_number = ?",
+            (REPO, live_issue),
+        ).fetchall()
+        conn.close()
+        assert len(edits) >= 1, "No comment edit history recorded in issue_comment_edits"
