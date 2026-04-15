@@ -33,8 +33,7 @@ TIMESTAMP="$(date +%Y-%m-%d_%H%M%S)"
 LOG_FILE="$LOG_DIR/run_$TIMESTAMP.log"
 
 log() {
-    local msg="$(date '+%Y-%m-%d %H:%M:%S') | $*"
-    echo "$msg" | tee -a "$LOG_FILE"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') | $*" | tee -a "$LOG_FILE"
 }
 
 run_collector() {
