@@ -69,7 +69,7 @@ bash scripts/uninstall-launchd.sh
 .\scripts\uninstall-task.ps1
 ```
 
-All install scripts default to daily at 02:00 and run the full entry point (`run_collectors.sh` or `run_collectors.ps1`), which executes all collectors sequentially.
+All install scripts default to daily at 02:00. They also install a boot-time fallback trigger so that if your PC is off at 02:00, the run happens automatically the next time you log in. Collectors are idempotent — running twice in one day produces no duplicate data.
 
 ---
 
@@ -107,7 +107,7 @@ If you prefer to configure the service manually instead of using the scripts abo
     <key>StandardErrorPath</key>
     <string><REPO_ROOT>/logs/launchd.err.log</string>
     <key>RunAtLoad</key>
-    <false/>
+    <true/>
 </dict>
 </plist>
 ```
@@ -155,7 +155,10 @@ crontab -e
 
 ```
 0 2 * * * cd <REPO_ROOT> && bash run_collectors.sh >> logs/cron.log 2>&1
+@reboot sleep 60 && cd <REPO_ROOT> && bash run_collectors.sh >> logs/cron.log 2>&1
 ```
+
+The `@reboot` line recovers missed runs when the PC was off at 02:00. Both entries are safe to have simultaneously — collectors are idempotent.
 
 ---
 

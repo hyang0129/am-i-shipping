@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Install a macOS launchd agent to run am-i-shipping collectors daily at 02:00.
+# Install a macOS launchd agent to run am-i-shipping collectors daily at 02:00,
+# with a login-time trigger so missed runs (e.g. Mac was off overnight) are
+# recovered on next login. Collectors are idempotent so same-day double-runs are safe.
 # Idempotent: re-running this script will update the plist and reload the agent.
 #
 # Usage:
@@ -52,7 +54,7 @@ cat > "$PLIST_PATH" <<PLIST
     <key>StandardErrorPath</key>
     <string>$REPO_ROOT/logs/launchd.err.log</string>
     <key>RunAtLoad</key>
-    <false/>
+    <true/>
 </dict>
 </plist>
 PLIST
