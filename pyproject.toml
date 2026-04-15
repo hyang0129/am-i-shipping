@@ -12,6 +12,7 @@ dependencies = ["pyyaml>=6.0"]
 am-init-db = "am_i_shipping.db:main"
 am-health-check = "am_i_shipping.health_check:main"
 am-session-parser = "collector.session_parser:main"
+am-github-poller = "collector.github_poller.run:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

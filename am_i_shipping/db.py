@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS issues (
     comments_json   TEXT,
     created_at      TEXT,
     closed_at       TEXT,
+    updated_at      TEXT,
     PRIMARY KEY (repo, issue_number)
 );
 """
@@ -77,6 +78,7 @@ CREATE TABLE IF NOT EXISTS pull_requests (
     push_count          INTEGER DEFAULT 0,
     created_at          TEXT,
     merged_at           TEXT,
+    updated_at          TEXT,
     PRIMARY KEY (repo, pr_number)
 );
 """
@@ -106,6 +108,58 @@ CREATE TABLE IF NOT EXISTS poll_cursor (
 );
 """
 
+GITHUB_ISSUE_BODY_EDITS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS issue_body_edits (
+    repo        TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    edited_at   TEXT NOT NULL,
+    diff        TEXT,
+    editor      TEXT,
+    PRIMARY KEY (repo, issue_number, edited_at)
+);
+"""
+
+GITHUB_ISSUE_COMMENT_EDITS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS issue_comment_edits (
+    repo         TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    comment_id   INTEGER NOT NULL,
+    edited_at    TEXT NOT NULL,
+    diff         TEXT,
+    editor       TEXT,
+    PRIMARY KEY (repo, issue_number, comment_id, edited_at)
+);
+"""
+
+GITHUB_PR_BODY_EDITS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pr_body_edits (
+    repo       TEXT NOT NULL,
+    pr_number  INTEGER NOT NULL,
+    edited_at  TEXT NOT NULL,
+    diff        TEXT,
+    editor      TEXT,
+    PRIMARY KEY (repo, pr_number, edited_at)
+);
+"""
+
+GITHUB_PR_REVIEW_COMMENT_EDITS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pr_review_comment_edits (
+    repo        TEXT NOT NULL,
+    pr_number   INTEGER NOT NULL,
+    comment_id  INTEGER NOT NULL,
+    edited_at   TEXT NOT NULL,
+    diff         TEXT,
+    editor       TEXT,
+    PRIMARY KEY (repo, pr_number, comment_id, edited_at)
+);
+"""
+
+# Columns added to existing tables after initial schema — migrated on init
+_GITHUB_MIGRATIONS = [
+    "ALTER TABLE issues ADD COLUMN updated_at TEXT",
+    "ALTER TABLE pull_requests ADD COLUMN updated_at TEXT",
+]
+
 APPSWITCH_SCHEMA = """
 CREATE TABLE IF NOT EXISTS app_events (
     timestamp_bucket INTEGER NOT NULL,
@@ -134,7 +188,7 @@ def init_sessions_db(db_path: Path) -> None:
 
 
 def init_github_db(db_path: Path) -> None:
-    """Create github.db with issues, PRs, linkage, and cursor tables."""
+    """Create github.db with issues, PRs, linkage, cursor, and edit history tables."""
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute(GITHUB_ISSUES_SCHEMA)
@@ -142,6 +196,15 @@ def init_github_db(db_path: Path) -> None:
         conn.execute(GITHUB_PR_ISSUES_SCHEMA)
         conn.execute(GITHUB_PR_SESSIONS_SCHEMA)
         conn.execute(GITHUB_CURSOR_SCHEMA)
+        conn.execute(GITHUB_ISSUE_BODY_EDITS_SCHEMA)
+        conn.execute(GITHUB_ISSUE_COMMENT_EDITS_SCHEMA)
+        conn.execute(GITHUB_PR_BODY_EDITS_SCHEMA)
+        conn.execute(GITHUB_PR_REVIEW_COMMENT_EDITS_SCHEMA)
+        for migration in _GITHUB_MIGRATIONS:
+            try:
+                conn.execute(migration)
+            except sqlite3.OperationalError:
+                pass  # column already exists
         conn.commit()
     finally:
         conn.close()
