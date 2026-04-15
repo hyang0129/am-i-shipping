@@ -32,9 +32,23 @@ CREATE TABLE IF NOT EXISTS sessions (
     working_directory TEXT,
     git_branch      TEXT,
     raw_content_json TEXT,
+    input_tokens    INTEGER DEFAULT 0,
+    output_tokens   INTEGER DEFAULT 0,
+    cache_creation_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    fast_mode_turns INTEGER DEFAULT 0,
     created_at      TEXT DEFAULT (datetime('now'))
 );
 """
+
+# Columns added after the initial schema — migrated on init
+_SESSIONS_MIGRATIONS = [
+    "ALTER TABLE sessions ADD COLUMN input_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE sessions ADD COLUMN output_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE sessions ADD COLUMN cache_creation_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE sessions ADD COLUMN cache_read_tokens INTEGER DEFAULT 0",
+    "ALTER TABLE sessions ADD COLUMN fast_mode_turns INTEGER DEFAULT 0",
+]
 
 GITHUB_ISSUES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS issues (
@@ -105,10 +119,15 @@ CREATE TABLE IF NOT EXISTS app_events (
 
 
 def init_sessions_db(db_path: Path) -> None:
-    """Create sessions.db with the sessions table."""
+    """Create sessions.db with the sessions table, running any pending migrations."""
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute(SESSIONS_SCHEMA)
+        for migration in _SESSIONS_MIGRATIONS:
+            try:
+                conn.execute(migration)
+            except sqlite3.OperationalError:
+                pass  # column already exists
         conn.commit()
     finally:
         conn.close()
