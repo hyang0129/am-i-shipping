@@ -123,10 +123,15 @@ class TestGhClientDelay:
 class TestItemCap:
     @patch("collector.github_poller.run.link_sessions")
     @patch("collector.github_poller.run.count_pushes_after_review")
+    @patch("collector.github_poller.run.fetch_pr_edit_history", return_value={})
+    @patch("collector.github_poller.run.fetch_issue_edit_history_batch", return_value={})
+    @patch("collector.github_poller.run.fetch_pr_review_comments", return_value=[])
+    @patch("collector.github_poller.run.fetch_issue_comments", return_value=[])
     @patch("collector.github_poller.run.fetch_prs")
     @patch("collector.github_poller.run.fetch_issues")
     def test_item_cap_limits_processing(
-        self, mock_issues, mock_prs, mock_push, mock_link, tmp_path
+        self, mock_issues, mock_prs, mock_issue_comments, mock_pr_comments,
+        mock_edit_batch, mock_pr_edit, mock_push, mock_link, tmp_path
     ):
         from collector.github_poller.run import _poll_repo
 
@@ -166,10 +171,15 @@ class TestItemCap:
 
     @patch("collector.github_poller.run.link_sessions")
     @patch("collector.github_poller.run.count_pushes_after_review")
+    @patch("collector.github_poller.run.fetch_pr_edit_history", return_value={})
+    @patch("collector.github_poller.run.fetch_issue_edit_history_batch", return_value={})
+    @patch("collector.github_poller.run.fetch_pr_review_comments", return_value=[])
+    @patch("collector.github_poller.run.fetch_issue_comments", return_value=[])
     @patch("collector.github_poller.run.fetch_prs")
     @patch("collector.github_poller.run.fetch_issues")
     def test_no_cap_when_under_limit(
-        self, mock_issues, mock_prs, mock_push, mock_link, tmp_path
+        self, mock_issues, mock_prs, mock_issue_comments, mock_pr_comments,
+        mock_edit_batch, mock_pr_edit, mock_push, mock_link, tmp_path
     ):
         from collector.github_poller.run import _poll_repo
 

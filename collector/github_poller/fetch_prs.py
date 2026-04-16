@@ -18,6 +18,7 @@ def fetch_prs(
     since: Optional[str] = None,
     state: str = "all",
     limit: int = 500,
+    include_comments: bool = False,
 ) -> List[Dict[str, Any]]:
     """Fetch pull requests for *repo* (``owner/repo``).
 
@@ -31,10 +32,17 @@ def fetch_prs(
         PR state filter: ``open``, ``closed``, ``merged``, or ``all``.
     limit:
         Maximum number of PRs to fetch (default 500).
+    include_comments:
+        If True, fetch review comments for every PR in the returned list.
+        Leave False (default) when the caller will apply a cap first and
+        then fetch review comments only for the kept subset via
+        :func:`fetch_pr_review_comments`.
 
     Returns
     -------
-    List of normalized PR dicts.
+    List of normalized PR dicts.  When *include_comments* is False the
+    ``"review_comments"`` key is present but set to an empty list and
+    ``"review_comment_count"`` is 0.
     """
     args = [
         "pr", "list",
@@ -52,7 +60,7 @@ def fetch_prs(
 
     results: List[Dict[str, Any]] = []
     for pr in raw_prs:
-        review_comments = _fetch_review_comments(repo, pr["number"])
+        review_comments = fetch_pr_review_comments(repo, pr["number"]) if include_comments else []
 
         results.append({
             "number": pr["number"],
@@ -69,11 +77,15 @@ def fetch_prs(
     return results
 
 
-def _fetch_review_comments(
+def fetch_pr_review_comments(
     repo: str,
     pr_number: int,
-) -> List[Dict[str, str]]:
-    """Fetch review comments for a single PR via ``gh api``."""
+) -> List[Dict[str, Any]]:
+    """Fetch review comments for a single PR via ``gh api``.
+
+    Exported so callers can fetch review comments after applying an item
+    cap, avoiding wasted API calls for PRs that will be discarded.
+    """
     owner, name = repo.split("/", 1)
     endpoint = f"/repos/{owner}/{name}/pulls/{pr_number}/comments"
 

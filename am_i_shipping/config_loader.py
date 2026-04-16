@@ -32,6 +32,7 @@ class GitHubLimiterConfig:
     inter_request_delay_seconds: float = 1.0
     max_items_per_repo: int = 500
     process_nice_increment: int = 10
+    max_calls_per_hour: int = 2500
 
 
 @dataclass
@@ -159,6 +160,11 @@ def load_config(config_path: str | Path | None = None) -> Config:
             github_limiter_raw.get(
                 "process_nice_increment",
                 GitHubLimiterConfig.process_nice_increment,
+            )
+        ),
+        max_calls_per_hour=int(
+            github_limiter_raw.get(
+                "max_calls_per_hour", GitHubLimiterConfig.max_calls_per_hour
             )
         ),
     )

@@ -32,12 +32,13 @@ from am_i_shipping.health_writer import write_health
 
 from .cursor import advance_cursor, compute_since, read_cursor
 from .fetch_issues import (
+    fetch_issue_comments,
     fetch_issue_edit_history,
     fetch_issue_edit_history_batch,
     fetch_issues,
 )
-from .fetch_prs import fetch_pr_edit_history, fetch_prs
-from .gh_client import configure_limiter
+from .fetch_prs import fetch_pr_edit_history, fetch_pr_review_comments, fetch_prs
+from .gh_client import BudgetExhausted, configure_limiter
 from .link_resolver import resolve_link
 from .push_counter import count_pushes_after_review
 from .session_linker import link_sessions
@@ -115,7 +116,7 @@ def run(
     # Apply resource limiters
     limiter = config.github.limiter
     _apply_nice(limiter.process_nice_increment)
-    configure_limiter(limiter.inter_request_delay_seconds)
+    configure_limiter(limiter.inter_request_delay_seconds, limiter.max_calls_per_hour)
 
     if not dry_run:
         init_github_db(github_db)
@@ -135,6 +136,12 @@ def run(
             )
             total_records += count
             print(f"OK: {repo} — {count} records", file=sys.stderr)
+        except BudgetExhausted as exc:
+            # Stop processing further repos — the hourly budget is shared
+            # across all repos and will not recover mid-run.
+            print(f"BUDGET: {exc} — stopping early, remaining repos skipped.", file=sys.stderr)
+            all_succeeded = False
+            break
         except Exception as exc:
             print(f"ERROR: {repo} — {exc}", file=sys.stderr)
             all_succeeded = False
@@ -161,16 +168,17 @@ def _poll_repo(
 
     print(f"  {repo}: fetching since {since} (cursor={'backfill' if cursor_value is None else 'delta'})", file=sys.stderr)
 
-    # 2. Fetch issues and PRs
-    issues = fetch_issues(repo, since=since)
-    prs = fetch_prs(repo, since=since)
+    # 2. Fetch issues and PRs (without comments — fetched after cap to avoid
+    #    wasting API calls on items that will be discarded).
+    issues = fetch_issues(repo, since=since, include_comments=False)
+    prs = fetch_prs(repo, since=since, include_comments=False)
 
     print(f"  {repo}: fetched {len(issues)} issues, {len(prs)} PRs", file=sys.stderr)
 
     if dry_run:
         return len(issues) + len(prs)
 
-    # Apply item cap: issues first, PRs get remaining capacity
+    # Apply item cap: issues first, PRs get remaining capacity.
     total_fetched = len(issues) + len(prs)
     if total_fetched > max_items_per_repo:
         if len(issues) >= max_items_per_repo:
@@ -184,6 +192,30 @@ def _poll_repo(
             f"(max_items_per_repo={max_items_per_repo})",
             file=sys.stderr,
         )
+
+    # Fetch comments only for the capped set.
+    for issue in issues:
+        try:
+            issue["comments"] = fetch_issue_comments(repo, issue["number"])
+        except BudgetExhausted as exc:
+            print(f"  {repo}: {exc}", file=sys.stderr)
+            raise
+        except Exception as exc:
+            print(f"  {repo}: comment fetch error (issue #{issue['number']}): {exc}", file=sys.stderr)
+            issue["comments"] = []
+
+    for pr in prs:
+        try:
+            review_comments = fetch_pr_review_comments(repo, pr["number"])
+            pr["review_comments"] = review_comments
+            pr["review_comment_count"] = len(review_comments)
+        except BudgetExhausted as exc:
+            print(f"  {repo}: {exc}", file=sys.stderr)
+            raise
+        except Exception as exc:
+            print(f"  {repo}: review comment fetch error (PR #{pr['number']}): {exc}", file=sys.stderr)
+            pr["review_comments"] = []
+            pr["review_comment_count"] = 0
 
     # Ensure schema exists (also called by run(), but _poll_repo may be
     # invoked directly in tests), then open a single connection for all writes.

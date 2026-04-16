@@ -51,6 +51,13 @@ github:
     # Ignored on platforms where os.nice() is unavailable.
     process_nice_increment: 10
 
+    # Hard cap on total gh CLI calls per rolling hour across all repos.
+    # Default is 2 500 — half of a standard PAT's 5 000 req/hr primary
+    # limit — so the poller never crowds out other tools or browser
+    # sessions sharing the same token. Raise only if you've verified
+    # no other tooling competes for the same quota.
+    max_calls_per_hour: 2500
+
 # -------------------------------------------------------------------
 # App-switch logger (Collector 3) — DISABLED
 # Uncomment to re-enable. Code remains in collector/appswitch/.

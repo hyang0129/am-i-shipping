@@ -1,26 +1,128 @@
 """Thin wrapper around the ``gh`` CLI for GitHub API calls.
 
 Handles subprocess invocation, JSON deserialization, pagination via
-``--paginate``, and rate-limit back-off (simple retry with exponential
-delay on 403/429 exit codes).
+``--paginate``, rate-limit back-off (retry with reset-aware sleep on
+403/429 exit codes), and an hourly call budget so the poller never
+consumes more than a configured fraction of the user's GitHub API quota.
 """
 
 from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import time
 from typing import Any, Dict, List, Optional
 
 
 _inter_request_delay: float = 0.0
 
+# ---------------------------------------------------------------------------
+# Hourly call budget
+# ---------------------------------------------------------------------------
 
-def configure_limiter(delay: float) -> None:
-    """Set the inter-request delay applied after each successful ``gh`` call."""
+class BudgetExhausted(Exception):
+    """Raised when the hourly call budget has been reached."""
+
+    def __init__(self, used: int, limit: int, resets_in: float) -> None:
+        self.used = used
+        self.limit = limit
+        self.resets_in = resets_in
+        super().__init__(
+            f"GitHub API hourly budget exhausted ({used}/{limit} calls used). "
+            f"Budget resets in {resets_in:.0f}s."
+        )
+
+
+class _HourlyBudget:
+    """Sliding-window call counter that raises when the hourly cap is hit."""
+
+    def __init__(self, max_per_hour: int) -> None:
+        self._max = max_per_hour
+        self._window_start = time.monotonic()
+        self._count = 0
+
+    def configure(self, max_per_hour: int) -> None:
+        self._max = max_per_hour
+        # Reset the window so a config change takes effect immediately.
+        self._window_start = time.monotonic()
+        self._count = 0
+
+    def record(self) -> None:
+        """Record one call.  Raises BudgetExhausted if the cap is reached."""
+        now = time.monotonic()
+        elapsed = now - self._window_start
+        if elapsed >= 3600:
+            # New hour window — reset.
+            self._window_start = now
+            self._count = 0
+
+        self._count += 1
+        if self._count >= self._max:
+            resets_in = max(0.0, 3600 - elapsed)
+            raise BudgetExhausted(self._count, self._max, resets_in)
+
+
+_budget = _HourlyBudget(max_per_hour=2500)
+
+
+def configure_limiter(delay: float, max_calls_per_hour: int = 2500) -> None:
+    """Set the inter-request delay and hourly call budget.
+
+    Parameters
+    ----------
+    delay:
+        Seconds to sleep after each successful ``gh`` call.
+    max_calls_per_hour:
+        Maximum ``gh`` calls allowed per rolling hour (default 2 500,
+        half of a standard PAT's 5 000 req/hr primary limit).
+    """
     global _inter_request_delay
     _inter_request_delay = delay
+    _budget.configure(max_calls_per_hour)
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _is_rate_limit_error(stderr: str) -> bool:
+    """Return True if stderr looks like a GitHub primary/secondary rate limit."""
+    lower = stderr.lower()
+    return any(
+        phrase in lower
+        for phrase in ("rate limit", "secondary rate", "429", "403")
+    )
+
+
+def _rate_limit_reset_wait() -> float:
+    """Query ``/rate_limit`` and return seconds until the REST quota resets.
+
+    Returns 0 if the quota is not exhausted or the query itself fails.
+    The ``/rate_limit`` endpoint is free — it does not consume quota.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "api", "/rate_limit"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            return 0.0
+        data = json.loads(result.stdout)
+        core = data.get("resources", {}).get("core", {})
+        remaining = core.get("remaining", 1)
+        if remaining > 0:
+            return 0.0
+        reset_epoch = core.get("reset", 0)
+        wait = reset_epoch - time.time()
+        return max(0.0, wait)
+    except Exception:
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
 
 class GhCliError(Exception):
     """Raised when a ``gh`` subprocess exits with a non-zero code."""
@@ -34,6 +136,10 @@ class GhCliError(Exception):
         )
 
 
+# ---------------------------------------------------------------------------
+# Core runner
+# ---------------------------------------------------------------------------
+
 def run_gh(
     args: List[str],
     *,
@@ -42,14 +148,21 @@ def run_gh(
 ) -> str:
     """Run ``gh`` with *args* and return stdout.
 
-    Retries up to *max_retries* times with exponential back-off when the
-    process exits non-zero (covers transient rate-limit 403/429 errors).
+    On failure, checks whether the error is a rate-limit exhaustion and
+    sleeps until the GitHub quota resets before retrying (up to
+    *max_retries* times).  Falls back to exponential back-off for other
+    transient errors.
 
     Raises
     ------
+    BudgetExhausted
+        When the configured hourly call budget is reached.
     GhCliError
         After exhausting retries.
     """
+    # Check budget before issuing the call.
+    _budget.record()
+
     cmd = ["gh"] + args
     last_err: Optional[GhCliError] = None
 
@@ -65,9 +178,20 @@ def run_gh(
         last_err = GhCliError(cmd, result.returncode, result.stderr)
 
         if attempt < max_retries:
-            time.sleep(backoff_base ** attempt)
+            if _is_rate_limit_error(result.stderr):
+                wait = _rate_limit_reset_wait()
+                if wait > 0:
+                    print(
+                        f"  rate limit hit — sleeping {wait:.0f}s until reset",
+                        file=sys.stderr,
+                    )
+                    time.sleep(wait + 5)  # +5s buffer
+                else:
+                    # Secondary limit or unknown 403 — short back-off.
+                    time.sleep(backoff_base ** attempt)
+            else:
+                time.sleep(backoff_base ** attempt)
 
-    # Should never be None here, but satisfy type checker
     assert last_err is not None
     raise last_err
 
