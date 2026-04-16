@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
+from loguru import logger
+
 
 def write_health(
     collector_name: str,
@@ -30,7 +32,7 @@ def write_health(
     Parameters
     ----------
     collector_name:
-        One of ``session_parser``, ``github_poller``, ``appswitch_export``.
+        One of ``session_parser``, ``github_poller``.
     record_count:
         Number of records processed in this run.
     data_dir:
@@ -76,6 +78,7 @@ def write_health(
         # os.replace is atomic on POSIX; on Windows it is atomic if
         # the destination is on the same volume (which it is here).
         os.replace(tmp_path, str(health_path))
+        logger.debug("health updated: {} — {} records", collector_name, record_count)
     except BaseException:
         # Clean up temp file on failure
         try:

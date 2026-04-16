@@ -18,6 +18,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -384,6 +385,10 @@ def run_batch(config_path: Optional[str] = None) -> None:
     db_path = config.data_path / "sessions.db"
     data_dir = config.data_path
 
+    # Read limiter config
+    max_files = config.session.limiter.max_files_per_run
+    inter_delay = config.session.limiter.inter_file_delay_seconds
+
     # Ensure DB exists
     from am_i_shipping.db import init_sessions_db
 
@@ -407,6 +412,14 @@ def run_batch(config_path: Optional[str] = None) -> None:
     errors = 0
 
     for sf in session_files:
+        # Enforce per-run file cap
+        if processed >= max_files:
+            print(
+                f"  Reached max_files_per_run={max_files}, deferring rest to next run",
+                file=sys.stderr,
+            )
+            break
+
         # Quick check: extract UUID and skip if already in DB
         uuid = _extract_uuid_from_file(sf)
         if uuid and uuid in existing:
@@ -414,17 +427,25 @@ def run_batch(config_path: Optional[str] = None) -> None:
             continue
 
         try:
-            result_uuid = process_session(
-                sf,
+            record = parse_session(
+                sf, threshold=config.session.reprompt_threshold
+            )
+            upsert_session(
+                record,
                 db_path=db_path,
                 data_dir=data_dir,
-                threshold=config.session.reprompt_threshold,
+                skip_init=True,
+                skip_health=True,
             )
-            existing.add(result_uuid)
+            existing.add(record.session_uuid)
             processed += 1
         except SessionParseError as exc:
             print(f"WARN: {sf}: {exc}", file=sys.stderr)
             errors += 1
+
+        # Inter-file delay
+        if inter_delay > 0:
+            time.sleep(inter_delay)
 
     print(
         f"Batch complete: {processed} processed, {skipped} skipped, {errors} errors",

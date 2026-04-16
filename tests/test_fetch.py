@@ -80,7 +80,7 @@ class TestFetchIssues:
         mock_list.return_value = ISSUE_FIXTURE
         mock_api.return_value = ISSUE_COMMENTS_FIXTURE
 
-        results = fetch_issues("owner/repo", since="2024-01-01")
+        results = fetch_issues("owner/repo", since="2024-01-01", include_comments=True)
 
         assert len(results) == 2
         issue = results[0]
@@ -148,7 +148,7 @@ class TestFetchPRs:
         mock_list.return_value = PR_FIXTURE
         mock_api.return_value = PR_REVIEW_COMMENTS_FIXTURE
 
-        results = fetch_prs("owner/repo", since="2024-01-01")
+        results = fetch_prs("owner/repo", since="2024-01-01", include_comments=True)
 
         assert len(results) == 1
         pr = results[0]
@@ -193,7 +193,7 @@ class TestCommentIds:
         mock_list.return_value = [ISSUE_FIXTURE[0]]
         mock_api.return_value = ISSUE_COMMENTS_FIXTURE
 
-        results = fetch_issues("owner/repo")
+        results = fetch_issues("owner/repo", include_comments=True)
         assert results[0]["comments"][0]["id"] == 12345
 
     @patch("collector.github_poller.fetch_issues.gh_api")
@@ -214,7 +214,7 @@ class TestCommentIds:
         mock_list.return_value = [PR_FIXTURE[0]]
         mock_api.return_value = PR_REVIEW_COMMENTS_FIXTURE
 
-        results = fetch_prs("owner/repo")
+        results = fetch_prs("owner/repo", include_comments=True)
         assert results[0]["review_comments"][0]["id"] == 67890
 
     @patch("collector.github_poller.fetch_prs.gh_api")

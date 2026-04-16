@@ -19,6 +19,7 @@ def fetch_issues(
     since: Optional[str] = None,
     state: str = "all",
     limit: int = 500,
+    include_comments: bool = False,
 ) -> List[Dict[str, Any]]:
     """Fetch issues for *repo* (``owner/repo``).
 
@@ -33,10 +34,16 @@ def fetch_issues(
         Issue state filter: ``open``, ``closed``, or ``all`` (default).
     limit:
         Maximum number of issues to fetch (default 500).
+    include_comments:
+        If True, fetch comments for every issue in the returned list.
+        Leave False (default) when the caller will apply a cap first and
+        then fetch comments only for the kept subset via
+        :func:`fetch_issue_comments`.
 
     Returns
     -------
-    List of normalized issue dicts.
+    List of normalized issue dicts.  When *include_comments* is False the
+    ``"comments"`` key is present but set to an empty list.
     """
     args = [
         "issue", "list",
@@ -54,8 +61,8 @@ def fetch_issues(
 
     results: List[Dict[str, Any]] = []
     for issue in raw_issues:
-        comments = _fetch_issue_comments(repo, issue["number"])
         type_label = _extract_type_label(issue.get("labels", []))
+        comments = fetch_issue_comments(repo, issue["number"]) if include_comments else []
 
         results.append({
             "number": issue["number"],
@@ -72,11 +79,15 @@ def fetch_issues(
     return results
 
 
-def _fetch_issue_comments(
+def fetch_issue_comments(
     repo: str,
     issue_number: int,
-) -> List[Dict[str, str]]:
-    """Fetch comments for a single issue via ``gh api``."""
+) -> List[Dict[str, Any]]:
+    """Fetch comments for a single issue via ``gh api``.
+
+    Exported so callers can fetch comments after applying an item cap,
+    avoiding wasted API calls for items that will be discarded.
+    """
     owner, name = repo.split("/", 1)
     endpoint = f"/repos/{owner}/{name}/issues/{issue_number}/comments"
 
@@ -101,6 +112,7 @@ def _fetch_issue_comments(
 
 _ISSUE_EDIT_HISTORY_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
+  rateLimit { cost remaining }
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
       userContentEdits(first: 100) {
@@ -246,6 +258,7 @@ def fetch_issue_edit_history_batch(
 
         query = (
             "query($owner: String!, $name: String!) {\n"
+            "  rateLimit { cost remaining }\n"
             "  repository(owner: $owner, name: $name) {"
             + "".join(alias_blocks)
             + "\n  }\n}"

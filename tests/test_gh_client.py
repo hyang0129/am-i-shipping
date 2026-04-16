@@ -113,9 +113,10 @@ class TestGhGraphql:
         result = gh_graphql("query { ... }", {"owner": "test", "name": "repo"})
         assert result == response
 
+    @patch("collector.github_poller.gh_client._rate_limit_reset_wait", return_value=0.0)
     @patch("collector.github_poller.gh_client.time.sleep")
     @patch("collector.github_poller.gh_client.subprocess.run")
-    def test_retries_on_failure(self, mock_run, mock_sleep):
+    def test_retries_on_failure(self, mock_run, mock_sleep, mock_rl_wait):
         """gh_graphql retries with backoff like run_gh."""
         mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="rate limited")
         with pytest.raises(GhCliError):

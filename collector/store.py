@@ -20,6 +20,8 @@ def upsert_session(
     record: "SessionRecord",
     db_path: Optional[Union[str, Path]] = None,
     data_dir: Optional[Union[str, Path]] = None,
+    skip_init: bool = False,
+    skip_health: bool = False,
 ) -> None:
     """Insert or update a session record in sessions.db.
 
@@ -34,6 +36,12 @@ def upsert_session(
         Path to sessions.db. If None, uses data_dir / "sessions.db".
     data_dir:
         Directory for health.json. Defaults to repo-root/data/.
+    skip_init:
+        If True, skip ``init_sessions_db()`` call. Use when the caller
+        has already initialized the schema (e.g. batch mode).
+    skip_health:
+        If True, skip ``write_health()`` call. Use when the caller
+        writes health once at the end of a batch.
     """
     if data_dir is None:
         data_dir = Path(__file__).resolve().parent.parent / "data"
@@ -48,10 +56,11 @@ def upsert_session(
     # Ensure the DB directory exists
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Ensure table exists
-    from am_i_shipping.db import init_sessions_db
+    # Ensure table exists (unless caller already did this)
+    if not skip_init:
+        from am_i_shipping.db import init_sessions_db
 
-    init_sessions_db(db_path)
+        init_sessions_db(db_path)
 
     conn = sqlite3.connect(str(db_path))
     try:
@@ -103,4 +112,5 @@ def upsert_session(
     finally:
         conn.close()
 
-    write_health("session_parser", 1, data_dir=data_dir)
+    if not skip_health:
+        write_health("session_parser", 1, data_dir=data_dir)

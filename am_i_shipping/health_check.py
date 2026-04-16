@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import List, Tuple, Union
 
 
-EXPECTED_COLLECTORS = ["session_parser", "github_poller", "appswitch_export"]
+EXPECTED_COLLECTORS = ["session_parser", "github_poller"]
 STALE_THRESHOLD = timedelta(hours=48)
 
 

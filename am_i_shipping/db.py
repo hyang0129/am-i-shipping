@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS pull_requests (
     head_ref            TEXT,
     title               TEXT,
     body                TEXT,
+    comments_json        TEXT,
     review_comments_json TEXT,
     review_comment_count INTEGER DEFAULT 0,
     push_count          INTEGER DEFAULT 0,
@@ -158,6 +159,7 @@ CREATE TABLE IF NOT EXISTS pr_review_comment_edits (
 _GITHUB_MIGRATIONS = [
     "ALTER TABLE issues ADD COLUMN updated_at TEXT",
     "ALTER TABLE pull_requests ADD COLUMN updated_at TEXT",
+    "ALTER TABLE pull_requests ADD COLUMN comments_json TEXT",
 ]
 
 APPSWITCH_SCHEMA = """

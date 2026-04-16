@@ -54,7 +54,6 @@ FAIL_COUNT=0
 
 run_collector "Session Parser" -m collector.session_parser --mode batch
 run_collector "GitHub Poller"  -m collector.github_poller.run
-run_collector "App-Switch Export" collector/appswitch/export.py
 
 log "=== Running health check ==="
 if python3 -m am_i_shipping.health_check >> "$LOG_FILE" 2>&1; then
