@@ -112,6 +112,7 @@ def fetch_issue_comments(
 
 _ISSUE_EDIT_HISTORY_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
+  rateLimit { cost remaining }
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
       userContentEdits(first: 100) {
@@ -257,6 +258,7 @@ def fetch_issue_edit_history_batch(
 
         query = (
             "query($owner: String!, $name: String!) {\n"
+            "  rateLimit { cost remaining }\n"
             "  repository(owner: $owner, name: $name) {"
             + "".join(alias_blocks)
             + "\n  }\n}"

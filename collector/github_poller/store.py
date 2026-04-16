@@ -111,13 +111,14 @@ def upsert_pr(
             """
             INSERT INTO pull_requests (
                 repo, pr_number, head_ref, title, body,
-                review_comments_json, review_comment_count,
+                comments_json, review_comments_json, review_comment_count,
                 push_count, created_at, merged_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(repo, pr_number) DO UPDATE SET
                 head_ref = excluded.head_ref,
                 title = excluded.title,
                 body = excluded.body,
+                comments_json = excluded.comments_json,
                 review_comments_json = excluded.review_comments_json,
                 review_comment_count = excluded.review_comment_count,
                 push_count = excluded.push_count,
@@ -131,6 +132,7 @@ def upsert_pr(
                 pr.get("head_ref", ""),
                 pr.get("title", ""),
                 pr.get("body", ""),
+                json.dumps(pr.get("comments", []), ensure_ascii=False),
                 json.dumps(pr.get("review_comments", []), ensure_ascii=False),
                 pr.get("review_comment_count", 0),
                 pr.get("push_count", 0),

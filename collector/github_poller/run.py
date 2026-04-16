@@ -41,8 +41,8 @@ from .fetch_issues import (
     fetch_issue_edit_history_batch,
     fetch_issues,
 )
-from .fetch_prs import fetch_pr_edit_history, fetch_pr_review_comments, fetch_prs
-from .gh_client import BudgetExhausted, calls_made, configure_limiter
+from .fetch_prs import fetch_pr_comments, fetch_pr_edit_history, fetch_pr_review_comments, fetch_prs
+from .gh_client import BudgetExhausted, calls_made, configure_limiter, graphql_points_used
 from .link_resolver import resolve_link
 from .push_counter import count_pushes_after_review
 from .session_linker import link_sessions
@@ -216,6 +216,15 @@ def _poll_repo(
             issue["comments"] = []
 
     for pr in prs:
+        try:
+            pr["comments"] = fetch_pr_comments(repo, pr["number"])
+        except BudgetExhausted as exc:
+            logger.error("{}  budget exhausted fetching comments for PR #{}: {}", repo, pr["number"], exc)
+            raise
+        except Exception as exc:
+            logger.warning("{}  comment fetch error (PR #{}): {}", repo, pr["number"], exc)
+            pr["comments"] = []
+
         try:
             review_comments = fetch_pr_review_comments(repo, pr["number"])
             pr["review_comments"] = review_comments
@@ -441,8 +450,8 @@ def _poll_repo(
     logger.info("{}  cursor advanced to {}", repo, date.today().isoformat())
 
     logger.info(
-        "{}  done: {} issues + {} PRs | {} API calls used this hour",
-        repo, len(issues), len(prs), calls_made(),
+        "{}  done: {} issues + {} PRs | {} REST calls, {} GraphQL points used this run",
+        repo, len(issues), len(prs), calls_made(), graphql_points_used(),
     )
     # Return post-cap count (actual records written).  The uncapped fetch
     # count was already logged above; dry-run returns the uncapped count

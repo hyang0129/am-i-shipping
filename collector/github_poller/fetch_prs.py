@@ -77,11 +77,49 @@ def fetch_prs(
     return results
 
 
+def fetch_pr_comments(
+    repo: str,
+    pr_number: int,
+) -> List[Dict[str, Any]]:
+    """Fetch thread (issue-style) comments for a single PR via ``gh api``.
+
+    These are the regular conversation comments on a PR, as distinct from
+    inline review comments on specific lines of code.  Uses the issues
+    endpoint because GitHub models PR thread comments as issue comments.
+
+    Exported so callers can fetch comments after applying an item cap,
+    avoiding wasted API calls for PRs that will be discarded.
+    """
+    owner, name = repo.split("/", 1)
+    endpoint = f"/repos/{owner}/{name}/issues/{pr_number}/comments"
+
+    try:
+        raw = gh_api(endpoint, paginate=True)
+    except GhCliError:
+        return []
+
+    if not isinstance(raw, list):
+        return []
+
+    comments: List[Dict[str, Any]] = []
+    for c in raw:
+        comments.append({
+            "id": c.get("id"),
+            "author": (c.get("user") or {}).get("login", ""),
+            "body": c.get("body", ""),
+            "created_at": c.get("created_at", ""),
+        })
+    return comments
+
+
 def fetch_pr_review_comments(
     repo: str,
     pr_number: int,
 ) -> List[Dict[str, Any]]:
-    """Fetch review comments for a single PR via ``gh api``.
+    """Fetch inline review comments for a single PR via ``gh api``.
+
+    These are comments attached to specific lines of code in a review,
+    as distinct from thread (issue-style) comments on the PR conversation.
 
     Exported so callers can fetch review comments after applying an item
     cap, avoiding wasted API calls for PRs that will be discarded.
@@ -110,6 +148,7 @@ def fetch_pr_review_comments(
 
 _PR_EDIT_HISTORY_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
+  rateLimit { cost remaining }
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       userContentEdits(first: 100) {
@@ -119,12 +158,12 @@ query($owner: String!, $name: String!, $number: Int!) {
           editor { login }
         }
       }
-      reviews(first: 100) {
+      reviews(first: 20) {
         nodes {
-          comments(first: 100) {
+          comments(first: 20) {
             nodes {
               databaseId
-              userContentEdits(first: 100) {
+              userContentEdits(first: 20) {
                 nodes {
                   editedAt
                   diff

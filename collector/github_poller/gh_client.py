@@ -2,8 +2,10 @@
 
 Handles subprocess invocation, JSON deserialization, pagination via
 ``--paginate``, rate-limit back-off (retry with reset-aware sleep on
-403/429 exit codes), and an hourly call budget so the poller never
-consumes more than a configured fraction of the user's GitHub API quota.
+403/429 exit codes), an hourly call budget so the poller never consumes
+more than a configured fraction of the user's GitHub API quota, and a
+proactive secondary-rate-limit guard that delays calls before they would
+exceed a configured fraction of GitHub's per-minute cap.
 """
 
 from __future__ import annotations
@@ -17,6 +19,83 @@ from loguru import logger
 
 
 _inter_request_delay: float = 0.0
+_graphql_points_used: int = 0
+
+# ---------------------------------------------------------------------------
+# Secondary rate limit guard (proactive, sliding 60-second window)
+# ---------------------------------------------------------------------------
+
+# GitHub's authenticated REST secondary rate limit.
+_GITHUB_SECONDARY_LIMIT_PER_MINUTE: int = 900
+
+
+class _SecondaryRateLimiter:
+    """Proactive sliding-window guard against GitHub's secondary rate limit.
+
+    Before each API call, ``check()`` inspects how many calls have been
+    made in the last 60 seconds.  If issuing one more call would push
+    usage above *max_fraction* of GitHub's per-minute cap, it sleeps
+    until the oldest in-window call ages out and capacity is restored.
+
+    This prevents secondary rate limit errors entirely rather than
+    reacting to them after the fact.
+    """
+
+    WINDOW_SECONDS: float = 60.0
+
+    def __init__(
+        self,
+        github_limit: int = _GITHUB_SECONDARY_LIMIT_PER_MINUTE,
+        max_fraction: float = 0.50,
+    ) -> None:
+        self._limit = github_limit
+        self._threshold = max(1, int(github_limit * max_fraction))
+        self._timestamps: List[float] = []  # monotonic call times
+
+    def configure(self, max_fraction: float) -> None:
+        self._threshold = max(1, int(self._limit * max_fraction))
+        self._timestamps = []
+
+    @property
+    def window_count(self) -> int:
+        """Calls made in the current 60-second window."""
+        cutoff = time.monotonic() - self.WINDOW_SECONDS
+        return sum(1 for t in self._timestamps if t > cutoff)
+
+    def check(self) -> None:
+        """Block until issuing the next call stays within the threshold.
+
+        Trims the timestamp list on each invocation so it never grows
+        beyond *threshold* entries.
+        """
+        now = time.monotonic()
+        cutoff = now - self.WINDOW_SECONDS
+        # Drop timestamps outside the window.
+        self._timestamps = [t for t in self._timestamps if t > cutoff]
+
+        if len(self._timestamps) >= self._threshold:
+            # Sleep until the oldest call exits the window.
+            oldest = self._timestamps[0]
+            wait = (oldest + self.WINDOW_SECONDS) - time.monotonic()
+            if wait > 0:
+                logger.info(
+                    "secondary rate limit: {}/{} calls in 60s window — "
+                    "sleeping {:.1f}s to stay ≤{:.0f}% of GitHub cap",
+                    len(self._timestamps),
+                    self._threshold,
+                    wait,
+                    (self._threshold / self._limit) * 100,
+                )
+                time.sleep(wait + 0.1)  # +0.1s to ensure the slot has cleared
+            # Re-trim after sleeping.
+            now = time.monotonic()
+            cutoff = now - self.WINDOW_SECONDS
+            self._timestamps = [t for t in self._timestamps if t > cutoff]
+
+        self._timestamps.append(time.monotonic())
+
+
+_secondary = _SecondaryRateLimiter()
 
 # ---------------------------------------------------------------------------
 # Hourly call budget
@@ -77,8 +156,17 @@ def calls_made() -> int:
     return _budget._count
 
 
-def configure_limiter(delay: float, max_calls_per_hour: int = 2500) -> None:
-    """Set the inter-request delay and hourly call budget.
+def graphql_points_used() -> int:
+    """Return the total GraphQL primary-rate-limit points consumed this run."""
+    return _graphql_points_used
+
+
+def configure_limiter(
+    delay: float,
+    max_calls_per_hour: int = 2500,
+    secondary_max_fraction: float = 0.50,
+) -> None:
+    """Set the inter-request delay, hourly call budget, and secondary rate limit guard.
 
     Parameters
     ----------
@@ -87,11 +175,22 @@ def configure_limiter(delay: float, max_calls_per_hour: int = 2500) -> None:
     max_calls_per_hour:
         Maximum ``gh`` calls allowed per rolling hour (default 2 500,
         half of a standard PAT's 5 000 req/hr primary limit).
+    secondary_max_fraction:
+        Maximum fraction of GitHub's 900 req/min secondary rate limit to
+        use before proactively delaying.  Default 0.50 (450 calls/min).
     """
     global _inter_request_delay
     _inter_request_delay = delay
     _budget.configure(max_calls_per_hour)
-    logger.info("limiter configured: {:.2f}s delay, {}/hr cap", delay, max_calls_per_hour)
+    _secondary.configure(secondary_max_fraction)
+    logger.info(
+        "limiter configured: {:.2f}s delay, {}/hr cap, "
+        "secondary guard ≤{:.0f}% of {}/min",
+        delay,
+        max_calls_per_hour,
+        secondary_max_fraction * 100,
+        _GITHUB_SECONDARY_LIMIT_PER_MINUTE,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +271,9 @@ def run_gh(
     GhCliError
         After exhausting retries.
     """
-    # Check budget before issuing the call.
+    # Proactive secondary rate limit guard — delays if needed before the call.
+    _secondary.check()
+    # Check hourly budget.
     _budget.record()
 
     cmd = ["gh"] + args
@@ -269,7 +370,20 @@ def gh_graphql(
             args.extend(["-F", f"{k}={v}"])
 
     stdout = run_gh(args, max_retries=max_retries, backoff_base=backoff_base)
-    return json.loads(stdout)
+    response = json.loads(stdout)
+
+    global _graphql_points_used
+    rate_limit = (response.get("data") or {}).get("rateLimit")
+    if rate_limit:
+        cost = rate_limit.get("cost", 0)
+        remaining = rate_limit.get("remaining")
+        _graphql_points_used += cost
+        logger.debug(
+            "graphql cost={} remaining={} total_this_run={}",
+            cost, remaining, _graphql_points_used,
+        )
+
+    return response
 
 
 def gh_api(
