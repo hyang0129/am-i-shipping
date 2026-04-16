@@ -185,7 +185,8 @@ def _poll_repo(
             file=sys.stderr,
         )
 
-    # Ensure schema exists, then open a single connection for all writes
+    # Ensure schema exists (also called by run(), but _poll_repo may be
+    # invoked directly in tests), then open a single connection for all writes.
     init_github_db(github_db)
     conn = sqlite3.connect(str(github_db))
     try:
@@ -395,6 +396,9 @@ def _poll_repo(
     # 7. Advance cursor
     advance_cursor(repo, github_db)
 
+    # Return post-cap count (actual records written).  The uncapped fetch
+    # count was already logged above; dry-run returns the uncapped count
+    # earlier (before the cap is applied).
     return len(issues) + len(prs)
 
 
