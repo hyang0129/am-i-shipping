@@ -32,7 +32,7 @@ def write_health(
     Parameters
     ----------
     collector_name:
-        One of ``session_parser``, ``github_poller``, ``appswitch_export``.
+        One of ``session_parser``, ``github_poller``.
     record_count:
         Number of records processed in this run.
     data_dir:
