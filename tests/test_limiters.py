@@ -139,14 +139,15 @@ class TestItemCap:
         mock_issues.return_value = [
             {"number": i, "title": f"Issue {i}", "state": "OPEN",
              "body": "", "comments": [], "type_label": None,
-             "created_at": "2024-01-01", "closed_at": None}
+             "created_at": "2024-01-01", "closed_at": None,
+             "updated_at": "2024-01-01T00:00:00Z"}
             for i in range(800)
         ]
         mock_prs.return_value = [
             {"number": 1000 + i, "title": f"PR {1000+i}", "head_ref": "main",
-             "body": "", "review_comments": [],
+             "body": "", "review_comments": [], "comments": [],
              "review_comment_count": 0, "created_at": "2024-01-02",
-             "merged_at": None}
+             "merged_at": None, "updated_at": "2024-01-02T00:00:00Z"}
             for i in range(400)
         ]
         mock_push.return_value = 0
@@ -186,13 +187,14 @@ class TestItemCap:
         mock_issues.return_value = [
             {"number": 1, "title": "Issue 1", "state": "OPEN",
              "body": "", "comments": [], "type_label": None,
-             "created_at": "2024-01-01", "closed_at": None}
+             "created_at": "2024-01-01", "closed_at": None,
+             "updated_at": "2024-01-01T00:00:00Z"}
         ]
         mock_prs.return_value = [
             {"number": 10, "title": "PR 10", "head_ref": "main",
-             "body": "", "review_comments": [],
+             "body": "", "review_comments": [], "comments": [],
              "review_comment_count": 0, "created_at": "2024-01-02",
-             "merged_at": None}
+             "merged_at": None, "updated_at": "2024-01-02T00:00:00Z"}
         ]
         mock_push.return_value = 0
         mock_link.return_value = 0
