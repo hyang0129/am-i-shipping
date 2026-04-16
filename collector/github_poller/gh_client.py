@@ -115,7 +115,16 @@ class BudgetExhausted(Exception):
 
 
 class _HourlyBudget:
-    """Sliding-window call counter that raises when the hourly cap is hit."""
+    """Fixed-window call counter that raises when the hourly cap is hit.
+
+    Note: uses a fixed (not sliding) window — the counter resets to zero
+    at the start of each 3600-second window.  In theory, a burst at the
+    end of one window followed by a burst at the start of the next could
+    allow up to 2× max_per_hour calls within any 60-minute span.  In
+    practice, ``_SecondaryRateLimiter`` enforces a tighter per-minute cap
+    (50 % of GitHub's 900 req/min) that prevents sustained bursting well
+    below this theoretical maximum.
+    """
 
     def __init__(self, max_per_hour: int) -> None:
         self._max = max_per_hour
@@ -272,6 +281,10 @@ def run_gh(
         After exhausting retries.
     """
     # Proactive secondary rate limit guard — delays if needed before the call.
+    # Note: these are called once before the retry loop, so retries are not
+    # individually re-checked or re-recorded.  This is an acceptable
+    # approximation: retries are rare and short-sleeped, so the under-count
+    # is negligible compared to the budget windows (1 hour / 60 seconds).
     _secondary.check()
     # Check hourly budget.
     _budget.record()
