@@ -12,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Union
 
+from loguru import logger
+
 
 def read_cursor(
     repo: str,
@@ -32,7 +34,9 @@ def read_cursor(
             "SELECT last_polled_at FROM poll_cursor WHERE repo = ?",
             (repo,),
         ).fetchone()
-        return row[0] if row else None
+        value = row[0] if row else None
+        logger.debug("{} cursor: {}", repo, value or 'none (backfill)')
+        return value
     finally:
         conn.close()
 
@@ -84,5 +88,6 @@ def advance_cursor(
             (repo, today),
         )
         conn.commit()
+        logger.debug("{} cursor advanced → {}", repo, today)
     finally:
         conn.close()

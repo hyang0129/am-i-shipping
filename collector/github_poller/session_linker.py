@@ -15,6 +15,8 @@ import sqlite3
 from pathlib import Path
 from typing import Union
 
+from loguru import logger
+
 
 def link_sessions(
     repo: str,
@@ -42,6 +44,7 @@ def link_sessions(
 
     # Exit cleanly if sessions.db does not exist
     if not sessions_db_path.exists():
+        logger.warning("sessions.db not found at {} — session linkage skipped for {}", sessions_db_path, repo)
         return 0
 
     # Get all PRs for this repo that have a head_ref
@@ -117,4 +120,10 @@ def link_sessions(
     finally:
         gh_conn.close()
 
+    pr_count = len(prs)
+    session_count = sum(len(v) for v in sessions_by_branch.values())
+    logger.info(
+        "{}  session links: {} PRs queried, {} sessions in DB, {} inserted",
+        repo, pr_count, session_count, count,
+    )
     return count

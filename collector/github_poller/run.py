@@ -23,12 +23,16 @@ import argparse
 import os
 import sqlite3
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Optional
+
+from loguru import logger
 
 from am_i_shipping.config_loader import GitHubLimiterConfig, load_config
 from am_i_shipping.db import init_github_db
 from am_i_shipping.health_writer import write_health
+from am_i_shipping.logging_config import setup_logging
 
 from .cursor import advance_cursor, compute_since, read_cursor
 from .fetch_issues import (
@@ -38,7 +42,7 @@ from .fetch_issues import (
     fetch_issues,
 )
 from .fetch_prs import fetch_pr_edit_history, fetch_pr_review_comments, fetch_prs
-from .gh_client import BudgetExhausted, configure_limiter
+from .gh_client import BudgetExhausted, calls_made, configure_limiter
 from .link_resolver import resolve_link
 from .push_counter import count_pushes_after_review
 from .session_linker import link_sessions
@@ -58,7 +62,7 @@ def _apply_nice(increment: int) -> None:
     try:
         os.nice(increment)
     except (OSError, AttributeError) as exc:
-        print(f"WARNING: os.nice({increment}) skipped: {exc}", file=sys.stderr)
+        logger.warning("os.nice({}) skipped: {}", increment, exc)
 
 
 def _get_stored_updated_at(
@@ -113,6 +117,14 @@ def run(
     github_db = data_dir / "github.db"
     sessions_db = data_dir / "sessions.db"
 
+    logger.info(
+        "polling {} repos: {} | backfill_days={} max_calls_per_hour={}",
+        len(config.github.repos),
+        config.github.repos,
+        config.github.backfill_days,
+        config.github.limiter.max_calls_per_hour,
+    )
+
     # Apply resource limiters
     limiter = config.github.limiter
     _apply_nice(limiter.process_nice_increment)
@@ -135,15 +147,15 @@ def run(
                 max_items_per_repo=limiter.max_items_per_repo,
             )
             total_records += count
-            print(f"OK: {repo} — {count} records", file=sys.stderr)
+            logger.info("OK: {} — {} records", repo, count)
         except BudgetExhausted as exc:
             # Stop processing further repos — the hourly budget is shared
             # across all repos and will not recover mid-run.
-            print(f"BUDGET: {exc} — stopping early, remaining repos skipped.", file=sys.stderr)
+            logger.error("BUDGET: {} — stopping early, remaining repos skipped.", exc)
             all_succeeded = False
             break
         except Exception as exc:
-            print(f"ERROR: {repo} — {exc}", file=sys.stderr)
+            logger.error("ERROR: {} — {}", repo, exc)
             all_succeeded = False
 
     # Write health only if all repos succeeded and not in dry-run mode
@@ -166,14 +178,14 @@ def _poll_repo(
     cursor_value = None if dry_run else read_cursor(repo, github_db)
     since = compute_since(cursor_value, backfill_days=backfill_days)
 
-    print(f"  {repo}: fetching since {since} (cursor={'backfill' if cursor_value is None else 'delta'})", file=sys.stderr)
+    logger.info("{}  mode={} since={}", repo, 'backfill' if cursor_value is None else 'delta', since)
 
     # 2. Fetch issues and PRs (without comments — fetched after cap to avoid
     #    wasting API calls on items that will be discarded).
     issues = fetch_issues(repo, since=since, include_comments=False)
     prs = fetch_prs(repo, since=since, include_comments=False)
 
-    print(f"  {repo}: fetched {len(issues)} issues, {len(prs)} PRs", file=sys.stderr)
+    logger.info("{}  fetched {} issues, {} PRs (uncapped)", repo, len(issues), len(prs))
 
     if dry_run:
         return len(issues) + len(prs)
@@ -187,10 +199,9 @@ def _poll_repo(
         else:
             remaining = max_items_per_repo - len(issues)
             prs = prs[:remaining]
-        print(
-            f"  {repo}: capped to {len(issues)} issues + {len(prs)} PRs "
-            f"(max_items_per_repo={max_items_per_repo})",
-            file=sys.stderr,
+        logger.info(
+            "{}  capped to {} issues + {} PRs (max_items_per_repo={})",
+            repo, len(issues), len(prs), max_items_per_repo,
         )
 
     # Fetch comments only for the capped set.
@@ -198,10 +209,10 @@ def _poll_repo(
         try:
             issue["comments"] = fetch_issue_comments(repo, issue["number"])
         except BudgetExhausted as exc:
-            print(f"  {repo}: {exc}", file=sys.stderr)
+            logger.error("{}  budget exhausted fetching comments for issue #{}: {}", repo, issue["number"], exc)
             raise
         except Exception as exc:
-            print(f"  {repo}: comment fetch error (issue #{issue['number']}): {exc}", file=sys.stderr)
+            logger.warning("{}  comment fetch error (issue #{}): {}", repo, issue["number"], exc)
             issue["comments"] = []
 
     for pr in prs:
@@ -210,10 +221,10 @@ def _poll_repo(
             pr["review_comments"] = review_comments
             pr["review_comment_count"] = len(review_comments)
         except BudgetExhausted as exc:
-            print(f"  {repo}: {exc}", file=sys.stderr)
+            logger.error("{}  budget exhausted fetching review comments for PR #{}: {}", repo, pr["number"], exc)
             raise
         except Exception as exc:
-            print(f"  {repo}: review comment fetch error (PR #{pr['number']}): {exc}", file=sys.stderr)
+            logger.warning("{}  review comment fetch error (PR #{}): {}", repo, pr["number"], exc)
             pr["review_comments"] = []
             pr["review_comment_count"] = 0
 
@@ -236,7 +247,7 @@ def _poll_repo(
                 try:
                     batch_results = fetch_issue_edit_history_batch(repo, issue_numbers)
                 except Exception as exc:
-                    print(f"  {repo}: edit history batch fetch error: {exc}", file=sys.stderr)
+                    logger.warning("{}  edit history batch fetch error: {}", repo, exc)
                     batch_results = {}
 
                 for issue_number, edits in batch_results.items():
@@ -252,7 +263,7 @@ def _poll_repo(
                                 conn=conn,
                             )
                         except Exception as exc:
-                            print(f"  {repo}: insert issue body edit error (issue #{issue_number}): {exc}", file=sys.stderr)
+                            logger.warning("{}  insert issue body edit error (issue #{}): {}", repo, issue_number, exc)
 
                     for edit in edits.get("comment_edits", []):
                         try:
@@ -267,7 +278,7 @@ def _poll_repo(
                                 conn=conn,
                             )
                         except Exception as exc:
-                            print(f"  {repo}: insert issue comment edit error (issue #{issue_number}): {exc}", file=sys.stderr)
+                            logger.warning("{}  insert issue comment edit error (issue #{}): {}", repo, issue_number, exc)
         else:
             # Delta: upsert each issue and fetch edit history if updated_at changed
             for issue in issues:
@@ -282,7 +293,7 @@ def _poll_repo(
                     try:
                         edits = fetch_issue_edit_history(repo, issue["number"])
                     except Exception as exc:
-                        print(f"  {repo}: edit history fetch error (issue #{issue['number']}): {exc}", file=sys.stderr)
+                        logger.warning("{}  edit history fetch error (issue #{}): {}", repo, issue["number"], exc)
                         continue
 
                     for edit in edits.get("body_edits", []):
@@ -297,7 +308,7 @@ def _poll_repo(
                                 conn=conn,
                             )
                         except Exception as exc:
-                            print(f"  {repo}: insert issue body edit error (issue #{issue['number']}): {exc}", file=sys.stderr)
+                            logger.warning("{}  insert issue body edit error (issue #{}): {}", repo, issue["number"], exc)
 
                     for edit in edits.get("comment_edits", []):
                         try:
@@ -312,7 +323,7 @@ def _poll_repo(
                                 conn=conn,
                             )
                         except Exception as exc:
-                            print(f"  {repo}: insert issue comment edit error (issue #{issue['number']}): {exc}", file=sys.stderr)
+                            logger.warning("{}  insert issue comment edit error (issue #{}): {}", repo, issue["number"], exc)
 
         # 3–5. Process PRs: resolve links, derive push counts, upsert, edit history
         for pr in prs:
@@ -342,7 +353,7 @@ def _poll_repo(
                     try:
                         edits = fetch_pr_edit_history(repo, pr["number"])
                     except Exception as exc:
-                        print(f"  {repo}: edit history fetch error (PR #{pr['number']}): {exc}", file=sys.stderr)
+                        logger.warning("{}  edit history fetch error (PR #{}): {}", repo, pr["number"], exc)
                     else:
                         for edit in edits.get("body_edits", []):
                             try:
@@ -356,7 +367,7 @@ def _poll_repo(
                                     conn=conn,
                                 )
                             except Exception as exc:
-                                print(f"  {repo}: insert PR body edit error (PR #{pr['number']}): {exc}", file=sys.stderr)
+                                logger.warning("{}  insert PR body edit error (PR #{}): {}", repo, pr["number"], exc)
 
                         for edit in edits.get("review_comment_edits", []):
                             try:
@@ -371,7 +382,7 @@ def _poll_repo(
                                     conn=conn,
                                 )
                             except Exception as exc:
-                                print(f"  {repo}: insert PR review comment edit error (PR #{pr['number']}): {exc}", file=sys.stderr)
+                                logger.warning("{}  insert PR review comment edit error (PR #{}): {}", repo, pr["number"], exc)
 
             # Insert PR→issue link if resolved
             if linked_issue is not None:
@@ -383,7 +394,7 @@ def _poll_repo(
                 try:
                     edits = fetch_pr_edit_history(repo, pr["number"])
                 except Exception as exc:
-                    print(f"  {repo}: edit history fetch error (PR #{pr['number']}): {exc}", file=sys.stderr)
+                    logger.warning("{}  edit history fetch error (PR #{}): {}", repo, pr["number"], exc)
                     continue
 
                 for edit in edits.get("body_edits", []):
@@ -398,7 +409,7 @@ def _poll_repo(
                             conn=conn,
                         )
                     except Exception as exc:
-                        print(f"  {repo}: insert PR body edit error (PR #{pr['number']}): {exc}", file=sys.stderr)
+                        logger.warning("{}  insert PR body edit error (PR #{}): {}", repo, pr["number"], exc)
 
                 for edit in edits.get("review_comment_edits", []):
                     try:
@@ -413,7 +424,7 @@ def _poll_repo(
                             conn=conn,
                         )
                     except Exception as exc:
-                        print(f"  {repo}: insert PR review comment edit error (PR #{pr['number']}): {exc}", file=sys.stderr)
+                        logger.warning("{}  insert PR review comment edit error (PR #{}): {}", repo, pr["number"], exc)
 
         # Commit all writes for this repo
         conn.commit()
@@ -423,11 +434,16 @@ def _poll_repo(
     # 6. Link PRs to sessions
     session_links = link_sessions(repo, github_db, sessions_db)
     if session_links:
-        print(f"  {repo}: linked {session_links} PR-session pairs", file=sys.stderr)
+        logger.info("{}  linked {} PR-session pairs", repo, session_links)
 
     # 7. Advance cursor
     advance_cursor(repo, github_db)
+    logger.info("{}  cursor advanced to {}", repo, date.today().isoformat())
 
+    logger.info(
+        "{}  done: {} issues + {} PRs | {} API calls used this hour",
+        repo, len(issues), len(prs), calls_made(),
+    )
     # Return post-cap count (actual records written).  The uncapped fetch
     # count was already logged above; dry-run returns the uncapped count
     # earlier (before the cap is applied).
@@ -450,6 +466,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    setup_logging()
     _total, ok = run(config_path=args.config, dry_run=args.dry_run)
     sys.exit(0 if ok else 1)
 

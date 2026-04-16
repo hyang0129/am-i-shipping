@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import json
 import subprocess
-import sys
 import time
 from typing import Any, Dict, List, Optional
+
+from loguru import logger
 
 
 _inter_request_delay: float = 0.0
@@ -58,12 +59,22 @@ class _HourlyBudget:
             self._count = 0
 
         self._count += 1
+        pct = self._count / self._max
+        if pct >= 0.95:
+            logger.warning("API budget {}/{} ({:.0f}%)", self._count, self._max, pct * 100)
+        elif pct >= 0.80:
+            logger.info("API budget {}/{} ({:.0f}%)", self._count, self._max, pct * 100)
         if self._count >= self._max:
             resets_in = max(0.0, 3600 - elapsed)
             raise BudgetExhausted(self._count, self._max, resets_in)
 
 
 _budget = _HourlyBudget(max_per_hour=2500)
+
+
+def calls_made() -> int:
+    """Return the number of API calls made in the current hour window."""
+    return _budget._count
 
 
 def configure_limiter(delay: float, max_calls_per_hour: int = 2500) -> None:
@@ -80,6 +91,7 @@ def configure_limiter(delay: float, max_calls_per_hour: int = 2500) -> None:
     global _inter_request_delay
     _inter_request_delay = delay
     _budget.configure(max_calls_per_hour)
+    logger.info("limiter configured: {:.2f}s delay, {}/hr cap", delay, max_calls_per_hour)
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +176,7 @@ def run_gh(
     _budget.record()
 
     cmd = ["gh"] + args
+    logger.debug("→ gh {}", ' '.join(args))
     last_err: Optional[GhCliError] = None
 
     for attempt in range(max_retries + 1):
@@ -178,13 +191,17 @@ def run_gh(
         last_err = GhCliError(cmd, result.returncode, result.stderr)
 
         if attempt < max_retries:
+            logger.warning(
+                "retry {}/{}: {} — {}",
+                attempt + 1,
+                max_retries,
+                ' '.join(cmd[1:3]),
+                result.stderr.strip()[:120],
+            )
             if _is_rate_limit_error(result.stderr):
                 wait = _rate_limit_reset_wait()
                 if wait > 0:
-                    print(
-                        f"  rate limit hit — sleeping {wait:.0f}s until reset",
-                        file=sys.stderr,
-                    )
+                    logger.info("rate limit — sleeping {:.0f}s until reset", wait)
                     time.sleep(wait + 5)  # +5s buffer
                 else:
                     # Secondary limit or unknown 403 — short back-off.
