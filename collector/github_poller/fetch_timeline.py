@@ -45,64 +45,71 @@ TIMELINE_EVENT_TYPES: tuple[str, ...] = (
 # individual query bodies below ~64 KB and keeps per-call GraphQL cost low.
 _CHUNK_SIZE = 20
 
-# Fragment that the aliased issue blocks all inherit. The per-event-type
-# inline fragments pull only the fields we persist; actor is a viewer-typed
-# union so we go via the shared ``... on User { login }`` path.
-_TIMELINE_FRAGMENT = """
+def _timeline_fragment() -> str:
+    """Build the ``timelineItems`` GraphQL fragment.
+
+    The per-event-type inline fragments pull only the fields we persist;
+    actor is a viewer-typed union so we go via the shared
+    ``... on User { login }`` path. Constructed per-call from
+    ``TIMELINE_EVENT_TYPES`` so that runtime modifications to the tuple
+    (rare, but possible from tests) are honoured.
+    """
+    item_types = ", ".join(TIMELINE_EVENT_TYPES)
+    return f"""
       timelineItems(
         first: 100,
-        itemTypes: [%s]
-      ) {
-        nodes {
+        itemTypes: [{item_types}]
+      ) {{
+        nodes {{
           __typename
-          ... on AssignedEvent {
+          ... on AssignedEvent {{
             id
             createdAt
-            actor { login }
-            assignee { ... on User { login } ... on Bot { login } }
-          }
-          ... on LabeledEvent {
+            actor {{ login }}
+            assignee {{ ... on User {{ login }} ... on Bot {{ login }} }}
+          }}
+          ... on LabeledEvent {{
             id
             createdAt
-            actor { login }
-            label { name }
-          }
-          ... on UnlabeledEvent {
+            actor {{ login }}
+            label {{ name }}
+          }}
+          ... on UnlabeledEvent {{
             id
             createdAt
-            actor { login }
-            label { name }
-          }
-          ... on ClosedEvent {
+            actor {{ login }}
+            label {{ name }}
+          }}
+          ... on ClosedEvent {{
             id
             createdAt
-            actor { login }
+            actor {{ login }}
             stateReason
-          }
-          ... on ReopenedEvent {
+          }}
+          ... on ReopenedEvent {{
             id
             createdAt
-            actor { login }
-          }
-          ... on CrossReferencedEvent {
+            actor {{ login }}
+          }}
+          ... on CrossReferencedEvent {{
             id
             createdAt
-            actor { login }
-            source {
-              ... on Issue { number repository { nameWithOwner } }
-              ... on PullRequest { number repository { nameWithOwner } }
-            }
-          }
-          ... on ReferencedEvent {
+            actor {{ login }}
+            source {{
+              ... on Issue {{ number repository {{ nameWithOwner }} }}
+              ... on PullRequest {{ number repository {{ nameWithOwner }} }}
+            }}
+          }}
+          ... on ReferencedEvent {{
             id
             createdAt
-            actor { login }
-            commit { oid }
-            commitRepository { nameWithOwner }
-          }
-        }
-      }
-""" % ", ".join(TIMELINE_EVENT_TYPES)
+            actor {{ login }}
+            commit {{ oid }}
+            commitRepository {{ nameWithOwner }}
+          }}
+        }}
+      }}
+"""
 
 
 def _build_batch_query(issue_numbers: List[int]) -> str:
@@ -111,12 +118,13 @@ def _build_batch_query(issue_numbers: List[int]) -> str:
     The aliases are ``issue0``, ``issue1``, ... so the caller can map
     alias -> issue number by list position.
     """
+    fragment = _timeline_fragment()
     alias_blocks: List[str] = []
     for i, num in enumerate(issue_numbers):
         alias_blocks.append(
             f"    issue{i}: issue(number: {num}) {{\n"
             f"      number\n"
-            f"{_TIMELINE_FRAGMENT}"
+            f"{fragment}"
             f"    }}"
         )
 
@@ -155,9 +163,17 @@ def _event_id_from_node(node: Dict[str, Any]) -> Optional[int]:
     column is INTEGER so we hash-stabilise it: ``hash(relay_id) & 0x7FFF_FFFF``
     gives us a deterministic positive int without creating a new column.
 
-    Collisions are astronomically unlikely at per-issue scope (typically
-    dozens of events per issue) but if they happen we just UPDATE the row,
-    which is safe because the payload_json still names the original relay id.
+    WARNING: collisions cause data loss, not a "safe UPDATE". A hash collision
+    between two events for the same issue would have them map to the same
+    ``(repo, issue_number, event_id)`` primary key, and the later UPDATE
+    overwrites the earlier event's ``payload_json`` — the earlier event is
+    no longer recoverable from the row because there is no row for it. The
+    31-bit fold is adequate per-issue (dozens of events, collision
+    probability negligible) but the birthday bound over a whole repo is not
+    astronomical. If the repo-wide event count pushes into the hundreds of
+    thousands, this key strategy should be revisited — either widen the
+    column to TEXT and store the raw relay id, or add a separate relay id
+    column with its own UNIQUE constraint.
     """
     raw = node.get("id")
     if raw is None:
@@ -176,14 +192,25 @@ def _normalize_node(issue_number: int, node: Dict[str, Any]) -> Optional[Dict[st
     """Turn one GraphQL timeline node into our persistence shape.
 
     Returns None if the node is missing the minimal fields (no id, no type).
+    Dropped nodes are logged at DEBUG so future GitHub schema drift
+    (a new ``__typename`` that leaks past our ``itemTypes`` filter, or a
+    null id) is observable without flooding the warning log.
     """
     typename = node.get("__typename")
     event_type = _TYPENAME_TO_EVENT_TYPE.get(typename or "")
     if event_type is None:
+        logger.debug(
+            "dropped timeline node for issue #{}: unknown __typename {!r}",
+            issue_number, typename,
+        )
         return None
 
     event_id = _event_id_from_node(node)
     if event_id is None:
+        logger.debug(
+            "dropped timeline node for issue #{}: missing id (__typename={!r})",
+            issue_number, typename,
+        )
         return None
 
     actor = (node.get("actor") or {}).get("login") if node.get("actor") else None
