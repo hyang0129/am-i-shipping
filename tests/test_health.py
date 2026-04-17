@@ -216,3 +216,47 @@ class TestSynthesisHealthWiring:
         healthy, messages = check_health(data_dir=data_dir)
         assert not healthy
         assert any("synthesis" in m and "never reported" in m for m in messages)
+
+    def test_stale_thresholds_is_immutable(self):
+        """STALE_THRESHOLDS cannot be mutated by importers (F-6).
+
+        ``MappingProxyType`` is a read-only view: assignment and ``.pop``
+        both raise ``TypeError``. A plain dict would silently accept the
+        mutation and shift production behaviour.
+        """
+        with pytest.raises(TypeError):
+            STALE_THRESHOLDS["synthesis"] = timedelta(hours=1)  # type: ignore[index]
+
+    def test_synthesis_stale_message_renders_days_not_hours(self, tmp_path):
+        """Stale-message for synthesis reads as "Xd", not "192h" (F-7)."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        now = datetime.now(timezone.utc)
+        fresh = now.isoformat()
+        way_stale = (now - timedelta(days=10)).isoformat()
+        health = {
+            "session_parser": {"last_success": fresh, "last_record_count": 10},
+            "github_poller": {"last_success": fresh, "last_record_count": 20},
+            "synthesis": {"last_success": way_stale, "last_record_count": 3},
+        }
+        (data_dir / "health.json").write_text(json.dumps(health))
+
+        healthy, messages = check_health(data_dir=data_dir)
+        assert not healthy
+        synth_msgs = [m for m in messages if "synthesis" in m and "stale" in m]
+        assert synth_msgs, messages
+        msg = synth_msgs[0]
+        # The 8-day threshold is rendered as "8d", not "192h".
+        assert "8d" in msg, (
+            f"expected '8d' threshold rendering in synthesis message, "
+            f"got: {msg!r}"
+        )
+        # The 192h form must NOT appear in the synthesis message — that
+        # was the F-7 regression.
+        assert "192h" not in msg, (
+            f"synthesis message fell back to hours rendering: {msg!r}"
+        )
+        # The ~10-day age must render in days too.
+        assert "d ago" in msg, (
+            f"age also expected to render in days: {msg!r}"
+        )

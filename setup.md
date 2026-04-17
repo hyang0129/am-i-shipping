@@ -113,7 +113,9 @@ under "Clarifying Questions" are safe.
 `retrospectives/<sunday-date>.md` exists and that `data/health.json`
 contains a fresh `synthesis` entry. `python -m am_i_shipping.health_check`
 will warn if the `synthesis` collector has been silent beyond the weekly
-threshold (8 days).
+threshold (currently 8 days — see
+`am_i_shipping/health_check.py::STALE_THRESHOLDS["synthesis"]` for the
+source of truth).
 
 ---
 
