@@ -73,3 +73,30 @@ data:
   # Directory for SQLite databases and health.json
   # Relative paths are resolved from the repo root
   data_dir: "data"
+
+# -------------------------------------------------------------------
+# Weekly synthesis (Phase 2 — Epic #17) — DISABLED
+# Uncomment to enable. The full synthesis pipeline is delivered across
+# sub-issues #34..#40; the config section is accepted now so downstream
+# sub-issues can be wired incrementally without re-touching config_loader.
+# -------------------------------------------------------------------
+# synthesis:
+#   # Name of the environment variable holding the Anthropic API key.
+#   # Presence is NOT validated here; the check is activated by Sub-Issue 6.
+#   anthropic_api_key_env: "ANTHROPIC_API_KEY"
+#
+#   # Anthropic model used for the weekly retrospective call.
+#   model: "claude-sonnet-4-5"
+#
+#   # Directory for retrospective markdown files (relative paths
+#   # resolved from the repo root).
+#   output_dir: "retrospectives"
+#
+#   # Start of the synthesis week. One of "monday" or "sunday".
+#   week_start: "monday"
+#
+#   # Days of inactivity before a unit is flagged as abandoned.
+#   abandonment_days: 14
+#
+#   # Sigma multiplier used when flagging outlier units on per-metric medians.
+#   outlier_sigma: 2.0
