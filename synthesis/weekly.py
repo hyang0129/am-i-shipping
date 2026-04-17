@@ -79,11 +79,17 @@ MAX_UNITS_PER_PROMPT = 100
 #   log a WARNING so the epic's "prompt ≤ 512 KB for a real week" check
 #   stays enforceable during smoke tests without raising on edge cases.
 # * ``MAX_PROMPT_BYTES`` (1 MiB) is the fail-loud rail. Above this we
-#   ``raise RuntimeError`` rather than ship — a bloated prompt that
-#   size points to a bug upstream (missed truncation, runaway unit set,
+#   ``raise RuntimeError`` rather than ship — a prompt that large
+#   points to a bug upstream (missed truncation, runaway unit set,
 #   oversized per-unit metadata) and silently truncating it would hide
 #   the signal. 1 MiB is ~2x the transcript budget (512 KB) plus
 #   headroom for the static template + per-unit metadata blocks.
+#
+# The soft threshold is coincidentally equal to ``TRANSCRIPT_BUDGET_BYTES``
+# above. They are independent ceilings with the same numeric value by
+# chance (ADR Decision 4 and epic #50 both landed on 512 KB) — keep
+# them as separate constants so a future tweak to one does not
+# silently move the other.
 MAX_PROMPT_SOFT_WARN_BYTES = 512 * 1024  # 524288 — epic-#50 target
 MAX_PROMPT_BYTES = 1_048_576  # 1 MiB — hard raise threshold
 

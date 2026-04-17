@@ -899,8 +899,14 @@ def test_unit_cap_preserves_priority_order(
             f"second-priority (outlier) unit {uid} was dropped — "
             "priority ordering regressed"
         )
-    # At least one low-priority filler must be absent — proof that the
-    # cap discarded the right tail of the priority order.
+    # At least 20 low-priority fillers must be absent — proof that the
+    # cap discarded the right tail of the priority order. We assert the
+    # loose bound (>=20) rather than the tight expectation (==30,
+    # because 120 filler - 90 surviving slots = 30 dropped) so future
+    # tweaks to the tie-break (e.g. a secondary sort field) do not
+    # require updating this test. The tight expectation is that
+    # exactly 30 filler units drop; anything looser than 20 means the
+    # cap is not doing its job.
     missing_z = [
         i for i in range(120)
         if f"### unit unit-Z-{i:03d}" not in prompt_text
