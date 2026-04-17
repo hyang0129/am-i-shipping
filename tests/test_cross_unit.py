@@ -459,6 +459,48 @@ class TestAbandonmentFlag:
             conn.close()
         assert row[0] == 1
 
+    @pytest.mark.parametrize(
+        "bad_ts",
+        [
+            pytest.param(None, id="null_created_at"),
+            pytest.param("", id="empty_created_at"),
+            pytest.param("not-a-date", id="garbage_created_at"),
+        ],
+    )
+    def test_node_with_unparseable_ts_is_abandoned(
+        self, tmp_path: Path, bad_ts
+    ) -> None:
+        """Node exists but its ``created_at`` can't be parsed — abandoned.
+
+        Pins the docstring promise: "Units with no parseable timestamp
+        on any node count as abandoned — the absence of a dated signal
+        is itself a signal". Complements ``test_no_nodes_is_abandoned``
+        (which covers the missing-node branch) by exercising the
+        present-node-but-unparseable-ts branch.
+        """
+        db_path = _make_db(tmp_path)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            _insert_unit(
+                conn, unit_id="u-bad-ts", root_node_id="n-bad-ts"
+            )
+            _insert_node(conn, node_id="n-bad-ts", created_at=bad_ts)
+            conn.commit()
+        finally:
+            conn.close()
+
+        compute_flags(str(db_path), WEEK_START, now=PINNED_NOW)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT abandonment_flag FROM units WHERE unit_id = ?",
+                ("u-bad-ts",),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == 1
+
     def test_abandonment_days_override(self, tmp_path: Path) -> None:
         """Passing abandonment_days=7 flags a 10-day-old event."""
         db_path = _make_db(tmp_path)

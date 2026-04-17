@@ -24,6 +24,13 @@ sibling ``unit_flags`` table: every read site that already pulls
 keep in sync with the append-only unit identity. The columns are added
 by the idempotent ``_GITHUB_MIGRATIONS`` list in :mod:`am_i_shipping.db`.
 
+Unlike :func:`synthesis.unit_identifier.identify_units`, which is
+append-only (``INSERT OR IGNORE`` keyed on ``(week_start, unit_id)``),
+this pass **overwrites** ``outlier_flags`` and ``abandonment_flag`` on
+every call so cross-unit statistics always reflect the latest population
+for ``week_start``. The unit identity row is still never rewritten —
+only the two flag columns are updated.
+
 Statistics
 ----------
 Population standard deviation (not sample) is used so a week with a
@@ -42,7 +49,7 @@ import sqlite3
 import statistics
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Optional, Union
+from typing import Optional, Union
 
 from synthesis import metrics
 
@@ -167,6 +174,12 @@ def compute_flags(
     Returns the number of ``units`` rows updated. Safe to re-run:
     every row for the week is UPDATEd each call, overwriting any prior
     pass for the same ``week_start``.
+
+    The return value counts rows whose UPDATE's WHERE clause matched —
+    i.e. every ``units`` row for ``week_start`` — and does **not**
+    filter to "rows whose column values actually changed". Re-running
+    with identical inputs therefore returns the same count as the first
+    run. This mirrors SQLite's ``Cursor.rowcount`` semantics on UPDATE.
 
     Parameters
     ----------
