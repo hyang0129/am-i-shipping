@@ -20,10 +20,11 @@ am-health-check = "am_i_shipping.health_check:main"
 am-session-parser = "collector.session_parser:main"
 am-github-poller = "collector.github_poller.run:main"
 am-appswitch-export = "collector.appswitch.export:main"
+am-synthesize = "synthesis.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["am_i_shipping*", "collector*"]
+include = ["am_i_shipping*", "collector*", "synthesis*"]

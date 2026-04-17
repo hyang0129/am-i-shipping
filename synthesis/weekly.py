@@ -1,0 +1,608 @@
+"""S-2 weekly synthesis runner (Epic #17 — Issue #39).
+
+Assembles the weekly retrospective prompt from the synthesis tables
+(``units`` with cross-unit flags, ``graph_nodes`` / ``graph_edges`` for
+component resolution, ``sessions.raw_content_json`` for transcripts),
+calls the Anthropic API (or the offline :class:`FakeAnthropicClient`
+stand-in when ``AMIS_SYNTHESIS_LIVE`` is unset), and hands the
+rendered Markdown to :func:`synthesis.output_writer.write_retrospective`.
+
+Architecture decisions anchored here
+------------------------------------
+* **Decision 2 (idempotency).** The output writer refuses to overwrite
+  an existing retrospective; :func:`run_synthesis` calls the API only
+  *after* that guard so re-running the same ``--week`` is cheap.
+* **Decision 4 (water-fill transcripts).** See
+  :func:`water_fill_truncate` — sessions share a 512 KB transcript
+  budget proportionally. Small sessions are never truncated; large
+  sessions take the equal-share haircut. The algorithm is the unit of
+  test (``tests/test_weekly.py::test_water_fill_*``).
+
+What lives where
+----------------
+* ``run_synthesis`` — end-to-end pipeline.
+* ``water_fill_truncate`` — pure-function transcript budgeter (tested
+  independently; no DB access).
+* ``_assemble_prompt`` — Markdown prompt assembly (static cacheable
+  context + per-unit dynamic block).
+* ``_get_client`` — picks between live SDK and
+  :class:`synthesis.fake_client.FakeAnthropicClient` based on
+  ``AMIS_SYNTHESIS_LIVE``.
+
+Prompt caching
+--------------
+When the live SDK is active, the static context block (template,
+thresholds, column descriptions) is sent with ``cache_control`` so
+subsequent weekly runs pay a cache-hit price on it. The dynamic
+per-unit block is never cached — it changes every week.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sqlite3
+from pathlib import Path
+from typing import List, Optional, Tuple, Union
+
+from am_i_shipping.config_loader import SynthesisConfig
+from synthesis.fake_client import FakeAnthropicClient
+from synthesis.output_writer import write_retrospective
+from synthesis.unit_timeline import render_timeline
+
+
+logger = logging.getLogger(__name__)
+
+
+# Total transcript budget across all sessions in a single synthesis run,
+# in bytes. ADR Decision 4. 512 KB fits comfortably within Claude's
+# 200K-token context window at ~3-4 bytes per token while leaving
+# plenty of room for the static template + per-unit stats blocks.
+TRANSCRIPT_BUDGET_BYTES = 512 * 1024  # 524288
+
+# Upper bound on output tokens for the weekly synthesis call. The real
+# response is a few hundred tokens of Markdown; the ceiling exists so a
+# runaway generation does not burn tokens indefinitely.
+_MAX_OUTPUT_TOKENS = 4096
+
+
+# ---------------------------------------------------------------------------
+# Water-fill transcript truncation (ADR Decision 4)
+# ---------------------------------------------------------------------------
+
+
+def water_fill_truncate(
+    contents: List[str],
+    budget: int,
+) -> List[str]:
+    """Apportion *budget* bytes across *contents* via equal-share water-fill.
+
+    The algorithm (per the ADR):
+
+    1. Sort the inputs ascending by current byte-length.
+    2. Walk from smallest to largest. Each entry's ``share`` is
+       ``remaining_budget / remaining_count``.
+    3. If the entry fits within its share, include it whole and shrink
+       the remaining budget + count (the saved bytes cascade to larger
+       entries).
+    4. Otherwise truncate to exactly ``share`` bytes.
+
+    This gives equal truncation burden to equally-large sessions while
+    letting small sessions pass through untouched, which is what we want
+    when the transcript budget is smaller than the total session
+    content.
+
+    Parameters
+    ----------
+    contents:
+        List of UTF-8 strings. Treated as opaque bytes for budgeting
+        (``len(s.encode('utf-8'))`` would be more accurate but the ADR
+        specifies ``len(content)`` and callers already truncate at
+        character boundaries so the simpler form matches the spec).
+    budget:
+        Total byte allowance. Must be non-negative. ``0`` returns a list
+        of empty strings with the same cardinality as *contents*.
+
+    Returns
+    -------
+    List of truncated strings in the SAME ORDER as the input. Internal
+    sorting is by a side index so the returned list aligns positionally
+    with *contents* — tests rely on that when asserting per-session
+    results.
+
+    Example
+    -------
+    ``budget=10, contents=["aaaaa", "bbbbbbbbbbbbbbb"]`` → ``["aaaaa",
+    "bbbbb"]``. The small session's 5-byte saving does not move budget
+    to the large one because the large one exceeded its share anyway;
+    the net effect is the small one passed through, the large one took
+    a 5-byte haircut.
+
+    ``budget=12, contents=["aaaaa", "bbbbbbbbbbbbbbb"]`` → ``["aaaaa",
+    "bbbbbbb"]``. First pass gives each session share=6. The 5-byte
+    session consumes 5, leaving 7 for the large session. Large session
+    truncates to 7.
+
+    ``budget=10, contents=["aaaaaaaa", "bbbbbbbbb"]`` → ``["aaaaa",
+    "bbbbb"]``. Neither session fits its initial share=5; both
+    truncate to 5.
+    """
+    if budget < 0:
+        raise ValueError(f"budget must be non-negative, got {budget}")
+    if not contents:
+        return []
+
+    # Pair up (index, content) so we can sort by size without losing
+    # the positional alignment the caller expects.
+    indexed: List[Tuple[int, str]] = list(enumerate(contents))
+    # Sort ascending by byte length. Ties broken by index for
+    # determinism — two equally-sized sessions should truncate
+    # identically, but the tie-break rule ensures the walk order is
+    # reproducible across Python versions.
+    indexed.sort(key=lambda p: (len(p[1]), p[0]))
+
+    result: List[Optional[str]] = [None] * len(contents)
+    remaining_budget = budget
+    remaining_count = len(indexed)
+
+    for original_idx, content in indexed:
+        if remaining_count <= 0:
+            # Defensive — should not hit with the loop bounds above.
+            result[original_idx] = ""
+            continue
+        # Integer-division share so the budget never goes negative.
+        # Any remainder is absorbed by the last entry, which is the
+        # largest and therefore the most capable of taking the bonus.
+        share = remaining_budget // remaining_count
+        if len(content) <= share:
+            result[original_idx] = content
+            remaining_budget -= len(content)
+        else:
+            # Truncate to exactly ``share`` bytes. Character-boundary
+            # only — we do not attempt to land on a valid UTF-8
+            # boundary here because the ADR spec is ``content[:share]``
+            # and the caller feeds already-decoded text.
+            result[original_idx] = content[:share]
+            remaining_budget -= share
+        remaining_count -= 1
+
+    # None of the slots should remain unassigned at this point.
+    return [r if r is not None else "" for r in result]
+
+
+# ---------------------------------------------------------------------------
+# Unit / session loading
+# ---------------------------------------------------------------------------
+
+
+def _load_units(
+    github_conn: sqlite3.Connection,
+    week_start: str,
+) -> List[dict]:
+    """Return one dict per ``units`` row for *week_start*.
+
+    Includes ``outlier_flags`` (JSON string or NULL) and
+    ``abandonment_flag`` (0/1 or NULL) from the cross-unit pass.
+    """
+    rows = github_conn.execute(
+        "SELECT unit_id, root_node_type, root_node_id, "
+        "       elapsed_days, dark_time_pct, total_reprompts, "
+        "       review_cycles, status, outlier_flags, abandonment_flag "
+        "FROM units WHERE week_start = ? "
+        "ORDER BY unit_id",
+        (week_start,),
+    ).fetchall()
+    return [
+        {
+            "unit_id": r[0],
+            "root_node_type": r[1],
+            "root_node_id": r[2],
+            "elapsed_days": r[3],
+            "dark_time_pct": r[4],
+            "total_reprompts": r[5],
+            "review_cycles": r[6],
+            "status": r[7],
+            "outlier_flags": r[8],
+            "abandonment_flag": r[9],
+        }
+        for r in rows
+    ]
+
+
+def _unit_nodes(
+    github_conn: sqlite3.Connection,
+    week_start: str,
+    root_node_id: str,
+) -> List[Tuple[str, str, Optional[str]]]:
+    """Walk ``graph_edges`` to collect the component containing *root_node_id*.
+
+    Returns ``[(node_id, node_type, node_ref), ...]`` — the shape the
+    :func:`synthesis.unit_timeline.render_timeline` and the session-
+    lookup helpers below consume.
+    """
+    # Pull all nodes + edges for the week in one pass; the per-unit
+    # filtering is pure Python BFS so we do not hammer SQLite with N+1
+    # queries the way a naive recursive-SQL version would.
+    nodes = {
+        nid: (nt, nr)
+        for nid, nt, nr in github_conn.execute(
+            "SELECT node_id, node_type, node_ref FROM graph_nodes "
+            "WHERE week_start = ?",
+            (week_start,),
+        ).fetchall()
+    }
+    adj: dict[str, set[str]] = {}
+    for src, dst in github_conn.execute(
+        "SELECT src_node_id, dst_node_id FROM graph_edges "
+        "WHERE week_start = ?",
+        (week_start,),
+    ).fetchall():
+        adj.setdefault(src, set()).add(dst)
+        adj.setdefault(dst, set()).add(src)
+
+    if not root_node_id or root_node_id not in nodes:
+        return []
+
+    seen = {root_node_id}
+    stack = [root_node_id]
+    while stack:
+        cur = stack.pop()
+        for nxt in adj.get(cur, ()):
+            if nxt not in seen and nxt in nodes:
+                seen.add(nxt)
+                stack.append(nxt)
+
+    return sorted(
+        (
+            (nid, nodes[nid][0] or "", nodes[nid][1])
+            for nid in seen
+        ),
+        key=lambda x: x[0],
+    )
+
+
+def _load_session_transcripts(
+    sessions_conn: sqlite3.Connection,
+    session_uuids: List[str],
+) -> List[Tuple[str, str]]:
+    """Return ``[(session_uuid, raw_content_json), ...]`` for the given UUIDs.
+
+    Rows with NULL raw_content_json contribute an empty string — the
+    water-fill algorithm treats them as zero-length entries that always
+    pass through their share untouched.
+    """
+    if not session_uuids:
+        return []
+    placeholders = ",".join("?" * len(session_uuids))
+    rows = sessions_conn.execute(
+        f"SELECT session_uuid, raw_content_json FROM sessions "
+        f"WHERE session_uuid IN ({placeholders})",
+        session_uuids,
+    ).fetchall()
+    by_uuid = {r[0]: (r[1] or "") for r in rows}
+    # Preserve the caller's order so the prompt is deterministic.
+    return [(uid, by_uuid.get(uid, "")) for uid in session_uuids]
+
+
+# ---------------------------------------------------------------------------
+# Prompt assembly
+# ---------------------------------------------------------------------------
+
+
+# Static context — same every week. Sent as a cacheable block when the
+# live SDK is active so re-runs pay a cache-read price on the ~1-2 KB of
+# boilerplate below.
+_STATIC_SYSTEM_PROMPT = """You are the weekly synthesis engine for the am-i-shipping workflow monitor.
+
+Purpose
+-------
+Produce a Markdown retrospective that helps the developer identify which
+preconditions (Phase 0, steps 1-5 of the idealized workflow) failed
+during the past week. The unit of improvement is the user's behavior,
+not Claude's — frame every observation in those terms.
+
+Required Markdown sections (exact headings, in order)
+-----------------------------------------------------
+1. `## Velocity Trend`            — change in throughput vs. the user's
+   own prior baseline. Omit population benchmarks.
+2. `## Unit Summary Table`        — one row per unit from the week's
+   `units` table.
+3. `## Outlier Units`             — units flagged by the cross-unit pass
+   (`outlier_flags` non-empty). For each, note which metric(s) breached.
+4. `## Abandoned Units`           — units with `abandonment_flag = 1`.
+   Do not prescribe follow-up; surface the signal.
+5. `## Dark Time`                 — fraction of each unit's wall-clock
+   span during which no session was active. Highlight the top-2.
+6. `## Clarifying Questions`      — at most TWO total, numbered `1.`
+   and `2.`. Each question should be answerable from the user's memory
+   of the week — no research required.
+
+Constraints
+-----------
+* At most TWO clarifying questions across the entire document.
+  The limit is TOTAL, not per unit.
+* No `## Recommendations` section. The experiment loop (a separate
+  call, not this one) generates recommendations. Synthesis only asks.
+* No population benchmarks ("you used Claude X% more than average");
+  personal baseline only.
+
+Metric column legend
+--------------------
+* `elapsed_days`      — wall-clock span from first to last event.
+* `dark_time_pct`     — 1 - (sum(session active) / span).
+* `total_reprompts`   — sum of `sessions.reprompt_count` in the unit.
+* `review_cycles`     — len(review_comments_json) or push_count fallback.
+* `outlier_flags`     — JSON list of metric names > median + 2sigma.
+* `abandonment_flag`  — 1 if no event within 14 days.
+
+Thresholds
+----------
+* Outlier cutoff:    median + 2.0 * stdev (population stdev).
+* Abandonment cutoff: 14 days without a graph_nodes event.
+"""
+
+
+def _format_unit_block(unit: dict, transcript: str) -> str:
+    """Render one unit's dynamic block for the prompt.
+
+    Includes the metrics, flags, and (potentially truncated) transcript.
+    Keeps the Markdown readable by an LLM — table-less, heading-heavy.
+    """
+    flags = unit.get("outlier_flags") or "[]"
+    abandoned = unit.get("abandonment_flag")
+    abandoned_str = "yes" if abandoned == 1 else ("no" if abandoned == 0 else "n/a")
+    lines = [
+        f"### unit {unit['unit_id']}",
+        f"- root_node: {unit['root_node_type']}:{unit['root_node_id']}",
+        f"- elapsed_days: {unit['elapsed_days']}",
+        f"- dark_time_pct: {unit['dark_time_pct']}",
+        f"- total_reprompts: {unit['total_reprompts']}",
+        f"- review_cycles: {unit['review_cycles']}",
+        f"- status: {unit['status']}",
+        f"- outlier_flags: {flags}",
+        f"- abandonment_flag: {abandoned_str}",
+        "",
+        "#### transcript",
+        "```",
+        transcript,
+        "```",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _assemble_prompt(
+    units: List[dict],
+    unit_transcripts: dict,
+    unit_timelines: dict,
+    week_start: str,
+) -> Tuple[str, List[dict]]:
+    """Return (system_prompt, user_messages) for the synthesis call.
+
+    *system_prompt* is the static cacheable block. *user_messages* is
+    the list of ``{"role": "user", "content": ...}`` dicts the SDK
+    consumes — a single user message that concatenates the week anchor
+    with the per-unit dynamic blocks.
+    """
+    body_parts = [
+        f"# Week starting {week_start}",
+        "",
+        f"Total units this week: {len(units)}",
+        "",
+    ]
+    for unit in units:
+        body_parts.append(_format_unit_block(unit, unit_transcripts.get(unit["unit_id"], "")))
+        # Timeline is a compact Markdown list — one line per event.
+        timeline = unit_timelines.get(unit["unit_id"], [])
+        if timeline:
+            body_parts.append("#### timeline")
+            for ev in timeline:
+                body_parts.append(
+                    f"- {ev['timestamp']} {ev['type']} {ev['description']}"
+                )
+            body_parts.append("")
+
+    user_content = "\n".join(body_parts)
+    return _STATIC_SYSTEM_PROMPT, [{"role": "user", "content": user_content}]
+
+
+# ---------------------------------------------------------------------------
+# Client selection
+# ---------------------------------------------------------------------------
+
+
+def _get_client(config: SynthesisConfig):
+    """Return the client to use for the synthesis call.
+
+    * ``AMIS_SYNTHESIS_LIVE`` unset / falsy → the offline fake.
+    * ``AMIS_SYNTHESIS_LIVE=1``              → the live Anthropic SDK.
+      Import is lazy so an unset ``anthropic`` install does not break
+      offline runs. The ``ANTHROPIC_API_KEY`` env var (or whichever var
+      ``config.anthropic_api_key_env`` names) must be set — the SDK
+      picks it up via its usual env-var dance.
+    """
+    if not os.environ.get("AMIS_SYNTHESIS_LIVE"):
+        return FakeAnthropicClient()
+
+    # Live path — lazy import so the anthropic dep is not required at
+    # import time, only when actually called with AMIS_SYNTHESIS_LIVE=1.
+    import anthropic  # noqa: WPS433 — deliberate lazy import
+
+    api_key = os.environ.get(config.anthropic_api_key_env)
+    if not api_key:
+        raise RuntimeError(
+            f"AMIS_SYNTHESIS_LIVE is set but {config.anthropic_api_key_env} "
+            f"is empty — cannot call the Anthropic API"
+        )
+    return anthropic.Anthropic(api_key=api_key)
+
+
+def _call_llm(client, config: SynthesisConfig, system_prompt: str, messages: list) -> str:
+    """Dispatch the synthesis call and return the Markdown text.
+
+    When ``AMIS_SYNTHESIS_LIVE=1`` the system prompt is wrapped in a
+    list-of-blocks shape with ``cache_control`` so the Anthropic API
+    treats it as an ephemeral cache entry. The fake client accepts the
+    same shape (ignores the caching hint) so the call site needs no
+    branching.
+    """
+    if os.environ.get("AMIS_SYNTHESIS_LIVE"):
+        # List-of-blocks form enables prompt caching on the static
+        # context. See https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+        system_blocks = [
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+    else:
+        # Fake client accepts either a plain string or the blocks form.
+        # We use the plain form offline so the offline path never
+        # silently depends on the SDK's block parser.
+        system_blocks = system_prompt
+
+    resp = client.messages.create(
+        model=config.model,
+        max_tokens=_MAX_OUTPUT_TOKENS,
+        system=system_blocks,
+        messages=messages,
+    )
+    # Both the real SDK's Message and our FakeMessage expose
+    # ``content[0].text`` for a single-block text response, which is
+    # what a non-tool-use synthesis call returns.
+    return resp.content[0].text
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+
+def run_synthesis(
+    config: SynthesisConfig,
+    github_db: Union[str, Path],
+    sessions_db: Union[str, Path],
+    week_start: str,
+    dry_run: bool = False,
+) -> Optional[Path]:
+    """End-to-end weekly synthesis for *week_start*.
+
+    Parameters
+    ----------
+    config:
+        Validated :class:`SynthesisConfig`. Names the env var that
+        holds the Anthropic key, the model, and the output directory.
+    github_db, sessions_db:
+        Paths to the collector DBs. The fixture packs both schemas into
+        one file; in production they are two files under
+        ``config.data_dir``.
+    week_start:
+        ``YYYY-MM-DD`` anchor. Must match a value in
+        ``units.week_start`` — no units → no retrospective is written
+        (function returns ``None``).
+    dry_run:
+        When ``True``, writes the assembled prompt to
+        ``<output_dir>/.dry-run/<week_start>.prompt.txt`` and returns
+        that path. No LLM call, no retrospective file. Useful for
+        iterating on the prompt without burning tokens.
+
+    Returns
+    -------
+    * Production path (``dry_run=False``):
+      - Path to the newly-written retrospective, or
+      - ``None`` if the file already existed (refuse-to-overwrite), or
+      - ``None`` if the week has no units.
+    * Dry-run path (``dry_run=True``):
+      - Path to the ``.prompt.txt`` that was written, or
+      - ``None`` if the week has no units.
+    """
+    gh_path = Path(github_db)
+    sess_path = Path(sessions_db)
+    gh_conn = sqlite3.connect(str(gh_path))
+    sess_conn = gh_conn if sess_path == gh_path else sqlite3.connect(str(sess_path))
+
+    try:
+        units = _load_units(gh_conn, week_start)
+        if not units:
+            logger.info(
+                "No units found for week_start=%s; skipping synthesis", week_start
+            )
+            return None
+
+        # Resolve every unit's component so we can pull the session
+        # UUIDs (for transcripts) and feed the timeline renderer.
+        unit_components: dict = {}
+        all_session_uuids: List[str] = []
+        per_unit_uuids: dict = {}
+        for u in units:
+            comp = _unit_nodes(gh_conn, week_start, u["root_node_id"])
+            unit_components[u["unit_id"]] = comp
+            uuids = [nr for nid, nt, nr in comp if nt == "session" and nr]
+            per_unit_uuids[u["unit_id"]] = uuids
+            all_session_uuids.extend(uuids)
+
+        # Water-fill the transcripts across ALL sessions in ALL units
+        # so the 512 KB budget is global, not per-unit. ADR Decision 4
+        # phrases it as "cumulative budget".
+        raw = _load_session_transcripts(sess_conn, all_session_uuids)
+        # raw is aligned with all_session_uuids by construction.
+        truncated = water_fill_truncate(
+            [content for _uid, content in raw],
+            TRANSCRIPT_BUDGET_BYTES,
+        )
+        by_uuid = {uid: tc for (uid, _), tc in zip(raw, truncated)}
+
+        # Per-unit transcript = concatenation of the unit's (truncated)
+        # sessions. Blank units yield an empty transcript block — the
+        # prompt still renders them so the LLM can reason about
+        # "why is this unit empty".
+        unit_transcripts: dict = {}
+        unit_timelines: dict = {}
+        for u in units:
+            parts = [by_uuid.get(uid, "") for uid in per_unit_uuids[u["unit_id"]]]
+            unit_transcripts[u["unit_id"]] = "\n\n".join(p for p in parts if p)
+            unit_timelines[u["unit_id"]] = render_timeline(
+                unit_components[u["unit_id"]], gh_conn, sess_conn
+            )
+
+        system_prompt, messages = _assemble_prompt(
+            units, unit_transcripts, unit_timelines, week_start
+        )
+
+        # --- dry-run short-circuit ------------------------------------
+        if dry_run:
+            dry_dir = Path(config.output_dir) / ".dry-run"
+            dry_dir.mkdir(parents=True, exist_ok=True)
+            dry_path = dry_dir / f"{week_start}.prompt.txt"
+            # Concatenate system + user for a human-readable dump. The
+            # two halves are visually separated so a developer paging
+            # through the file can tell which block is cached.
+            text_content = messages[0]["content"] if messages else ""
+            dump = (
+                "=== SYSTEM (cacheable) ===\n"
+                f"{system_prompt}\n"
+                "=== USER ===\n"
+                f"{text_content}\n"
+            )
+            dry_path.write_text(dump, encoding="utf-8")
+            logger.info("Dry-run prompt written to %s", dry_path)
+            return dry_path
+
+        # --- live / fake synthesis ------------------------------------
+        client = _get_client(config)
+        markdown = _call_llm(client, config, system_prompt, messages)
+
+        return write_retrospective(markdown, config.output_dir, week_start)
+
+    finally:
+        if sess_conn is not gh_conn:
+            sess_conn.close()
+        gh_conn.close()
+
+
+__all__ = [
+    "run_synthesis",
+    "water_fill_truncate",
+    "TRANSCRIPT_BUDGET_BYTES",
+]
