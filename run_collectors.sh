@@ -55,6 +55,38 @@ FAIL_COUNT=0
 run_collector "Session Parser" -m collector.session_parser --mode batch
 run_collector "GitHub Poller"  -m collector.github_poller.run
 
+# Weekly synthesis: only run on Sundays, or when AMIS_FORCE_SYNTHESIS=1 is set.
+# `date +%u` returns 1..7 where 7 = Sunday (POSIX). Both GNU date and BSD date
+# support `+%u` the same way, so no per-OS branching is needed here.
+#
+# Week-start semantics: synthesis covers the most recently *completed* week,
+# so WEEK_START is always the Sunday seven days before today when today IS
+# Sunday, and the most recent past Sunday on every other day. GNU
+# `date -d 'last sunday'` and BSD `date -v-sun` both implement that
+# "previous Sunday, never today" semantic natively, so the output is
+# consistent across OSes and across weekdays. See F-1 / F-9 in the PR-48
+# review-fix cycle: the PowerShell counterpart is aligned to the same
+# convention explicitly.
+#
+# Exit semantics: a non-zero exit from `am-synthesize` is logged as a
+# WARNING and does NOT increment FAIL_COUNT. The overall scheduler's
+# exit code should reflect the daily collectors' health; synthesis is a
+# once-a-week add-on that may legitimately skip (missing API key,
+# AMIS_SYNTHESIS_LIVE=1 without credentials, empty DB, etc.). Only
+# daily-collector failures should flip the scheduler red. See F-5 in the
+# PR-48 review-fix cycle.
+if [ "$(date +%u)" = "7" ] || [ "${AMIS_FORCE_SYNTHESIS:-0}" = "1" ]; then
+    WEEK_START="$(date -d 'last sunday' +%Y-%m-%d 2>/dev/null || date -v-sun +%Y-%m-%d)"
+    log "--- Starting: Weekly Synthesis (week=$WEEK_START) ---"
+    if am-synthesize --week "$WEEK_START" "${CONFIG_ARG[@]}" >> "$LOG_FILE" 2>&1; then
+        log "OK: Weekly Synthesis completed successfully"
+    else
+        rc=$?
+        log "WARNING: Weekly Synthesis exited with code $rc (not counted as a failure)"
+    fi
+    log "--- Finished: Weekly Synthesis ---"
+fi
+
 log "=== Running health check ==="
 if python3 -m am_i_shipping.health_check >> "$LOG_FILE" 2>&1; then
     log "OK: All collectors healthy"

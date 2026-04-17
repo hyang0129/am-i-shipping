@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -127,6 +129,47 @@ def _scrub_live_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("AMIS_SYNTHESIS_LIVE", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     yield
+
+
+# ---------------------------------------------------------------------------
+# Health-write isolation (F-2 in the PR-48 review-fix cycle)
+# ---------------------------------------------------------------------------
+# Issue #40 added ``write_health("synthesis", len(units))`` inside
+# ``run_synthesis``. ``write_health`` with no ``data_dir`` defaults to the
+# real repo's ``data/`` directory, which means every invocation of
+# ``run_synthesis`` from this test module was stomping the developer's
+# production ``data/health.json``. The fixture below redirects the call
+# site so the default-path health writer writes into a tmp_path-scoped
+# data dir and never touches the repo.
+
+@pytest.fixture(autouse=True)
+def _isolate_write_health(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Redirect ``synthesis.weekly.write_health``'s default data_dir to tmp_path.
+
+    Yields the redirected health-data directory. Tests that want to assert
+    "a synthesis entry landed in health.json" can read from
+    ``tmp_path / "data" / "health.json"`` — or request the ``health_data_dir``
+    fixture.
+    """
+    import synthesis.weekly as weekly_module
+
+    health_data_dir = tmp_path / "health_data"
+    real_write_health = weekly_module.write_health
+
+    def _redirecting_write_health(collector_name, record_count, data_dir=None):
+        target = data_dir if data_dir is not None else health_data_dir
+        return real_write_health(collector_name, record_count, data_dir=target)
+
+    monkeypatch.setattr(
+        weekly_module, "write_health", _redirecting_write_health
+    )
+    yield health_data_dir
+
+
+@pytest.fixture
+def health_data_dir(_isolate_write_health) -> Path:
+    """Convenience alias for the redirected health-data directory."""
+    return _isolate_write_health
 
 
 class TestRunSynthesisOffline:
@@ -273,6 +316,134 @@ class TestNoUnitsForWeek:
         assert result is None
         # And no retrospective file was written.
         assert not (out / "1999-01-04.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# Health-write integration (issue #40 / F-3 in PR-48 review-fix cycle)
+# ---------------------------------------------------------------------------
+# These tests lock down the invariant that the PR claims to establish:
+# ``run_synthesis`` must call ``write_health("synthesis", ...)`` on the
+# successful-write path, and must NOT call it on the refuse-to-overwrite
+# path. Without these, a future refactor could silently delete the
+# ``write_health`` call and the health-check goes-red-after-one-week
+# invariant regresses without CI signal.
+
+
+class TestRunSynthesisHealthWiring:
+    def test_successful_run_writes_synthesis_health_entry(
+        self, tmp_path: Path, health_data_dir: Path
+    ):
+        """Happy path: the fake-client run lands a synthesis entry in health.json."""
+        db = _fixture_copy(tmp_path)
+        out = tmp_path / "retrospectives"
+        cfg = _make_config(tmp_path, out)
+
+        result = run_synthesis(cfg, db, db, WEEK_START)
+        assert result is not None, "precondition: the happy-path write succeeded"
+
+        health_path = health_data_dir / "health.json"
+        assert health_path.exists(), (
+            "run_synthesis did not call write_health on the success path"
+        )
+
+        data = json.loads(health_path.read_text(encoding="utf-8"))
+        assert "synthesis" in data
+        entry = data["synthesis"]
+        assert "last_success" in entry
+        assert "last_record_count" in entry
+        # last_record_count is len(units); golden fixture has ≥ 1 unit
+        # for WEEK_START, so we just assert it is a non-negative int.
+        assert isinstance(entry["last_record_count"], int)
+        assert entry["last_record_count"] >= 0
+        # last_success is a recent ISO timestamp.
+        ts = datetime.fromisoformat(entry["last_success"])
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        assert (datetime.now(timezone.utc) - ts).total_seconds() < 60, (
+            f"last_success timestamp is not recent: {entry['last_success']!r}"
+        )
+
+    def test_refuse_to_overwrite_does_not_bump_health(
+        self, tmp_path: Path, health_data_dir: Path
+    ):
+        """Decision-2 (refuse-to-overwrite) returns None → health NOT bumped.
+
+        The weekly.py comment at the write_health call site is explicit:
+        "that case is idempotent success, but it's not a new data point
+        so we don't bump the health timestamp". This test nails that
+        invariant down with a negative assertion.
+        """
+        db = _fixture_copy(tmp_path)
+        out = tmp_path / "retrospectives"
+        cfg = _make_config(tmp_path, out)
+
+        # First run writes the retrospective AND the health entry.
+        first = run_synthesis(cfg, db, db, WEEK_START)
+        assert first is not None
+
+        health_path = health_data_dir / "health.json"
+        first_ts = json.loads(health_path.read_text(encoding="utf-8"))[
+            "synthesis"
+        ]["last_success"]
+
+        # Second run hits refuse-to-overwrite and returns None.
+        second = run_synthesis(cfg, db, db, WEEK_START)
+        assert second is None, "precondition: refuse-to-overwrite path taken"
+
+        # The health timestamp MUST NOT have advanced.
+        second_ts = json.loads(health_path.read_text(encoding="utf-8"))[
+            "synthesis"
+        ]["last_success"]
+        assert first_ts == second_ts, (
+            "refuse-to-overwrite run bumped the health timestamp; it must not"
+        )
+
+    def test_no_units_for_week_does_not_write_health(
+        self, tmp_path: Path, health_data_dir: Path
+    ):
+        """Empty-week run returns None → no health entry created.
+
+        An empty week is not a successful synthesis — the LLM was never
+        called, no retrospective was written. It MUST NOT register as a
+        fresh health datapoint, otherwise stale-synthesis detection
+        would be masked by empty-week runs.
+        """
+        db = _fixture_copy(tmp_path)
+        out = tmp_path / "retrospectives"
+        cfg = _make_config(tmp_path, out)
+
+        # 1999-01-04 is a Monday with no units in the golden fixture.
+        result = run_synthesis(cfg, db, db, "1999-01-04")
+        assert result is None, "precondition: no-units path taken"
+
+        health_path = health_data_dir / "health.json"
+        # Either the file doesn't exist, or it exists without a synthesis
+        # entry. Both are acceptable — what must NOT happen is a synthesis
+        # entry appearing from an empty-week run.
+        if health_path.exists():
+            data = json.loads(health_path.read_text(encoding="utf-8"))
+            assert "synthesis" not in data, (
+                "empty-week run wrote a synthesis health entry; it must not"
+            )
+
+    def test_dry_run_does_not_write_health(
+        self, tmp_path: Path, health_data_dir: Path
+    ):
+        """--dry-run emits a prompt artefact and MUST NOT write health."""
+        db = _fixture_copy(tmp_path)
+        out = tmp_path / "retrospectives"
+        cfg = _make_config(tmp_path, out)
+
+        result = run_synthesis(cfg, db, db, WEEK_START, dry_run=True)
+        assert result is not None
+        assert result.name.endswith(".prompt.txt")
+
+        health_path = health_data_dir / "health.json"
+        if health_path.exists():
+            data = json.loads(health_path.read_text(encoding="utf-8"))
+            assert "synthesis" not in data, (
+                "dry-run wrote a synthesis health entry; it must not"
+            )
 
 
 class TestWaterFillBudgetConstant:

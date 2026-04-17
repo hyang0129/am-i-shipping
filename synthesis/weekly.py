@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 from am_i_shipping.config_loader import SynthesisConfig
+from am_i_shipping.health_writer import write_health
 from synthesis.fake_client import FakeAnthropicClient
 from synthesis.output_writer import write_retrospective
 from synthesis.unit_timeline import render_timeline
@@ -631,7 +632,19 @@ def run_synthesis(
         client, is_live = _get_client(config)
         markdown = _call_llm(client, config, system_prompt, messages, is_live)
 
-        return write_retrospective(markdown, config.output_dir, week_start)
+        result = write_retrospective(markdown, config.output_dir, week_start)
+
+        # Record a successful synthesis run in health.json ONLY when the
+        # retrospective was actually written this invocation. Refuse-to-
+        # overwrite (Decision 2) returns None — that case is idempotent
+        # success, but it's not a new data point so we don't bump the
+        # health timestamp. ``last_record_count`` is the number of units
+        # the run synthesised, giving operators a cheap signal to spot
+        # "synthesis ran but the week was empty" vs. the normal case.
+        if result is not None:
+            write_health("synthesis", len(units))
+
+        return result
 
     finally:
         if sess_conn is not gh_conn:

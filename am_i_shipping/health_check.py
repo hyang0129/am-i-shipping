@@ -16,11 +16,51 @@ import json
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import List, Tuple, Union
 
 
-EXPECTED_COLLECTORS = ["session_parser", "github_poller"]
+EXPECTED_COLLECTORS = ["session_parser", "github_poller", "synthesis"]
+# Per-collector staleness threshold. Session parser and GitHub poller run
+# daily, so 48h catches a missed run. Synthesis runs weekly (Sundays only)
+# so its threshold has to allow for a full cadence plus a one-day slack
+# window for clock skew / DST / missed-run catch-up.
+#
+# If you change STALE_THRESHOLDS["synthesis"] (currently 8 days), also
+# update setup.md §"Weekly synthesis cadence" which documents the same
+# value to human readers. F-8 in the PR-48 review-fix cycle.
+#
+# Wrapped in MappingProxyType so importers cannot mutate the map in
+# place. ``.get(key, default)`` still works on the proxy. F-6 in the
+# same review-fix cycle.
+STALE_THRESHOLDS = MappingProxyType({
+    "session_parser": timedelta(hours=48),
+    "github_poller": timedelta(hours=48),
+    "synthesis": timedelta(days=8),
+})
+# Default kept for backwards compatibility — any collector not in the map
+# above falls back to the original 48h threshold. Callers that import
+# STALE_THRESHOLD directly continue to see the same value.
 STALE_THRESHOLD = timedelta(hours=48)
+
+
+def _format_duration(delta: timedelta) -> str:
+    """Render a timedelta as a human-readable "Xh" or "Xd" string.
+
+    Durations strictly below 72h are shown in hours ("48h"); anything
+    above that is shown in days with one decimal of precision ("8d",
+    "10.0d"). F-7 in the PR-48 review-fix cycle.
+    """
+    total_hours = delta.total_seconds() / 3600
+    if total_hours < 72:
+        return f"{total_hours:.0f}h"
+    total_days = total_hours / 24
+    # Use an integer render when the value is clean (no fractional day),
+    # otherwise one decimal. Avoids "8.0d" in favour of "8d" for the
+    # expected 8-day synthesis threshold.
+    if abs(total_days - round(total_days)) < 0.05:
+        return f"{int(round(total_days))}d"
+    return f"{total_days:.1f}d"
 
 
 def check_health(
@@ -84,11 +124,12 @@ def check_health(
             continue
 
         age = now - last_success
-        if age > STALE_THRESHOLD:
-            hours_ago = age.total_seconds() / 3600
+        threshold = STALE_THRESHOLDS.get(collector, STALE_THRESHOLD)
+        if age > threshold:
             messages.append(
-                f"WARNING: {collector} is stale — last success {hours_ago:.1f}h ago "
-                f"(threshold: {STALE_THRESHOLD.total_seconds() / 3600:.0f}h)"
+                f"WARNING: {collector} is stale — last success "
+                f"{_format_duration(age)} ago "
+                f"(threshold: {_format_duration(threshold)})"
             )
             all_healthy = False
         else:
