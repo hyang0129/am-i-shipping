@@ -217,9 +217,16 @@ class TestIdentifyUnitsFixture:
         db = _fresh_fixture(tmp_path)
         conn = sqlite3.connect(str(db))
         try:
-            # Pre-seed the singleton unit with sentinel values.
+            # Pre-seed the singleton unit with sentinel values. Use an
+            # explicit column list so the positional tuple keeps working
+            # even when later migrations (e.g. Sub-Issue 5's
+            # outlier_flags / abandonment_flag) extend the table.
             conn.execute(
-                "INSERT INTO units VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO units "
+                "(week_start, unit_id, root_node_type, root_node_id, "
+                " elapsed_days, dark_time_pct, total_reprompts, "
+                " review_cycles, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (WEEK_START, "0e5eb65932c9f5f7", "session", "n-u3-sess",
                  999.0, 0.5, 42, 7, "sentinel"),
             )

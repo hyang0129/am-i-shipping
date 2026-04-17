@@ -244,6 +244,19 @@ _GITHUB_MIGRATIONS = [
     "ALTER TABLE issues ADD COLUMN updated_at TEXT",
     "ALTER TABLE pull_requests ADD COLUMN updated_at TEXT",
     "ALTER TABLE pull_requests ADD COLUMN comments_json TEXT",
+    # Epic #17 — Sub-Issue 5 (#38): cross-unit outlier + abandonment flags.
+    # ``outlier_flags`` stores a JSON-encoded list of metric names that
+    # breached the outlier threshold for the unit's week (e.g.
+    # ``["elapsed_days","total_reprompts"]``). Empty list ``"[]"`` means
+    # the unit was evaluated and cleared; NULL means the cross-unit pass
+    # has not yet run. ``abandonment_flag`` is 1 when the unit has no
+    # event activity within the last ``abandonment_days`` days, 0 when
+    # the unit was checked and is still active, and NULL before the pass
+    # runs. Kept as columns on ``units`` rather than a sibling table so
+    # downstream consumers can read outlier + abandonment state in the
+    # same row as the underlying metrics.
+    "ALTER TABLE units ADD COLUMN outlier_flags TEXT",
+    "ALTER TABLE units ADD COLUMN abandonment_flag INTEGER",
 ]
 
 APPSWITCH_SCHEMA = """
@@ -386,6 +399,9 @@ EXPECTED_GITHUB_TABLES: dict[str, set[str]] = {
         "total_reprompts",
         "review_cycles",
         "status",
+        # Epic #17 — Sub-Issue 5 (#38) additions
+        "outlier_flags",
+        "abandonment_flag",
     },
 }
 
