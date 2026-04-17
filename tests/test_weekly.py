@@ -14,6 +14,8 @@ import pytest
 
 from am_i_shipping.config_loader import SynthesisConfig
 from synthesis.weekly import (
+    MAX_PROMPT_BYTES,
+    MAX_UNITS_PER_PROMPT,
     TRANSCRIPT_BUDGET_BYTES,
     _format_unit_block,
     _load_units,
@@ -541,3 +543,206 @@ class TestWaterFillBudgetConstant:
             "TRANSCRIPT_BUDGET_BYTES is pinned by Epic #17 ADR Decision 4 "
             "(512 KB = 524288 bytes). Update the ADR before changing it."
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #54 P-2 — unit cap + prompt-byte guard
+# ---------------------------------------------------------------------------
+# These tests nail down the safety rails that keep ``run_synthesis``
+# from silently shipping a 5-MB prompt when the week partition is
+# pathological (dev ``week_start='all'`` with thousands of units) or
+# when a single unit produces an oversized metadata block. The cap and
+# the guard are independent — the cap truncates the unit list BEFORE
+# assembly, the guard fails loudly AFTER assembly — so each gets its
+# own end-to-end test against a handcrafted DB.
+
+
+def _seed_unit_row(
+    conn: sqlite3.Connection,
+    *,
+    week_start: str,
+    unit_id: str,
+    root_node_type: str = "session",
+    root_node_id: str = "",
+    elapsed_days: float = 1.0,
+    dark_time_pct: float = 0.0,
+    total_reprompts: int = 0,
+    review_cycles: int = 0,
+    status: str = "closed",
+    outlier_flags: str = "[]",
+    abandonment_flag: int = 0,
+) -> None:
+    """Insert one ``units`` row with test-friendly defaults.
+
+    Mirrors the helper pattern in ``test_cross_unit.py`` / the inline
+    INSERT in ``test_format_unit_block_no_double_namespace`` so the new
+    tests do not drag in the full ``build_golden`` pipeline just to
+    exercise the cap / guard.
+    """
+    if not root_node_id:
+        root_node_id = f"n-{unit_id}"
+    conn.execute(
+        "INSERT INTO units "
+        "(week_start, unit_id, root_node_type, root_node_id, "
+        " elapsed_days, dark_time_pct, total_reprompts, "
+        " review_cycles, status, outlier_flags, abandonment_flag) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            week_start,
+            unit_id,
+            root_node_type,
+            root_node_id,
+            elapsed_days,
+            dark_time_pct,
+            total_reprompts,
+            review_cycles,
+            status,
+            outlier_flags,
+            abandonment_flag,
+        ),
+    )
+
+
+def test_unit_cap_truncates_and_warns(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """150 units → WARNING logged and only MAX_UNITS_PER_PROMPT survive.
+
+    Seeds a handcrafted DB with 150 units under a single week_start,
+    runs ``run_synthesis`` in dry-run mode (so we can inspect the
+    assembled prompt without a network call), and asserts:
+
+    1. A WARNING log line is emitted naming both the before (150) and
+       after (MAX_UNITS_PER_PROMPT=100) counts.
+    2. The assembled prompt reports ``Total units this week: 100`` — the
+       prompt body encodes the post-cap count, so this is the cleanest
+       end-to-end check that the cap took effect.
+    3. Exactly ``MAX_UNITS_PER_PROMPT`` ``### unit `` headings appear in
+       the assembled prompt — double-locks the count via the per-unit
+       block renderer.
+    """
+    from am_i_shipping.db import init_github_db
+
+    week_start = "2025-04-14"
+    total_units = 150
+    assert total_units > MAX_UNITS_PER_PROMPT, (
+        "test precondition: seed size must exceed the cap"
+    )
+
+    db_path = tmp_path / "github.db"
+    init_github_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        # Seed a mix of abandoned / outlier / plain units so the sort
+        # key has something to rank against. The cap must still land on
+        # exactly MAX_UNITS_PER_PROMPT regardless of the priority mix.
+        for i in range(total_units):
+            flags = "[\"elapsed_days\"]" if i % 7 == 0 else "[]"
+            abandoned = 1 if i % 11 == 0 else 0
+            _seed_unit_row(
+                conn,
+                week_start=week_start,
+                unit_id=f"unit-{i:04d}",
+                elapsed_days=float(i % 30),
+                outlier_flags=flags,
+                abandonment_flag=abandoned,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = tmp_path / "retrospectives"
+    cfg = _make_config(tmp_path, out)
+
+    caplog.set_level("WARNING", logger="synthesis.weekly")
+
+    # Dry-run keeps us off the LLM and gives us the assembled prompt on
+    # disk — cleanest surface to assert on without reaching into
+    # private helpers.
+    result = run_synthesis(cfg, db_path, db_path, week_start, dry_run=True)
+    assert result is not None, "dry-run must produce a prompt artefact"
+
+    # 1. WARNING emitted naming the before/after counts.
+    warnings = [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and r.name == "synthesis.weekly"
+    ]
+    assert warnings, "expected at least one WARNING log from the unit cap"
+    msg_blob = " ".join(r.getMessage() for r in warnings)
+    assert str(total_units) in msg_blob, (
+        f"warning must mention the before-count {total_units}: {msg_blob!r}"
+    )
+    assert str(MAX_UNITS_PER_PROMPT) in msg_blob, (
+        f"warning must mention the after-count {MAX_UNITS_PER_PROMPT}: "
+        f"{msg_blob!r}"
+    )
+
+    # 2. Prompt body encodes the post-cap count.
+    prompt_text = result.read_text(encoding="utf-8")
+    assert f"Total units this week: {MAX_UNITS_PER_PROMPT}" in prompt_text, (
+        "assembled prompt did not report the capped unit count"
+    )
+
+    # 3. Exactly MAX_UNITS_PER_PROMPT per-unit blocks rendered.
+    rendered_unit_blocks = prompt_text.count("### unit ")
+    assert rendered_unit_blocks == MAX_UNITS_PER_PROMPT, (
+        f"expected {MAX_UNITS_PER_PROMPT} unit blocks in the assembled "
+        f"prompt, got {rendered_unit_blocks}"
+    )
+
+
+def test_prompt_byte_guard_raises(tmp_path: Path) -> None:
+    """An oversized unit block pushes the prompt past MAX_PROMPT_BYTES → RuntimeError.
+
+    Strategy: inject a single unit whose ``outlier_flags`` field is a
+    JSON string large enough that rendering its block alone exceeds
+    ``MAX_PROMPT_BYTES``. ``_format_unit_block`` embeds
+    ``outlier_flags`` verbatim, so a multi-megabyte JSON string flows
+    straight into the assembled prompt. This avoids any dependence on
+    session transcripts (which water-fill would truncate) and exercises
+    the guard against oversized *metadata*, which is the actual gap
+    the guard exists to close.
+
+    The guard MUST fire before any network call and before the dry-run
+    artefact is written. We exercise the dry-run path here because it
+    hits the guard without needing a live SDK stub — the guard is
+    shared across both paths.
+    """
+    from am_i_shipping.db import init_github_db
+
+    week_start = "2025-04-14"
+
+    db_path = tmp_path / "github.db"
+    init_github_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        # Build an ``outlier_flags`` payload that alone exceeds the
+        # byte ceiling. 2 * MAX_PROMPT_BYTES is comfortably over the
+        # limit even accounting for the static system prompt savings.
+        bloated_flags = "[" + ("\"x\"," * (2 * MAX_PROMPT_BYTES // 4)) + "\"x\"]"
+        assert len(bloated_flags) > MAX_PROMPT_BYTES, (
+            "test precondition: bloated_flags must itself exceed the cap"
+        )
+        _seed_unit_row(
+            conn,
+            week_start=week_start,
+            unit_id="unit-bloat",
+            outlier_flags=bloated_flags,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = tmp_path / "retrospectives"
+    cfg = _make_config(tmp_path, out)
+
+    with pytest.raises(RuntimeError, match="MAX_PROMPT_BYTES"):
+        run_synthesis(cfg, db_path, db_path, week_start, dry_run=True)
+
+    # And the dry-run artefact must NOT have been written — the guard
+    # runs before the write.
+    dry_path = out / ".dry-run" / f"{week_start}.prompt.txt"
+    assert not dry_path.exists(), (
+        "prompt-byte guard must fire before the dry-run artefact is written"
+    )

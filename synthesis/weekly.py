@@ -61,6 +61,24 @@ logger = logging.getLogger(__name__)
 # plenty of room for the static template + per-unit stats blocks.
 TRANSCRIPT_BUDGET_BYTES = 512 * 1024  # 524288
 
+# Issue #54 / Epic #50 P-2 — hard cap on the number of units included in
+# a single synthesis prompt. Keeps the prompt assembly bounded even when
+# the week partition is pathological (e.g. a dev ``week_start='all'``
+# run with thousands of units). A real weekly run is ~42 units, so 100
+# is generous for the expected case while still catching runaway input
+# before it reaches the LLM. Kept as a module constant (not a
+# ``SynthesisConfig`` field) per ADR Q2 — this is a safety rail, not a
+# user-tuneable knob.
+MAX_UNITS_PER_PROMPT = 100
+
+# Issue #54 / Epic #50 P-2 — hard ceiling on the total assembled prompt
+# (system + user content, in bytes). 1 MiB is ~2x the transcript budget
+# (512 KB) plus headroom for static template + per-unit metadata blocks.
+# If the assembled prompt exceeds this, we raise rather than ship — a
+# bloated prompt points to a bug upstream (missed truncation, runaway
+# unit set) and silently truncating it would hide the signal.
+MAX_PROMPT_BYTES = 1_048_576  # 1 MiB
+
 # Upper bound on output tokens for the weekly synthesis call. The real
 # response is a few hundred tokens of Markdown; the ceiling exists so a
 # runaway generation does not burn tokens indefinitely.
@@ -569,6 +587,40 @@ def run_synthesis(
             )
             return None
 
+        # --- Issue #54 P-2: prioritise + cap unit count ---------------
+        # Prompt-size safety rail. Units are ordered so that the most
+        # signal-bearing ones survive a truncation:
+        #   1. abandonment_flag=1 first (most actionable — user stalled)
+        #   2. units with non-empty outlier_flags next (metric outliers)
+        #   3. longer-running units (elapsed_days desc)
+        #   4. unit_id asc as the final tie-break (determinism)
+        # ``outlier_flags`` is a JSON string ("[]" / "["x","y"]" / NULL).
+        # We only need to distinguish empty-vs-non-empty, so a string
+        # compare against "[]" is sufficient without parsing the JSON.
+        def _priority_key(u: dict) -> tuple:
+            abandoned = 1 if u.get("abandonment_flag") == 1 else 0
+            flags = u.get("outlier_flags")
+            has_outliers = 1 if (flags is not None and flags != "[]") else 0
+            elapsed = u.get("elapsed_days") or 0.0
+            unit_id = u.get("unit_id") or ""
+            # Negate the fields we want DESC so a plain ``sorted`` ASC
+            # yields the right order with unit_id as the final ASC key.
+            return (-abandoned, -has_outliers, -elapsed, unit_id)
+
+        units.sort(key=_priority_key)
+
+        if len(units) > MAX_UNITS_PER_PROMPT:
+            logger.warning(
+                "Unit count %d exceeds MAX_UNITS_PER_PROMPT=%d for "
+                "week_start=%s; truncating to top %d by priority "
+                "(abandonment > outliers > elapsed_days desc)",
+                len(units),
+                MAX_UNITS_PER_PROMPT,
+                week_start,
+                MAX_UNITS_PER_PROMPT,
+            )
+            units = units[:MAX_UNITS_PER_PROMPT]
+
         # Resolve every unit's component so we can pull the session
         # UUIDs (for transcripts) and feed the timeline renderer.
         unit_components: dict = {}
@@ -608,6 +660,28 @@ def run_synthesis(
         system_prompt, messages = _assemble_prompt(
             units, unit_transcripts, unit_timelines, week_start
         )
+
+        # --- Issue #54 P-2: prompt-size guard -------------------------
+        # Hard ceiling on the assembled prompt (system + user). Runs
+        # BEFORE the dry-run short-circuit AND before the live network
+        # call so both paths fail loudly on a bloated prompt rather than
+        # writing a bad artefact or burning tokens. The unit cap above
+        # is the first line of defence; this guard catches the case
+        # where even the capped unit set produces a prompt that is too
+        # large (e.g. a single unit with a very long metadata block).
+        total_bytes = len(system_prompt) + sum(
+            len(m["content"]) for m in messages
+        )
+        if total_bytes > MAX_PROMPT_BYTES:
+            raise RuntimeError(
+                f"Assembled prompt is {total_bytes} bytes, exceeds "
+                f"MAX_PROMPT_BYTES={MAX_PROMPT_BYTES} for week_start="
+                f"{week_start!r} with {len(units)} units. Refusing to "
+                f"call the LLM (or write a dry-run artefact) with a "
+                f"prompt this large — this usually indicates a bug "
+                f"upstream (missed transcript truncation, runaway unit "
+                f"set, or oversized per-unit metadata)."
+            )
 
         # --- dry-run short-circuit ------------------------------------
         if dry_run:
@@ -656,4 +730,6 @@ __all__ = [
     "run_synthesis",
     "water_fill_truncate",
     "TRANSCRIPT_BUDGET_BYTES",
+    "MAX_UNITS_PER_PROMPT",
+    "MAX_PROMPT_BYTES",
 ]
