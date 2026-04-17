@@ -15,6 +15,8 @@ import pytest
 from am_i_shipping.config_loader import SynthesisConfig
 from synthesis.weekly import (
     TRANSCRIPT_BUDGET_BYTES,
+    _format_unit_block,
+    _load_units,
     run_synthesis,
     water_fill_truncate,
 )
@@ -444,6 +446,88 @@ class TestRunSynthesisHealthWiring:
             assert "synthesis" not in data, (
                 "dry-run wrote a synthesis health entry; it must not"
             )
+
+
+# ---------------------------------------------------------------------------
+# Regression — Issue #51: root_node line must not double the namespace
+# ---------------------------------------------------------------------------
+# The golden fixture built by ``build_golden.py`` uses short fake node
+# IDs (e.g. ``n-u1-issue``) that would never surface this bug. Production
+# node IDs are already namespaced — ``session:<uuid>``, ``issue:<repo>#N``,
+# ``pr:<repo>#N``, ``commit:<sha>`` — so a naive ``{root_node_type}:{root_node_id}``
+# render emits ``session:session:<uuid>``. This test seeds a handcrafted
+# DB (pattern borrowed from ``test_cross_unit.py``) with real-shape node
+# IDs and asserts the rendered block never contains the doubled prefix.
+# Do NOT extend ``build_golden.py`` to cover this — that would couple the
+# bug's regression test to the expensive golden-snapshot pipeline.
+
+
+def test_format_unit_block_no_double_namespace(tmp_path: Path) -> None:
+    """``_format_unit_block`` must not emit ``<type>:<type>:<id>``.
+
+    Regression for issue #51. The formatter previously prefixed the
+    already-namespaced ``root_node_id`` with ``root_node_type:``, so a
+    unit rooted at ``session:<uuid>`` came out as ``session:session:<uuid>``
+    in the prompt. This test asserts the double-namespace pattern is
+    absent for every real-shape root node type (session / issue / pr /
+    commit) via a handcrafted inline DB — no reliance on the committed
+    ``golden.sqlite`` or ``expected_retrospective.md`` fixtures.
+    """
+    import re
+
+    from am_i_shipping.db import init_github_db
+
+    week_start = "2025-04-07"
+    # Production-shape, already-namespaced node IDs — each one would
+    # collide with its ``root_node_type`` if the formatter re-prefixed.
+    cases = [
+        ("unit-session", "session", "session:3f2a9e14-1b6d-4a0e-9a2c-1234567890ab"),
+        ("unit-issue",   "issue",   "issue:example/repo#201"),
+        ("unit-pr",      "pr",      "pr:example/repo#42"),
+        ("unit-commit",  "commit",  "commit:deadbeefcafef00d1234567890abcdef01234567"),
+    ]
+
+    db_path = tmp_path / "github.db"
+    init_github_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        for unit_id, node_type, node_id in cases:
+            conn.execute(
+                "INSERT INTO units "
+                "(week_start, unit_id, root_node_type, root_node_id, "
+                " elapsed_days, dark_time_pct, total_reprompts, "
+                " review_cycles, status, outlier_flags, abandonment_flag) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    week_start, unit_id, node_type, node_id,
+                    1.0, 0.0, 0, 0, "closed", "[]", 0,
+                ),
+            )
+        conn.commit()
+        units = _load_units(conn, week_start)
+    finally:
+        conn.close()
+
+    assert len(units) == len(cases), (
+        f"expected {len(cases)} units, got {len(units)}"
+    )
+
+    double_ns = re.compile(
+        r"(?:session|issue|pr|commit):(?:session|issue|pr|commit):"
+    )
+
+    for unit in units:
+        block = _format_unit_block(unit, transcript="")
+        assert double_ns.search(block) is None, (
+            f"double-namespace pattern leaked into block for unit "
+            f"{unit['unit_id']!r} (root_node_id={unit['root_node_id']!r}, "
+            f"root_node_type={unit['root_node_type']!r}):\n{block}"
+        )
+        # And the raw root_node_id must still appear verbatim — the fix
+        # drops the prefix, it does not drop the identifier itself.
+        assert unit["root_node_id"] in block, (
+            f"root_node_id {unit['root_node_id']!r} missing from block:\n{block}"
+        )
 
 
 class TestWaterFillBudgetConstant:

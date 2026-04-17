@@ -364,7 +364,7 @@ def _format_unit_block(unit: dict, transcript: str) -> str:
     abandoned_str = "yes" if abandoned == 1 else ("no" if abandoned == 0 else "n/a")
     lines = [
         f"### unit {unit['unit_id']}",
-        f"- root_node: {unit['root_node_type']}:{unit['root_node_id']}",
+        f"- root_node: {unit['root_node_id']}",
         f"- elapsed_days: {unit['elapsed_days']}",
         f"- dark_time_pct: {unit['dark_time_pct']}",
         f"- total_reprompts: {unit['total_reprompts']}",
