@@ -224,14 +224,18 @@ def _insert_sessions(conn: sqlite3.Connection) -> None:
         """
     )
     rows = UNIT1_SESSIONS + [UNIT3_SESSION]
-    # Session tuples above carry 17 values ordered to match the 18-column
-    # schema with ``created_at`` skipped.  We derive ``created_at`` from
-    # ``session_started_at`` so the fixture is fully deterministic (no
-    # datetime('now') defaults creeping in).  Final INSERT order:
-    # cols 0..14 — primary fields + token counters + fast_mode_turns
-    # col 15    — created_at    (= session_started_at)
-    # col 16    — session_started_at
-    # col 17    — session_ended_at
+    # Source tuples are 17 elements, laid out as:
+    #   cols 0..14 — primary fields + token counters + fast_mode_turns
+    #   col 15    — session_started_at
+    #   col 16    — session_ended_at
+    # The destination sessions table has 18 columns; the extra column
+    # (``created_at``) is derived at INSERT time by duplicating
+    # ``session_started_at`` so the fixture stays deterministic (no
+    # datetime('now') defaults creeping in). Final INSERT column order:
+    #   cols 0..14 — primary fields + token counters + fast_mode_turns
+    #   col 15    — created_at           (= session_started_at)
+    #   col 16    — session_started_at
+    #   col 17    — session_ended_at
     placeholders = ", ".join("?" * 18)
     for row in rows:
         session_started_at = row[15]
