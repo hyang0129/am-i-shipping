@@ -1,0 +1,40 @@
+{
+  "_readme": "Snapshot of the expected output of synthesis.unit_identifier.identify_units when run against tests/fixtures/synthesis/golden.sqlite with week_start='2025-01-06' and now=2025-01-13T00:00:00. See tests/test_unit_identifier.py. 'now' is pinned so abandonment status is deterministic (within 14 days of unit 1/3 activity, far past unit 2).",
+  "week_start": "2025-01-06",
+  "now": "2025-01-13T00:00:00",
+  "units": [
+    {
+      "unit_id": "0e5eb65932c9f5f7",
+      "nodes": ["n-u3-sess"],
+      "root_node_type": "session",
+      "root_node_id": "n-u3-sess",
+      "elapsed_days": 0.013888888888888888,
+      "dark_time_pct": 0.0,
+      "total_reprompts": 0,
+      "review_cycles": 0,
+      "status": "closed"
+    },
+    {
+      "unit_id": "52c2800675966c48",
+      "nodes": ["n-u2-issue", "n-u2-pr"],
+      "root_node_type": "issue",
+      "root_node_id": "n-u2-issue",
+      "elapsed_days": 1.9583333333333333,
+      "dark_time_pct": 0.0,
+      "total_reprompts": 0,
+      "review_cycles": 0,
+      "status": "open"
+    },
+    {
+      "unit_id": "9dcb15f9dbf5b54c",
+      "nodes": ["n-u1-issue", "n-u1-pr-a", "n-u1-pr-b", "n-u1-sess-a", "n-u1-sess-b"],
+      "root_node_type": "issue",
+      "root_node_id": "n-u1-issue",
+      "elapsed_days": 2.2534722222222223,
+      "dark_time_pct": 0.9532710280373832,
+      "total_reprompts": 1,
+      "review_cycles": 2,
+      "status": "closed"
+    }
+  ]
+}
