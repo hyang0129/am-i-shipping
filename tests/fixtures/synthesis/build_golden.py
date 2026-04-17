@@ -260,7 +260,7 @@ def build(path: Path = FIXTURE_PATH) -> None:
             sibling.unlink()
 
     # Initialise schema against the live db module so the fixture always
-    # matches whatever db.py ships.  init_github_db also runs _assert_schema.
+    # matches whatever db.py ships.  init_github_db also runs assert_schema.
     init_github_db(path)
 
     conn = sqlite3.connect(str(path))

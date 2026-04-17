@@ -7,9 +7,9 @@ import pytest
 
 from am_i_shipping.config_loader import Config, SessionConfig, GitHubConfig, AppSwitchConfig, DataConfig
 from am_i_shipping.db import (
-    _EXPECTED_GITHUB_TABLES,
-    _EXPECTED_SESSIONS_COLUMNS,
-    _assert_schema,
+    EXPECTED_GITHUB_TABLES,
+    EXPECTED_SESSIONS_COLUMNS,
+    assert_schema,
     init_all,
 )
 
@@ -195,21 +195,21 @@ class TestInitDb:
         assert expected.issubset(columns)
 
     def test_assert_schema_passes_on_fresh_db(self, tmp_path):
-        """init_*_db() already call _assert_schema(); a direct call must also pass."""
+        """init_*_db() already call assert_schema(); a direct call must also pass."""
         config = _make_config(tmp_path)
         init_all(config)
 
         # Both should raise nothing.
-        _assert_schema(
+        assert_schema(
             tmp_path / "data" / "sessions.db",
-            {"sessions": _EXPECTED_SESSIONS_COLUMNS},
+            {"sessions": EXPECTED_SESSIONS_COLUMNS},
         )
-        _assert_schema(
-            tmp_path / "data" / "github.db", _EXPECTED_GITHUB_TABLES
+        assert_schema(
+            tmp_path / "data" / "github.db", EXPECTED_GITHUB_TABLES
         )
 
     def test_assert_schema_raises_on_missing_column(self, tmp_path):
-        """_assert_schema raises RuntimeError naming the missing column."""
+        """assert_schema raises RuntimeError naming the missing column."""
         bad_db = tmp_path / "bad.db"
         conn = sqlite3.connect(str(bad_db))
         # Legacy sessions schema — missing the new timestamp columns.
@@ -225,17 +225,17 @@ class TestInitDb:
         conn.close()
 
         with pytest.raises(RuntimeError, match="session_started_at"):
-            _assert_schema(bad_db, {"sessions": _EXPECTED_SESSIONS_COLUMNS})
+            assert_schema(bad_db, {"sessions": EXPECTED_SESSIONS_COLUMNS})
 
     def test_assert_schema_raises_on_missing_table(self, tmp_path):
-        """_assert_schema raises when a whole table is absent."""
+        """assert_schema raises when a whole table is absent."""
         empty_db = tmp_path / "empty.db"
         conn = sqlite3.connect(str(empty_db))
         conn.commit()
         conn.close()
 
         with pytest.raises(RuntimeError, match="units"):
-            _assert_schema(empty_db, {"units": {"week_start", "unit_id"}})
+            assert_schema(empty_db, {"units": {"week_start", "unit_id"}})
 
     def test_migration_replay_on_legacy_sessions_db(self, tmp_path):
         """Running init_all over an old sessions.db adds the new columns
@@ -323,4 +323,4 @@ class TestGoldenFixture:
 
     def test_golden_fixture_schema_matches_live_db(self, tmp_path):
         """Every expected github.db table is present in the fixture."""
-        _assert_schema(self.FIXTURE, _EXPECTED_GITHUB_TABLES)
+        assert_schema(self.FIXTURE, EXPECTED_GITHUB_TABLES)

@@ -252,7 +252,7 @@ CREATE TABLE IF NOT EXISTS app_events (
 
 
 # ---------------------------------------------------------------------------
-# Expected-column registry — drives _assert_schema()
+# Expected-column registry — drives assert_schema()
 # ---------------------------------------------------------------------------
 #
 # These constants describe the columns that MUST exist after init_*_db() has
@@ -261,7 +261,7 @@ CREATE TABLE IF NOT EXISTS app_events (
 # ALTER TABLE. Tests import these constants directly to keep the source of
 # truth in one place.
 
-_EXPECTED_SESSIONS_COLUMNS: set[str] = {
+EXPECTED_SESSIONS_COLUMNS: set[str] = {
     "session_uuid",
     "turn_count",
     "tool_call_count",
@@ -283,7 +283,7 @@ _EXPECTED_SESSIONS_COLUMNS: set[str] = {
     "session_ended_at",
 }
 
-_EXPECTED_GITHUB_TABLES: dict[str, set[str]] = {
+EXPECTED_GITHUB_TABLES: dict[str, set[str]] = {
     "issues": {
         "repo",
         "issue_number",
@@ -382,7 +382,7 @@ _EXPECTED_GITHUB_TABLES: dict[str, set[str]] = {
     },
 }
 
-_EXPECTED_APPSWITCH_TABLES: dict[str, set[str]] = {
+EXPECTED_APPSWITCH_TABLES: dict[str, set[str]] = {
     "app_events": {
         "timestamp_bucket",
         "window_hash",
@@ -393,7 +393,7 @@ _EXPECTED_APPSWITCH_TABLES: dict[str, set[str]] = {
 }
 
 
-def _assert_schema(
+def assert_schema(
     db_path: Path, expected: dict[str, set[str]]
 ) -> None:
     """Fail loud if any expected table/column is missing from *db_path*.
@@ -402,7 +402,7 @@ def _assert_schema(
     so that re-running ``ALTER TABLE ADD COLUMN`` against an already-migrated DB
     is a no-op. That convenience also hides the case where the migration text
     itself was malformed — silent failure would let a collector write against a
-    schema that quietly lacks the column. ``_assert_schema`` closes that loop by
+    schema that quietly lacks the column. ``assert_schema`` closes that loop by
     reading ``PRAGMA table_info`` for each expected table and raising a
     ``RuntimeError`` that names the specific missing column.
 
@@ -431,7 +431,7 @@ def _assert_schema(
             # non-source-controlled table name (CLI flag, config value, etc.).
             if not table.isidentifier():
                 raise ValueError(
-                    f"Invalid table identifier passed to _assert_schema: "
+                    f"Invalid table identifier passed to assert_schema: "
                     f"{table!r}"
                 )
             if table not in existing_tables:
@@ -469,7 +469,7 @@ def init_sessions_db(db_path: Path) -> None:
         conn.commit()
     finally:
         conn.close()
-    _assert_schema(db_path, {"sessions": _EXPECTED_SESSIONS_COLUMNS})
+    assert_schema(db_path, {"sessions": EXPECTED_SESSIONS_COLUMNS})
 
 
 def init_github_db(db_path: Path) -> None:
@@ -499,7 +499,7 @@ def init_github_db(db_path: Path) -> None:
         conn.commit()
     finally:
         conn.close()
-    _assert_schema(db_path, _EXPECTED_GITHUB_TABLES)
+    assert_schema(db_path, EXPECTED_GITHUB_TABLES)
 
 
 def init_appswitch_db(db_path: Path) -> None:
@@ -510,7 +510,7 @@ def init_appswitch_db(db_path: Path) -> None:
         conn.commit()
     finally:
         conn.close()
-    _assert_schema(db_path, _EXPECTED_APPSWITCH_TABLES)
+    assert_schema(db_path, EXPECTED_APPSWITCH_TABLES)
 
 
 def init_all(config: Config) -> None:
