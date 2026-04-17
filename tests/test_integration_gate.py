@@ -15,6 +15,7 @@ sources. They require:
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -91,11 +92,16 @@ class TestIntegrationGate:
     # Known tables for each database — avoids dynamic SQL construction.
     # Epic #17 Sub-Issue 2 (#35) adds ``commits`` and ``timeline_events``;
     # both are populated by the new E-1 / E-2 collectors enabled by default.
+    # Epic #50 replaced the Phase 1 ``issues`` / ``pull_requests`` /
+    # ``pushes`` / ``issue_pr_links`` tables with the unified Phase 2
+    # schema (``graph_nodes`` / ``graph_edges`` / ``units``). The old
+    # names are intentionally omitted — they no longer exist in
+    # ``github.db`` and referencing them would leave the "has any data"
+    # probe testing nothing.
     GITHUB_TABLES = (
-        "issues",
-        "pull_requests",
-        "pushes",
-        "issue_pr_links",
+        "graph_nodes",
+        "graph_edges",
+        "units",
         "commits",
         "timeline_events",
     )
@@ -364,4 +370,393 @@ class TestIntegrationGate:
         assert match, (
             "synthesis block started but WEEK_START not a valid "
             "YYYY-MM-DD in the log:\n" + log_text
+        )
+
+
+# ----------------------------------------------------------------------
+# Phase 2 pipeline integration (issue #55 / P-6)
+# ----------------------------------------------------------------------
+# The tests above exercise the Phase 1 collector pipeline
+# (``run_collectors.sh`` → sessions / github pollers). They never call
+# the Phase 2 synthesis chain — ``am-prepare-week`` followed by
+# ``am-synthesize`` — on a real ``week_start``. Without that coverage
+# breakage such as the ``session:session:`` doubling regression
+# (#51) or the stale ``week_start='all'`` pollution (see
+# ``_clean_stale_phase2_rows``) only surfaces in production.
+#
+# Preconditions (enforced by earlier merged issues on this epic):
+#   * P-1 #52  — ``am-prepare-week`` CLI exists and populates
+#                ``graph_nodes`` / ``units``.
+#   * P-3 #51  — session node IDs no longer double-prefix ``session:``.
+#   * P-4 #53  — ``sessions.session_started_at`` is backfilled on
+#                existing rows (gated by the timestamp coverage test).
+#   * P-5 #56  — ``config.yaml`` exposes a ``synthesis:`` section.
+#
+# All tests gated on ``AMIS_INTEGRATION=1`` via the module-level
+# ``pytestmark`` above.
+
+
+def _last_sunday(today: "datetime.date | None" = None) -> str:
+    """Return the most recent Sunday as ``YYYY-MM-DD``.
+
+    Python's ``weekday()`` returns 0 for Monday and 6 for Sunday. Any
+    offset computed from ``weekday()`` treats the previous Sunday as
+    the week boundary — matching the convention used by
+    ``am-prepare-week`` and ``am-synthesize``. When ``today`` itself is
+    a Sunday, that Sunday is returned (not the Sunday seven days
+    prior) so reruns on Sunday target the current week.
+    """
+    import datetime
+
+    if today is None:
+        today = datetime.date.today()
+    # weekday(): Mon=0 ... Sun=6. Days since last Sunday:
+    #   Sun -> 0, Mon -> 1, Tue -> 2, ..., Sat -> 6
+    days_since_sunday = (today.weekday() + 1) % 7
+    sunday = today - datetime.timedelta(days=days_since_sunday)
+    return sunday.isoformat()
+
+
+def _clean_stale_phase2_rows(github_db: Path) -> None:
+    """Delete any ``week_start = 'all'`` pollution from Phase 2 tables.
+
+    The 2026-04-17 smoke test for this issue wrote 15,845 / 63 / 15,785
+    rows into ``graph_nodes`` / ``graph_edges`` / ``units`` with
+    ``week_start = 'all'`` before ``am-prepare-week`` required a real
+    ISO week. Those rows are not keyed on a real week and silently
+    distort count-based idempotency assertions. Delete them before the
+    Phase 2 tests run so T-3 / T-5 compare real-week counts only.
+
+    Safe no-op when the tables are absent (fresh install) or when no
+    ``'all'`` rows exist.
+    """
+    if not github_db.exists():
+        return
+    conn = sqlite3.connect(str(github_db))
+    try:
+        for table in ("graph_nodes", "graph_edges", "units"):
+            try:
+                conn.execute(
+                    f"DELETE FROM [{table}] WHERE week_start = 'all'"
+                )
+            except sqlite3.OperationalError:
+                # Table not created yet — nothing to clean.
+                continue
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestPhase2Pipeline:
+    """Phase 2 smoke tests — run prepare/synthesize on the real DB.
+
+    Every test here has side effects on ``data/github.db`` and on the
+    ``retrospectives/.dry-run/`` directory. They must only run when
+    ``AMIS_INTEGRATION=1`` is set (enforced by the module-level
+    ``pytestmark``). Each test computes its own ``week_start`` via
+    :func:`_last_sunday` so the suite stays deterministic when run on
+    any day of the week.
+    """
+
+    # Dry-run prompt size ceiling — matches the 512 KB water-fill
+    # transcript budget in ``synthesis.weekly``. A file larger than this
+    # signals the budgeter broke.
+    DRY_RUN_SIZE_LIMIT_BYTES = 512 * 1024
+
+    # Regex for the doubled type-prefix regression fixed by P-3 (#51).
+    # Matches ``session:session:``, ``issue:issue:``, ``pr:pr:``.
+    DOUBLE_PREFIX_PATTERN = re.compile(r"(session|issue|pr):\1:")
+
+    # >=90% of sessions must have ``session_started_at`` set. This
+    # gates the P-4 (#53) backfill — without it, Phase 2 unit summaries
+    # collapse to zero dark-time / elapsed-days and the retrospective
+    # is meaningless.
+    TIMESTAMP_COVERAGE_MIN = 0.90
+
+    # ------------------------------------------------------------------
+    # Setup: purge the stale ``week_start='all'`` pollution exactly once
+    # per test (not once per session) — cheap, and makes each test
+    # independent of sibling-test ordering.
+    # ------------------------------------------------------------------
+    def setup_method(self, _method) -> None:
+        _clean_stale_phase2_rows(REPO_ROOT / "data" / "github.db")
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _run_prepare_week(week: str) -> subprocess.CompletedProcess:
+        """Invoke ``am-prepare-week --week <week>``.
+
+        Uses the current Python interpreter's console script so the
+        test does not depend on ``PATH`` resolution — ``sys.executable``
+        points at the venv that installed the package in editable mode.
+        """
+        return subprocess.run(
+            [sys.executable, "-m", "synthesis.prepare", "--week", week],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+
+    @staticmethod
+    def _run_synthesize_dry_run(week: str) -> subprocess.CompletedProcess:
+        """Invoke ``am-synthesize --week <week> --dry-run``."""
+        return subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "synthesis.cli",
+                "--week",
+                week,
+                "--dry-run",
+            ],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+
+    @staticmethod
+    def _count_rows(db: Path, table: str, week: str) -> int:
+        conn = sqlite3.connect(str(db))
+        try:
+            return conn.execute(
+                f"SELECT COUNT(*) FROM [{table}] WHERE week_start = ?",
+                (week,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _dry_run_path(week: str) -> Path:
+        return REPO_ROOT / "retrospectives" / ".dry-run" / f"{week}.prompt.txt"
+
+    # ------------------------------------------------------------------
+    # T-2
+    # ------------------------------------------------------------------
+    def test_prepare_week_populates_graph(self) -> None:
+        """``am-prepare-week`` exits 0 and writes rows for the target week."""
+        week = _last_sunday()
+        result = self._run_prepare_week(week)
+        assert result.returncode == 0, (
+            f"am-prepare-week exited {result.returncode}:\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+
+        github_db = REPO_ROOT / "data" / "github.db"
+        assert github_db.exists(), "data/github.db does not exist"
+
+        graph_count = self._count_rows(github_db, "graph_nodes", week)
+        units_count = self._count_rows(github_db, "units", week)
+
+        # Both tables must have at least one row keyed to the real week.
+        # An empty DB (zero rows) is a legitimate "nothing happened this
+        # week" state only if the collector has never run — in an
+        # integration gate that always follows a real collector run we
+        # expect at least some activity.
+        assert graph_count > 0, (
+            f"graph_nodes has no rows for week_start={week} after "
+            f"am-prepare-week; stdout:\n{result.stdout}"
+        )
+        assert units_count > 0, (
+            f"units has no rows for week_start={week} after "
+            f"am-prepare-week; stdout:\n{result.stdout}"
+        )
+
+    # ------------------------------------------------------------------
+    # T-3
+    # ------------------------------------------------------------------
+    def test_prepare_week_is_idempotent(self) -> None:
+        """Running ``am-prepare-week`` twice is a no-op on the second run."""
+        week = _last_sunday()
+
+        first = self._run_prepare_week(week)
+        assert first.returncode == 0, (
+            f"first am-prepare-week exited {first.returncode}:\n"
+            f"stderr: {first.stderr}"
+        )
+
+        github_db = REPO_ROOT / "data" / "github.db"
+        graph_before = self._count_rows(github_db, "graph_nodes", week)
+        units_before = self._count_rows(github_db, "units", week)
+
+        second = self._run_prepare_week(week)
+        assert second.returncode == 0, (
+            f"second am-prepare-week exited {second.returncode}:\n"
+            f"stderr: {second.stderr}"
+        )
+
+        graph_after = self._count_rows(github_db, "graph_nodes", week)
+        units_after = self._count_rows(github_db, "units", week)
+
+        assert graph_after == graph_before, (
+            f"graph_nodes row count changed on rerun "
+            f"({graph_before} -> {graph_after}) — idempotency broken"
+        )
+        assert units_after == units_before, (
+            f"units row count changed on rerun "
+            f"({units_before} -> {units_after}) — idempotency broken"
+        )
+
+    # ------------------------------------------------------------------
+    # T-4
+    # ------------------------------------------------------------------
+    def test_synthesize_dry_run_completes(self) -> None:
+        """``am-synthesize --dry-run`` writes a bounded, clean prompt file."""
+        week = _last_sunday()
+
+        # Prepare must run first — synthesize reads ``units``.
+        prep = self._run_prepare_week(week)
+        assert prep.returncode == 0, (
+            f"am-prepare-week exited {prep.returncode}:\n"
+            f"stderr: {prep.stderr}"
+        )
+
+        result = self._run_synthesize_dry_run(week)
+        assert result.returncode == 0, (
+            f"am-synthesize --dry-run exited {result.returncode}:\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+
+        prompt_path = self._dry_run_path(week)
+        assert prompt_path.exists(), (
+            f"dry-run prompt not written to {prompt_path}:\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+
+        size = prompt_path.stat().st_size
+        assert size <= self.DRY_RUN_SIZE_LIMIT_BYTES, (
+            f"dry-run prompt is {size} bytes, exceeds "
+            f"{self.DRY_RUN_SIZE_LIMIT_BYTES} byte ceiling — water-fill "
+            "transcript budgeter likely regressed"
+        )
+
+        content = prompt_path.read_text(encoding="utf-8", errors="replace")
+        double_prefix = self.DOUBLE_PREFIX_PATTERN.search(content)
+        assert double_prefix is None, (
+            f"dry-run prompt contains doubled type prefix "
+            f"{double_prefix.group(0)!r} at offset {double_prefix.start()} "
+            "— P-3 (#51) regression"
+        )
+
+    # ------------------------------------------------------------------
+    # T-5
+    # ------------------------------------------------------------------
+    def test_full_pipeline_idempotent(self) -> None:
+        """Running prepare + synthesize --dry-run twice is stable."""
+        week = _last_sunday()
+
+        # First full pass.
+        prep1 = self._run_prepare_week(week)
+        assert prep1.returncode == 0, (
+            f"first am-prepare-week exited {prep1.returncode}:\n"
+            f"stderr: {prep1.stderr}"
+        )
+        syn1 = self._run_synthesize_dry_run(week)
+        assert syn1.returncode == 0, (
+            f"first am-synthesize --dry-run exited {syn1.returncode}:\n"
+            f"stderr: {syn1.stderr}"
+        )
+
+        github_db = REPO_ROOT / "data" / "github.db"
+        units_before = self._count_rows(github_db, "units", week)
+        prompt_path = self._dry_run_path(week)
+        assert prompt_path.exists(), "dry-run prompt not written on first pass"
+        content_before = prompt_path.read_text(encoding="utf-8", errors="replace")
+
+        # Second full pass.
+        prep2 = self._run_prepare_week(week)
+        assert prep2.returncode == 0, (
+            f"second am-prepare-week exited {prep2.returncode}:\n"
+            f"stderr: {prep2.stderr}"
+        )
+        syn2 = self._run_synthesize_dry_run(week)
+        assert syn2.returncode == 0, (
+            f"second am-synthesize --dry-run exited {syn2.returncode}:\n"
+            f"stderr: {syn2.stderr}"
+        )
+
+        units_after = self._count_rows(github_db, "units", week)
+        content_after = prompt_path.read_text(encoding="utf-8", errors="replace")
+
+        assert units_after == units_before, (
+            f"units row count changed between passes "
+            f"({units_before} -> {units_after})"
+        )
+
+        # Allow the prompt to differ on lines that embed a live
+        # timestamp (e.g. "generated_at: ...") — compare line-by-line
+        # and require that non-timestamp lines match. A single-line
+        # timestamp divergence is acceptable; anything else is a real
+        # non-determinism bug.
+        lines_before = content_before.splitlines()
+        lines_after = content_after.splitlines()
+        if lines_before == lines_after:
+            return
+
+        assert len(lines_before) == len(lines_after), (
+            f"dry-run prompt line count changed "
+            f"({len(lines_before)} -> {len(lines_after)}) — content "
+            "is non-deterministic beyond timestamps"
+        )
+        diffs = [
+            (i, a, b)
+            for i, (a, b) in enumerate(zip(lines_before, lines_after))
+            if a != b
+        ]
+        # At most one differing line, and that line must look timestampy.
+        assert len(diffs) <= 1, (
+            f"dry-run prompt has {len(diffs)} differing lines between "
+            f"passes; first: line {diffs[0][0]} {diffs[0][1]!r} vs "
+            f"{diffs[0][2]!r}"
+        )
+        if diffs:
+            _, a, b = diffs[0]
+            timestampy = any(
+                token in a.lower() or token in b.lower()
+                for token in ("time", "date", "generated", "-04-", "-03-")
+            )
+            assert timestampy, (
+                f"dry-run prompt differs on a non-timestamp line: "
+                f"{a!r} vs {b!r}"
+            )
+
+    # ------------------------------------------------------------------
+    # Timestamp coverage — gates the P-4 (#53) backfill.
+    # ------------------------------------------------------------------
+    def test_timestamp_coverage(self) -> None:
+        """>=90% of ``sessions`` rows have a populated ``session_started_at``.
+
+        Duplicates the intent of ``TestIntegrationGate
+        .test_session_timestamp_coverage_gate`` but asserts it inside
+        the Phase 2 block so a Phase 2-only pytest selection still
+        catches regressions in the backfill.
+        """
+        sessions_db = REPO_ROOT / "data" / "sessions.db"
+        if not sessions_db.exists():
+            pytest.skip("data/sessions.db does not exist yet")
+
+        conn = sqlite3.connect(str(sessions_db))
+        try:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM sessions"
+            ).fetchone()[0]
+            with_ts = conn.execute(
+                "SELECT COUNT(*) FROM sessions "
+                "WHERE session_started_at IS NOT NULL"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        if total == 0:
+            pytest.skip("sessions.db has no rows yet")
+
+        coverage = with_ts / total
+        assert coverage >= self.TIMESTAMP_COVERAGE_MIN, (
+            f"session_started_at coverage is {coverage:.1%} "
+            f"({with_ts}/{total}); required minimum is "
+            f"{self.TIMESTAMP_COVERAGE_MIN:.0%}. Run: "
+            "python -m am_i_shipping.scripts.backfill_session_timestamps"
         )
