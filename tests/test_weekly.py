@@ -746,3 +746,167 @@ def test_prompt_byte_guard_raises(tmp_path: Path) -> None:
     assert not dry_path.exists(), (
         "prompt-byte guard must fire before the dry-run artefact is written"
     )
+
+
+def test_prompt_byte_guard_blocks_live_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The byte-guard must also fire BEFORE the LLM call on ``dry_run=False``.
+
+    ``test_prompt_byte_guard_raises`` above only exercises the dry-run
+    branch. The guard's contract (documented in the module comment and
+    the PR description) is "no network call, no dry-run write" — so we
+    also need a live-path assertion. We install a spy as
+    ``synthesis.weekly._call_llm`` that raises ``AssertionError`` if
+    ever invoked, then call ``run_synthesis(..., dry_run=False)`` with
+    the same oversized seed. A ``RuntimeError`` from the guard is the
+    only acceptable outcome; if the spy is touched the guard landed
+    *below* the LLM dispatch (regression) and the test fails loudly.
+    """
+    from am_i_shipping.db import init_github_db
+    import synthesis.weekly as weekly_module
+
+    week_start = "2025-04-14"
+    db_path = tmp_path / "github.db"
+    init_github_db(db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        bloated_flags = "[" + ("\"x\"," * (2 * MAX_PROMPT_BYTES // 4)) + "\"x\"]"
+        assert len(bloated_flags) > MAX_PROMPT_BYTES
+        _seed_unit_row(
+            conn,
+            week_start=week_start,
+            unit_id="unit-bloat-live",
+            outlier_flags=bloated_flags,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Spy: if _call_llm runs, the guard regressed.
+    def _forbidden_call_llm(*args, **kwargs) -> str:
+        raise AssertionError(
+            "_call_llm must not be invoked when the prompt-byte guard "
+            "should have fired — the guard regressed below the LLM "
+            "dispatch"
+        )
+
+    monkeypatch.setattr(weekly_module, "_call_llm", _forbidden_call_llm)
+
+    out = tmp_path / "retrospectives"
+    cfg = _make_config(tmp_path, out)
+
+    with pytest.raises(RuntimeError, match="MAX_PROMPT_BYTES"):
+        run_synthesis(cfg, db_path, db_path, week_start, dry_run=False)
+
+    # No retrospective file should have been written either — the guard
+    # sits above ``write_retrospective`` just as it sits above the
+    # dry-run write.
+    assert not (out / f"{week_start}.md").exists(), (
+        "live-path guard regression: retrospective was written despite "
+        "an oversized prompt"
+    )
+
+
+def test_unit_cap_preserves_priority_order(
+    tmp_path: Path,
+) -> None:
+    """The 100 units that survive truncation must be the highest-priority ones.
+
+    ``test_unit_cap_truncates_and_warns`` asserts the *count* is 100.
+    This test asserts the *identity* of the survivors — that the
+    documented priority (abandonment_flag=1 > non-empty outlier_flags >
+    elapsed_days desc > unit_id asc) actually drives the truncation.
+    A regression that dropped a ``-`` from ``_priority_key`` (sorting
+    abandoned units to the BOTTOM instead of the top) would still pass
+    the count assertion; this test fails loudly on that bug.
+
+    Seeding strategy:
+      * 5 guaranteed survivors: ``unit-A-00..04`` with abandonment_flag=1.
+      * 5 more guaranteed survivors: ``unit-B-00..04`` with non-empty
+        outlier_flags (and abandonment=0).
+      * 120 filler units: ``unit-Z-000..119`` with both flags clear.
+        Only 90 of these can fit (100 cap − 10 already spoken for).
+        The 30 extras must be dropped.
+    After the cap:
+      * Every A-unit must be present (top priority).
+      * Every B-unit must be present (second priority).
+      * At least one Z-unit must be absent (proof the cap actually
+        discarded low-priority units rather than high-priority ones).
+    """
+    from am_i_shipping.db import init_github_db
+
+    week_start = "2025-04-14"
+    db_path = tmp_path / "github.db"
+    init_github_db(db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        # 5 abandoned (guaranteed top-priority survivors)
+        for i in range(5):
+            _seed_unit_row(
+                conn,
+                week_start=week_start,
+                unit_id=f"unit-A-{i:02d}",
+                abandonment_flag=1,
+                outlier_flags="[]",
+                elapsed_days=0.0,
+            )
+        # 5 outlier-flagged (guaranteed second-priority survivors)
+        for i in range(5):
+            _seed_unit_row(
+                conn,
+                week_start=week_start,
+                unit_id=f"unit-B-{i:02d}",
+                abandonment_flag=0,
+                outlier_flags="[\"elapsed_days\"]",
+                elapsed_days=0.0,
+            )
+        # 120 filler units (flags all clear — lowest priority)
+        for i in range(120):
+            _seed_unit_row(
+                conn,
+                week_start=week_start,
+                unit_id=f"unit-Z-{i:03d}",
+                abandonment_flag=0,
+                outlier_flags="[]",
+                elapsed_days=0.0,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = tmp_path / "retrospectives"
+    cfg = _make_config(tmp_path, out)
+
+    result = run_synthesis(cfg, db_path, db_path, week_start, dry_run=True)
+    assert result is not None
+    prompt_text = result.read_text(encoding="utf-8")
+
+    # Every abandonment-flagged unit must survive.
+    for i in range(5):
+        uid = f"unit-A-{i:02d}"
+        assert f"### unit {uid}" in prompt_text, (
+            f"top-priority (abandoned) unit {uid} was dropped — "
+            "priority ordering regressed"
+        )
+    # Every outlier-flagged unit must survive.
+    for i in range(5):
+        uid = f"unit-B-{i:02d}"
+        assert f"### unit {uid}" in prompt_text, (
+            f"second-priority (outlier) unit {uid} was dropped — "
+            "priority ordering regressed"
+        )
+    # At least one low-priority filler must be absent — proof that the
+    # cap discarded the right tail of the priority order.
+    missing_z = [
+        i for i in range(120)
+        if f"### unit unit-Z-{i:03d}" not in prompt_text
+    ]
+    assert len(missing_z) >= 20, (
+        f"expected >=20 filler units to be dropped under the 100-unit "
+        f"cap (120 filler + 10 priority = 130 total, cap=100), got "
+        f"{len(missing_z)} dropped — the cap may not be engaging"
+    )
