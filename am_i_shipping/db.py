@@ -394,9 +394,9 @@ EXPECTED_APPSWITCH_TABLES: dict[str, set[str]] = {
 
 
 def assert_schema(
-    db_path: Path, expected: dict[str, set[str]]
+    db_path_or_conn, expected: dict[str, set[str]]
 ) -> None:
-    """Fail loud if any expected table/column is missing from *db_path*.
+    """Fail loud if any expected table/column is missing.
 
     The migration helpers above intentionally swallow ``sqlite3.OperationalError``
     so that re-running ``ALTER TABLE ADD COLUMN`` against an already-migrated DB
@@ -408,14 +408,25 @@ def assert_schema(
 
     Parameters
     ----------
-    db_path:
-        Path to the SQLite database to verify. Must already exist.
+    db_path_or_conn:
+        Either a filesystem path to an existing SQLite database, or an already
+        open ``sqlite3.Connection``. Passing a connection is required for
+        ``:memory:`` databases, where each new connection gets its own isolated
+        empty DB — reopening by path would observe an empty database rather
+        than the one the caller just wrote to.
     expected:
         Mapping of ``table_name -> set_of_expected_column_names``. A table is
         considered present iff it appears in ``sqlite_master``; a column is
         considered present iff it appears in ``PRAGMA table_info(<table>)``.
     """
-    conn = sqlite3.connect(str(db_path))
+    if isinstance(db_path_or_conn, sqlite3.Connection):
+        conn = db_path_or_conn
+        owns_conn = False
+        label = "<connection>"
+    else:
+        conn = sqlite3.connect(str(db_path_or_conn))
+        owns_conn = True
+        label = str(db_path_or_conn)
     try:
         existing_tables = {
             row[0]
@@ -436,7 +447,7 @@ def assert_schema(
                 )
             if table not in existing_tables:
                 raise RuntimeError(
-                    f"Schema assertion failed for {db_path}: "
+                    f"Schema assertion failed for {label}: "
                     f"missing table {table!r}"
                 )
             actual_columns = {
@@ -448,12 +459,13 @@ def assert_schema(
             missing = expected_columns - actual_columns
             if missing:
                 raise RuntimeError(
-                    f"Schema assertion failed for {db_path}: "
+                    f"Schema assertion failed for {label}: "
                     f"table {table!r} missing columns "
                     f"{sorted(missing)!r}"
                 )
     finally:
-        conn.close()
+        if owns_conn:
+            conn.close()
 
 
 def init_sessions_db(db_path: Path) -> None:
@@ -467,9 +479,11 @@ def init_sessions_db(db_path: Path) -> None:
             except sqlite3.OperationalError:
                 pass  # column already exists
         conn.commit()
+        # Assert on the same connection we just wrote to. For ':memory:'
+        # databases, reopening by path would see a fresh, empty DB.
+        assert_schema(conn, {"sessions": EXPECTED_SESSIONS_COLUMNS})
     finally:
         conn.close()
-    assert_schema(db_path, {"sessions": EXPECTED_SESSIONS_COLUMNS})
 
 
 def init_github_db(db_path: Path) -> None:
@@ -497,9 +511,11 @@ def init_github_db(db_path: Path) -> None:
             except sqlite3.OperationalError:
                 pass  # column already exists
         conn.commit()
+        # Assert on the same connection we just wrote to. For ':memory:'
+        # databases, reopening by path would see a fresh, empty DB.
+        assert_schema(conn, EXPECTED_GITHUB_TABLES)
     finally:
         conn.close()
-    assert_schema(db_path, EXPECTED_GITHUB_TABLES)
 
 
 def init_appswitch_db(db_path: Path) -> None:
@@ -508,9 +524,11 @@ def init_appswitch_db(db_path: Path) -> None:
     try:
         conn.execute(APPSWITCH_SCHEMA)
         conn.commit()
+        # Assert on the same connection we just wrote to. For ':memory:'
+        # databases, reopening by path would see a fresh, empty DB.
+        assert_schema(conn, EXPECTED_APPSWITCH_TABLES)
     finally:
         conn.close()
-    assert_schema(db_path, EXPECTED_APPSWITCH_TABLES)
 
 
 def init_all(config: Config) -> None:
