@@ -69,16 +69,21 @@ def fetch_pr_commits(repo: str, pr_number: int) -> List[Dict[str, Any]]:
 
     Returns
     -------
-    A list of normalized commit dicts — empty on API error so the caller can
-    continue processing other PRs.
+    A list of normalized commit dicts.
+
+    Raises
+    ------
+    GhCliError
+        On API error. Callers that want silent-empty behaviour should catch
+        explicitly — historical "return [] on error" was removed because it
+        caused ``count_pushes_after_review`` to collapse push_count to 0
+        indistinguishable from a genuine empty-PR response (see F-2).
+        ``BudgetExhausted`` also propagates.
     """
     owner, name = repo.split("/", 1)
     endpoint = f"/repos/{owner}/{name}/pulls/{pr_number}/commits"
 
-    try:
-        raw = gh_api(endpoint, paginate=True)
-    except GhCliError:
-        return []
+    raw = gh_api(endpoint, paginate=True)
 
     if not isinstance(raw, list):
         return []
@@ -110,6 +115,13 @@ def fetch_and_store_pr_commits(
         If the caller already has the normalized commit list (e.g. from a
         prior ``fetch_pr_commits`` call), it can pass it here and skip the
         network round-trip. Persistence still happens.
+
+    Raises
+    ------
+    GhCliError, BudgetExhausted
+        Propagated from ``fetch_pr_commits`` so the caller can distinguish a
+        transient API failure (retry / fall back) from a genuine zero-commit
+        PR. See F-2.
     """
     # Defer the import so this module can be imported without pulling the full
     # store layer (and its transitive imports) at module load.

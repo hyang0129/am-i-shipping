@@ -342,3 +342,63 @@ class TestEpic17FetchIntegration:
         # Neither new fetcher was invoked.
         assert mock_fetch_commits.call_count == 0
         assert mock_fetch_timeline.call_count == 0
+
+    @patch("collector.github_poller.run.link_sessions", return_value=0)
+    @patch("collector.github_poller.run.count_pushes_after_review", return_value=7)
+    @patch("collector.github_poller.run.fetch_pr_edit_history", return_value={})
+    @patch("collector.github_poller.run.fetch_issue_edit_history_batch", return_value={})
+    @patch("collector.github_poller.run.fetch_pr_review_comments", return_value=[])
+    @patch("collector.github_poller.run.fetch_issue_comments", return_value=[])
+    @patch("collector.github_poller.run.fetch_prs")
+    @patch("collector.github_poller.run.fetch_issues")
+    @patch("collector.github_poller.run.fetch_and_store_issue_timelines", return_value={})
+    @patch("collector.github_poller.run.fetch_and_store_pr_commits")
+    def test_fetch_commits_error_falls_back_to_push_counter_self_fetch(
+        self,
+        mock_fetch_commits,
+        mock_fetch_timeline,
+        mock_issues,
+        mock_prs,
+        mock_issue_comments,
+        mock_pr_review_comments,
+        mock_edit_batch,
+        mock_pr_edit,
+        mock_push,
+        mock_link,
+        tmp_path,
+    ):
+        """F-2 invariant: when fetch_and_store_pr_commits raises GhCliError,
+        count_pushes_after_review is invoked WITHOUT the `commits` kwarg, so
+        push_counter can perform its own /commits fetch. The push_count must
+        NOT collapse to 0 on a transient fetch_commits failure."""
+        from collector.github_poller.gh_client import GhCliError
+
+        mock_issues.return_value = []
+        mock_prs.return_value = [
+            {"number": 10, "title": "P", "head_ref": "fix/1",
+             "body": "Closes #1", "review_comments": [],
+             "review_comment_count": 0, "created_at": None,
+             "merged_at": None},
+        ]
+        # fetch_commits blows up with a transient error.
+        mock_fetch_commits.side_effect = GhCliError(["gh"], 1, "boom")
+
+        _poll_repo(
+            "owner/repo",
+            tmp_path / "github.db",
+            tmp_path / "sessions.db",
+            backfill_days=30,
+            dry_run=False,
+            fetch_commits_enabled=True,
+            fetch_timeline_enabled=False,
+        )
+
+        # count_pushes_after_review must have been called without the kwarg
+        # so push_counter re-fetches /commits itself and returns its own count
+        # (7 per the mock) — NOT 0.
+        assert mock_push.call_count == 1
+        call_kwargs = mock_push.call_args.kwargs
+        assert "commits" not in call_kwargs, (
+            "Fallback path must NOT pass commits=[] — that would collapse "
+            "push_count to 0. See F-2."
+        )

@@ -106,9 +106,13 @@ class TestFetchPrCommits:
         assert [c["sha"] for c in result] == ["aaaa1111", "bbbb2222", "cccc3333"]
 
     @patch("collector.github_poller.fetch_commits.gh_api")
-    def test_api_error_returns_empty(self, mock_api):
+    def test_api_error_propagates(self, mock_api):
+        """Post-F-2: GhCliError is now surfaced to the caller so
+        push_counter can fall back instead of silently collapsing push_count
+        to 0 on a transient /commits failure."""
         mock_api.side_effect = GhCliError(["gh", "api"], 1, "boom")
-        assert fetch_pr_commits("owner/repo", 1) == []
+        with pytest.raises(GhCliError):
+            fetch_pr_commits("owner/repo", 1)
 
     @patch("collector.github_poller.fetch_commits.gh_api")
     def test_non_list_response_returns_empty(self, mock_api):

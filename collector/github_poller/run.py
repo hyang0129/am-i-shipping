@@ -53,7 +53,7 @@ from .fetch_issues import (
 )
 from .fetch_prs import fetch_pr_comments, fetch_pr_edit_history, fetch_pr_review_comments, fetch_prs
 from .fetch_timeline import fetch_and_store_issue_timelines
-from .gh_client import BudgetExhausted, calls_made, configure_limiter, graphql_points_used
+from .gh_client import BudgetExhausted, GhCliError, calls_made, configure_limiter, graphql_points_used
 from .link_resolver import resolve_link
 from .push_counter import count_pushes_after_review
 from .session_linker import link_sessions
@@ -422,14 +422,27 @@ def _process_prs(
 
         # Epic #17 E-1: fetch+persist commits once, reuse for push_count.
         # This is the *only* place in the pipeline that hits /commits per PR.
+        # If fetch_commits raises (transient GhCliError), we fall back to the
+        # pre-E1 path of letting push_counter do its own /commits fetch — that
+        # preserves push_count fidelity rather than collapsing to 0 on a flaky
+        # API call (see F-2). BudgetExhausted is not caught so it propagates.
         pre_fetched_commits: Optional[List[Dict[str, Any]]] = None
         if fetch_commits_enabled:
-            pre_fetched_commits = fetch_and_store_pr_commits(
-                repo, pr["number"], github_db, conn=conn,
-            )
+            try:
+                pre_fetched_commits = fetch_and_store_pr_commits(
+                    repo, pr["number"], github_db, conn=conn,
+                )
+            except GhCliError as exc:
+                logger.warning(
+                    "{}  fetch_commits failed (PR #{}): {} — falling back to "
+                    "push_counter self-fetch",
+                    repo, pr["number"], exc,
+                )
+                pre_fetched_commits = None
 
         # Derive push count — reuse commits if we already pulled them, else
         # fall back to push_counter's own /commits fetch (pre-E1 behaviour).
+        # push_count is consumed by upsert_pr below via pr["push_count"].
         if pre_fetched_commits is not None:
             push_count = count_pushes_after_review(
                 repo, pr["number"], commits=pre_fetched_commits,
