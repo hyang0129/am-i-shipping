@@ -238,3 +238,35 @@ class TestSynthesisConfig:
         cfg = load_config(cfg_path)
         assert cfg.synthesis.output_dir == "weekly-retros"
         assert cfg.synthesis.model == "claude-sonnet-4-5"
+
+
+class TestEpic17FetchFlags:
+    """Epic #17 Sub-Issue 2 (#35): E-1 / E-2 config flags."""
+
+    def test_fetch_flags_default_true(self, tmp_path):
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+        })
+        cfg = load_config(cfg_path)
+        assert cfg.github.fetch_commits is True
+        assert cfg.github.fetch_timeline is True
+
+    def test_fetch_commits_false_disables_e1(self, tmp_path):
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"], "fetch_commits": False},
+        })
+        cfg = load_config(cfg_path)
+        assert cfg.github.fetch_commits is False
+        # fetch_timeline still defaults on.
+        assert cfg.github.fetch_timeline is True
+
+    def test_fetch_timeline_false_disables_e2(self, tmp_path):
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"], "fetch_timeline": False},
+        })
+        cfg = load_config(cfg_path)
+        assert cfg.github.fetch_commits is True
+        assert cfg.github.fetch_timeline is False

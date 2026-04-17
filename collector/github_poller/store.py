@@ -295,3 +295,148 @@ def insert_pr_review_comment_edit(
     finally:
         if own_conn:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Epic #17 — Sub-Issue 2/7 (#35): synthesis-table upserts
+# ---------------------------------------------------------------------------
+#
+# ``commits`` and ``timeline_events`` rows are keyed on natural identifiers
+# (``(repo, sha)`` and ``(repo, issue_number, event_id)`` respectively), so
+# ``INSERT OR REPLACE`` is safe and idempotent — re-polling a PR that already
+# has its commits in the table updates the message / pushed_at fields in place
+# without creating duplicates. The same semantics hold for timeline events.
+
+
+def upsert_commit(
+    repo: str,
+    commit: Dict[str, Any],
+    db_path: Union[str, Path],
+    conn: Optional[sqlite3.Connection] = None,
+) -> None:
+    """Insert or update a single commit row.
+
+    Parameters
+    ----------
+    repo:
+        GitHub repository in ``owner/repo`` format.
+    commit:
+        Dict with keys: ``sha`` (required), ``author``, ``authored_at``,
+        ``message``, ``pr_number``, ``pushed_at``. Missing optional keys are
+        stored as NULL.
+    db_path, conn:
+        Same conventions as :func:`upsert_pr` — if *conn* is given the caller
+        owns the lifecycle.
+
+    Raises
+    ------
+    ValueError
+        If *repo* or *commit["sha"]* is missing.
+    """
+    if not repo:
+        raise ValueError("repo is required")
+    sha = commit.get("sha")
+    if not sha:
+        raise ValueError("commit sha is required")
+
+    own_conn = conn is None
+    if own_conn:
+        db_path = Path(db_path)
+        conn = _connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO commits (
+                repo, sha, author, authored_at, message, pr_number, pushed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(repo, sha) DO UPDATE SET
+                author      = excluded.author,
+                authored_at = excluded.authored_at,
+                message     = excluded.message,
+                pr_number   = excluded.pr_number,
+                pushed_at   = excluded.pushed_at
+            """,
+            (
+                repo,
+                sha,
+                commit.get("author"),
+                commit.get("authored_at"),
+                commit.get("message"),
+                commit.get("pr_number"),
+                commit.get("pushed_at"),
+            ),
+        )
+        if own_conn:
+            conn.commit()
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def upsert_timeline_event(
+    repo: str,
+    event: Dict[str, Any],
+    db_path: Union[str, Path],
+    conn: Optional[sqlite3.Connection] = None,
+) -> None:
+    """Insert or update a single timeline event row.
+
+    Parameters
+    ----------
+    repo:
+        GitHub repository in ``owner/repo`` format.
+    event:
+        Dict with keys: ``issue_number`` (required), ``event_id`` (required),
+        ``event_type``, ``actor``, ``created_at``, ``payload_json``. Missing
+        optional keys are stored as NULL; ``payload_json`` is expected to be a
+        JSON string already (the fetcher serializes GraphQL payloads before
+        handing them off).
+    db_path, conn:
+        Same conventions as :func:`upsert_pr`.
+
+    Raises
+    ------
+    ValueError
+        If *repo*, *event["issue_number"]*, or *event["event_id"]* is missing.
+    """
+    if not repo:
+        raise ValueError("repo is required")
+    issue_number = event.get("issue_number")
+    if issue_number is None:
+        raise ValueError("issue_number is required")
+    event_id = event.get("event_id")
+    if event_id is None:
+        raise ValueError("event_id is required")
+
+    own_conn = conn is None
+    if own_conn:
+        db_path = Path(db_path)
+        conn = _connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO timeline_events (
+                repo, issue_number, event_id, event_type,
+                actor, created_at, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(repo, issue_number, event_id) DO UPDATE SET
+                event_type   = excluded.event_type,
+                actor        = excluded.actor,
+                created_at   = excluded.created_at,
+                payload_json = excluded.payload_json
+            """,
+            (
+                repo,
+                issue_number,
+                event_id,
+                event.get("event_type"),
+                event.get("actor"),
+                event.get("created_at"),
+                event.get("payload_json"),
+            ),
+        )
+        if own_conn:
+            conn.commit()
+    finally:
+        if own_conn:
+            conn.close()

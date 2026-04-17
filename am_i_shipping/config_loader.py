@@ -40,6 +40,12 @@ class GitHubConfig:
     repos: List[str]
     backfill_days: int = 90
     limiter: GitHubLimiterConfig = field(default_factory=GitHubLimiterConfig)
+    # Epic #17 — Sub-Issue 2/7 (#35): E-1 (commit data) and E-2 (timeline
+    # events) collectors. Both default on; flipping to false turns the new
+    # collectors off while leaving the rest of the poll cycle unchanged, as
+    # a rollback lever for the synthesis rollout.
+    fetch_commits: bool = True
+    fetch_timeline: bool = True
 
 
 @dataclass
@@ -199,6 +205,12 @@ def load_config(config_path: str | Path | None = None) -> Config:
             github_raw.get("backfill_days", GitHubConfig.backfill_days)
         ),
         limiter=github_limiter,
+        fetch_commits=bool(
+            github_raw.get("fetch_commits", GitHubConfig.fetch_commits)
+        ),
+        fetch_timeline=bool(
+            github_raw.get("fetch_timeline", GitHubConfig.fetch_timeline)
+        ),
     )
 
     # --- appswitch (optional section — defaults are fine) ---
