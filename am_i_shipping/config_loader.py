@@ -109,6 +109,22 @@ class Config:
             p = self._config_dir / p
         return p
 
+    @property
+    def synthesis_output_path(self) -> Path:
+        """Return the resolved synthesis output directory as an absolute Path.
+
+        Mirrors :py:meth:`data_path` for ``synthesis.output_dir``: relative
+        paths resolve against the directory that contained ``config.yaml``,
+        NOT against ``data_dir``. The old CLI anchored against
+        ``data_dir.parent``, which only happened to coincide with the
+        config dir for the default ``data_dir = "data"`` layout and broke
+        silently for any other layout.
+        """
+        p = Path(self.synthesis.output_dir)
+        if not p.is_absolute():
+            p = self._config_dir / p
+        return p
+
 
 def load_config(config_path: str | Path | None = None) -> Config:
     """Load config.yaml from *config_path* (default: config.yaml in repo root).
