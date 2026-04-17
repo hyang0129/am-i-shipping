@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from .gh_client import gh_graphql
+from .gh_client import BudgetExhausted, gh_graphql
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +242,11 @@ def fetch_issue_timeline_batch(
 
         try:
             response = gh_graphql(query, {"owner": owner, "name": name})
+        except BudgetExhausted:
+            # Hourly budget is repo-scoped; re-raise so the outer poll cycle
+            # can stop this repo cleanly rather than logging one warning per
+            # remaining chunk while the budget stays pinned.
+            raise
         except Exception as exc:
             logger.warning(
                 "{}  timeline batch fetch failed for chunk starting at issue #{}: {}",

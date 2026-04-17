@@ -20,6 +20,7 @@ from collector.github_poller.fetch_timeline import (
     fetch_and_store_issue_timelines,
     fetch_issue_timeline_batch,
 )
+from collector.github_poller.gh_client import BudgetExhausted
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +198,28 @@ class TestFetchIssueTimelineBatch:
         }
         result = fetch_issue_timeline_batch("owner/repo", [1, 2])
         assert result == {1: [], 2: []}
+
+    @patch("collector.github_poller.fetch_timeline.gh_graphql")
+    def test_budget_exhausted_propagates(self, mock_gql):
+        """Invariant: BudgetExhausted MUST escape fetch_issue_timeline_batch so
+        the outer poll cycle can stop cleanly. A generic except-Exception would
+        silently continue iterating chunks while the budget stays pinned — this
+        negative-assertion test guards against that regression (see F-1)."""
+        mock_gql.side_effect = BudgetExhausted(100, 100, 600.0)
+        with pytest.raises(BudgetExhausted):
+            fetch_issue_timeline_batch("owner/repo", [1, 2, 3])
+        # Exactly one chunk attempted — we did NOT continue past the budget cap.
+        assert mock_gql.call_count == 1
+
+    @patch("collector.github_poller.fetch_timeline.gh_graphql")
+    def test_budget_exhausted_propagates_through_store(self, mock_gql, tmp_path):
+        """fetch_and_store_issue_timelines must also re-raise BudgetExhausted
+        so _fetch_timeline_step's handler in run.py observes it."""
+        mock_gql.side_effect = BudgetExhausted(100, 100, 600.0)
+        db = tmp_path / "github.db"
+        init_github_db(db)
+        with pytest.raises(BudgetExhausted):
+            fetch_and_store_issue_timelines("owner/repo", [1], db)
 
 
 class TestFetchAndStoreIssueTimelines:
