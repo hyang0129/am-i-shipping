@@ -58,6 +58,23 @@ github:
     # no other tooling competes for the same quota.
     max_calls_per_hour: 2500
 
+  # -----------------------------------------------------------------
+  # Epic #17 — Phase-2 synthesis collectors (E-1 + E-2)
+  # -----------------------------------------------------------------
+  # Both default ON. Set to false to roll back to Phase-1 behaviour —
+  # the rest of the poll cycle is unaffected.
+  #
+  #   fetch_commits  — per-PR commit data (E-1). Required for the
+  #                    workflow-unit graph builder (#36) and downstream
+  #                    synthesis. Shares the per-PR /commits call with
+  #                    push_counter, so enabling costs no extra API
+  #                    quota vs. Phase-1.
+  #   fetch_timeline — issue timeline events (E-2). Assigned, labeled,
+  #                    unlabeled, closed, reopened, cross-referenced,
+  #                    referenced. GraphQL aliased batches of 20.
+  # fetch_commits: true
+  # fetch_timeline: true
+
 # -------------------------------------------------------------------
 # App-switch logger (Collector 3) — DISABLED
 # Uncomment to re-enable. Code remains in collector/appswitch/.
@@ -73,3 +90,30 @@ data:
   # Directory for SQLite databases and health.json
   # Relative paths are resolved from the repo root
   data_dir: "data"
+
+# -------------------------------------------------------------------
+# Weekly synthesis (Phase 2 — Epic #17) — DISABLED
+# Uncomment to enable. The full synthesis pipeline is delivered across
+# sub-issues #34..#40; the config section is accepted now so downstream
+# sub-issues can be wired incrementally without re-touching config_loader.
+# -------------------------------------------------------------------
+# synthesis:
+#   # Name of the environment variable holding the Anthropic API key.
+#   # Presence is NOT validated here; the check is activated by Sub-Issue 6.
+#   anthropic_api_key_env: "ANTHROPIC_API_KEY"
+#
+#   # Anthropic model used for the weekly retrospective call.
+#   model: "claude-sonnet-4-5"
+#
+#   # Directory for retrospective markdown files (relative paths
+#   # resolved from the repo root).
+#   output_dir: "retrospectives"
+#
+#   # Start of the synthesis week. One of "monday" or "sunday".
+#   week_start: "monday"
+#
+#   # Days of inactivity before a unit is flagged as abandoned.
+#   abandonment_days: 14
+#
+#   # Sigma multiplier used when flagging outlier units on per-metric medians.
+#   outlier_sigma: 2.0

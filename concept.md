@@ -97,7 +97,7 @@ Do NOT produce scores or rankings. Instead:
 1. Identify at most 2 anomalies against the developer's own baseline.
 2. For each anomaly, offer three possible explanations — one environmental,
    one behavioral, one tool-related.
-3. Ask one clarifying question per anomaly the developer can answer from memory.
+3. Ask at most 2 clarifying questions total (across all anomalies) the developer can answer from memory.
 4. Do not recommend anything yet.
 ```
 

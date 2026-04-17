@@ -128,3 +128,54 @@ class TestProcessSession:
         from datetime import datetime
 
         datetime.fromisoformat(ts)
+
+
+class TestSessionTimestampsColumns:
+    """Epic #17 Sub-Issue 2 (#35): the two session timestamp columns roundtrip."""
+
+    def test_stored_and_read_back(self, tmp_path):
+        db_path = tmp_path / "sessions.db"
+        record = _make_record(
+            session_uuid="ts-uuid",
+            session_started_at="2024-05-01T00:00:00+00:00",
+            session_ended_at="2024-05-01T01:00:00+00:00",
+        )
+        upsert_session(record, db_path=db_path, data_dir=tmp_path)
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT session_started_at, session_ended_at "
+            "FROM sessions WHERE session_uuid = 'ts-uuid'"
+        ).fetchone()
+        conn.close()
+        assert row == (
+            "2024-05-01T00:00:00+00:00",
+            "2024-05-01T01:00:00+00:00",
+        )
+
+    def test_second_upsert_overwrites_timestamps(self, tmp_path):
+        db_path = tmp_path / "sessions.db"
+        r1 = _make_record(
+            session_uuid="ts-uuid",
+            session_started_at="2024-05-01T00:00:00+00:00",
+            session_ended_at="2024-05-01T01:00:00+00:00",
+        )
+        upsert_session(r1, db_path=db_path, data_dir=tmp_path)
+
+        r2 = _make_record(
+            session_uuid="ts-uuid",
+            session_started_at="2024-06-01T00:00:00+00:00",
+            session_ended_at="2024-06-01T02:00:00+00:00",
+        )
+        upsert_session(r2, db_path=db_path, data_dir=tmp_path)
+
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT session_started_at, session_ended_at "
+            "FROM sessions WHERE session_uuid = 'ts-uuid'"
+        ).fetchone()
+        conn.close()
+        assert row == (
+            "2024-06-01T00:00:00+00:00",
+            "2024-06-01T02:00:00+00:00",
+        )

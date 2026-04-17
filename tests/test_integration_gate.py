@@ -31,15 +31,26 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _run_collectors() -> subprocess.CompletedProcess:
-    """Run run_collectors.sh and return the result."""
+def _run_collectors(
+    env_overrides: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    """Run run_collectors.sh and return the result.
+
+    ``env_overrides`` lets a test inject extra environment variables
+    (e.g. ``AMIS_FORCE_SYNTHESIS=1`` to exercise the weekly-cadence
+    branch on any day of the week).
+    """
     script = REPO_ROOT / "run_collectors.sh"
+    env = os.environ.copy()
+    if env_overrides:
+        env.update(env_overrides)
     return subprocess.run(
         ["bash", str(script)],
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
         timeout=300,
+        env=env,
     )
 
 
@@ -77,8 +88,17 @@ class TestIntegrationGate:
             f"stdout: {result.stdout}\nstderr: {result.stderr}"
         )
 
-    # Known tables for each database — avoids dynamic SQL construction
-    GITHUB_TABLES = ("issues", "pull_requests", "pushes", "issue_pr_links")
+    # Known tables for each database — avoids dynamic SQL construction.
+    # Epic #17 Sub-Issue 2 (#35) adds ``commits`` and ``timeline_events``;
+    # both are populated by the new E-1 / E-2 collectors enabled by default.
+    GITHUB_TABLES = (
+        "issues",
+        "pull_requests",
+        "pushes",
+        "issue_pr_links",
+        "commits",
+        "timeline_events",
+    )
 
     def test_databases_have_data(self) -> None:
         """After a run, implemented collector DBs contain rows."""
@@ -220,4 +240,74 @@ class TestIntegrationGate:
         assert found_recent, (
             "No collector has a last_success within the last 5 minutes "
             f"in health.json: {data}"
+        )
+
+    # ------------------------------------------------------------------
+    # Weekly synthesis block (issue #40 / F-4 in PR-48 review-fix cycle)
+    # ------------------------------------------------------------------
+    # The scheduler invokes ``am-synthesize`` on Sundays, or on any day
+    # when ``AMIS_FORCE_SYNTHESIS=1``. The existing tests above skip
+    # this branch on non-Sundays, so without these two cases the entire
+    # cadence block has no positive coverage.
+
+    def test_synthesis_block_skipped_on_non_sunday_without_force(self) -> None:
+        """Without FORCE and not on Sunday, the synthesis block is SKIPPED.
+
+        Negative assertion: the log must NOT contain the
+        ``--- Starting: Weekly Synthesis`` marker. Skipped with reason
+        when today happens to be Sunday — the positive case is covered
+        separately.
+        """
+        import datetime as _dt
+
+        if _dt.date.today().weekday() == 6:  # Sunday in Python weekday
+            pytest.skip("today is Sunday; skip-branch not exercised")
+
+        result = _run_collectors()
+        assert result.returncode == 0, (
+            f"run_collectors.sh exited {result.returncode}:\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        log_files = sorted((REPO_ROOT / "logs").glob("run_*.log"))
+        assert log_files, "no log file produced"
+        log_text = log_files[-1].read_text(encoding="utf-8", errors="replace")
+        assert "Starting: Weekly Synthesis" not in log_text, (
+            "synthesis block ran on a non-Sunday without FORCE; "
+            "cadence guard is broken:\n" + log_text
+        )
+
+    def test_synthesis_block_runs_with_force_env(self) -> None:
+        """With ``AMIS_FORCE_SYNTHESIS=1`` the synthesis block always runs.
+
+        Positive assertion: log contains the "Starting: Weekly Synthesis"
+        marker and the WEEK_START is a valid YYYY-MM-DD token. The
+        am-synthesize invocation may legitimately exit non-zero (missing
+        API key, empty DB, etc.); per F-5 that must NOT flip the
+        scheduler to a non-zero exit code, so we also assert exit 0
+        regardless of whether synthesis itself succeeded.
+        """
+        import re
+
+        result = _run_collectors({"AMIS_FORCE_SYNTHESIS": "1"})
+        assert result.returncode == 0, (
+            f"run_collectors.sh exited {result.returncode} with "
+            f"AMIS_FORCE_SYNTHESIS=1 — synthesis failure must NOT flip "
+            f"the scheduler to non-zero.\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        log_files = sorted((REPO_ROOT / "logs").glob("run_*.log"))
+        assert log_files, "no log file produced"
+        log_text = log_files[-1].read_text(encoding="utf-8", errors="replace")
+        assert "Starting: Weekly Synthesis" in log_text, (
+            "synthesis block did not start under AMIS_FORCE_SYNTHESIS=1:\n"
+            + log_text
+        )
+        # WEEK_START must appear as YYYY-MM-DD in the "(week=...)" parens.
+        match = re.search(
+            r"Starting: Weekly Synthesis \(week=(\d{4}-\d{2}-\d{2})\)",
+            log_text,
+        )
+        assert match, (
+            "synthesis block started but WEEK_START not a valid "
+            "YYYY-MM-DD in the log:\n" + log_text
         )

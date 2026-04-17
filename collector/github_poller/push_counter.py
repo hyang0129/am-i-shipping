@@ -3,6 +3,11 @@
 Queries PR commits and reviews via ``gh api``, counts commits pushed
 after the first review event timestamp.  Returns 0 if there are no
 reviews.
+
+Epic #17 — Sub-Issue 2/7 (#35): the ``/commits`` round-trip is now
+shared with ``fetch_commits.fetch_pr_commits``. Callers that already
+pulled commits for persistence pass them via the ``commits`` kwarg so
+this function does not double-spend the API budget.
 """
 
 from __future__ import annotations
@@ -16,6 +21,8 @@ from .gh_client import GhCliError, gh_api
 def count_pushes_after_review(
     repo: str,
     pr_number: int,
+    *,
+    commits: Optional[List[Dict[str, Any]]] = None,
 ) -> int:
     """Count commits pushed after the first review on a PR.
 
@@ -25,6 +32,16 @@ def count_pushes_after_review(
         GitHub repository in ``owner/repo`` format.
     pr_number:
         The pull request number.
+    commits:
+        Optional pre-fetched list of commits. Two shapes are accepted:
+
+        * The raw REST shape ``{"commit": {"committer": {"date": ...}}}``
+          that this module historically fetched itself.
+        * The normalized shape produced by
+          :func:`collector.github_poller.fetch_commits.fetch_pr_commits`:
+          ``{"sha": ..., "pushed_at": ISO-8601, ...}``.
+
+        Supplying either form skips the internal ``/commits`` round-trip.
 
     Returns
     -------
@@ -43,8 +60,9 @@ def count_pushes_after_review(
     if first_review_at is None:
         return 0
 
-    # Fetch commits
-    commits = _fetch_commits(owner, name, pr_number)
+    # Fetch commits only if the caller did not pre-supply them.
+    if commits is None:
+        commits = _fetch_commits(owner, name, pr_number)
     if not commits:
         return 0
 
@@ -93,10 +111,22 @@ def _earliest_review_time(reviews: List[Dict[str, Any]]) -> Optional[datetime]:
 
 
 def _parse_commit_date(commit: Dict[str, Any]) -> Optional[datetime]:
-    """Parse the committer date from a commit object."""
-    commit_data = commit.get("commit", {})
-    committer = commit_data.get("committer", {})
-    date_str = committer.get("date")
+    """Parse the committer date from a commit object.
+
+    Accepts both the raw REST shape (``{"commit": {"committer": {"date": ...}}}``)
+    and the normalised shape from ``fetch_commits.fetch_pr_commits``
+    (``{"pushed_at": ISO-8601}``). Returns ``None`` when neither is present
+    or the timestamp is un-parseable.
+    """
+    # Normalised shape (preferred — this is what run.py now hands in).
+    date_str = commit.get("pushed_at")
+
+    if not date_str:
+        # Fall back to the raw REST shape for the historical no-kwarg path.
+        commit_data = commit.get("commit", {})
+        committer = commit_data.get("committer", {})
+        date_str = committer.get("date")
+
     if not date_str:
         return None
     try:

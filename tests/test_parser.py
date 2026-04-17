@@ -218,3 +218,30 @@ class TestGitBranchFallback:
         session_file.write_text("\n".join(lines) + "\n")
         record = parse_session(session_file)
         assert record.git_branch is None
+
+
+class TestSessionTimestamps:
+    """Epic #17 Sub-Issue 2 (#35): session_started_at and session_ended_at."""
+
+    def test_extracts_first_and_last_timestamp(self):
+        record = parse_session(SAMPLE)
+        # First timestamp in the fixture is 2026-01-15T10:00:00.000Z on a
+        # queue-operation entry; last is 2026-01-15T10:00:35.000Z.
+        assert record.session_started_at is not None
+        assert record.session_started_at.startswith("2026-01-15T10:00:00")
+        assert record.session_ended_at is not None
+        assert record.session_ended_at.startswith("2026-01-15T10:00:35")
+
+    def test_no_timestamps_returns_none(self, tmp_path):
+        """A session file with zero parseable timestamps yields None/None."""
+        session_file = tmp_path / "no-ts.jsonl"
+        session_file.write_text(
+            json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": "hello"},
+                "sessionId": "ts-none",
+            }) + "\n"
+        )
+        record = parse_session(session_file)
+        assert record.session_started_at is None
+        assert record.session_ended_at is None

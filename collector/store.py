@@ -72,8 +72,9 @@ def upsert_session(
                 session_duration_seconds, working_directory,
                 git_branch, raw_content_json,
                 input_tokens, output_tokens, cache_creation_tokens,
-                cache_read_tokens, fast_mode_turns
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                cache_read_tokens, fast_mode_turns,
+                session_started_at, session_ended_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_uuid) DO UPDATE SET
                 turn_count = excluded.turn_count,
                 tool_call_count = excluded.tool_call_count,
@@ -88,7 +89,9 @@ def upsert_session(
                 output_tokens = excluded.output_tokens,
                 cache_creation_tokens = excluded.cache_creation_tokens,
                 cache_read_tokens = excluded.cache_read_tokens,
-                fast_mode_turns = excluded.fast_mode_turns
+                fast_mode_turns = excluded.fast_mode_turns,
+                session_started_at = excluded.session_started_at,
+                session_ended_at = excluded.session_ended_at
             """,
             (
                 record.session_uuid,
@@ -106,6 +109,8 @@ def upsert_session(
                 record.cache_creation_tokens,
                 record.cache_read_tokens,
                 record.fast_mode_turns,
+                record.session_started_at,
+                record.session_ended_at,
             ),
         )
         conn.commit()

@@ -40,6 +40,15 @@ class GitHubConfig:
     repos: List[str]
     backfill_days: int = 90
     limiter: GitHubLimiterConfig = field(default_factory=GitHubLimiterConfig)
+    # Epic #17 — Sub-Issue 2/7 (#35): E-1 (commit data) and E-2 (timeline
+    # events) collectors. Both default on; flipping to false turns the new
+    # collectors off while leaving the rest of the poll cycle unchanged, as
+    # a pause lever for the synthesis rollout. NOTE: this pauses *further*
+    # writes — existing rows in ``commits`` and ``timeline_events`` are NOT
+    # removed by flipping the flag. For a full rollback the operator must
+    # also ``DELETE FROM commits; DELETE FROM timeline_events`` on github.db.
+    fetch_commits: bool = True
+    fetch_timeline: bool = True
 
 
 @dataclass
@@ -54,11 +63,36 @@ class DataConfig:
 
 
 @dataclass
+class SynthesisConfig:
+    """Weekly synthesis (Phase 2 — Epic #17).
+
+    Populated from the optional ``synthesis:`` section of config.yaml. All
+    fields have defaults; a completely missing section yields this dataclass
+    with default values. ``anthropic_api_key_env`` names the environment
+    variable that will hold the Anthropic API key — presence of the variable
+    itself is NOT validated here; that check is deferred to Sub-Issue 6 of
+    Epic #17 so that running the collectors without synthesis configured is
+    still valid.
+    """
+
+    anthropic_api_key_env: str = "ANTHROPIC_API_KEY"
+    model: str = "claude-sonnet-4-5"
+    output_dir: str = "retrospectives"
+    week_start: str = "monday"  # "monday" or "sunday"
+    abandonment_days: int = 14
+    outlier_sigma: float = 2.0
+
+
+_VALID_WEEK_STARTS = {"monday", "sunday"}
+
+
+@dataclass
 class Config:
     session: SessionConfig
     github: GitHubConfig
     appswitch: AppSwitchConfig = field(default_factory=AppSwitchConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    synthesis: SynthesisConfig = field(default_factory=SynthesisConfig)
     _config_dir: Path = field(
         default_factory=lambda: Path(__file__).resolve().parent.parent, repr=False
     )
@@ -71,6 +105,22 @@ class Config:
         config.yaml file passed to ``load_config``.
         """
         p = Path(self.data.data_dir)
+        if not p.is_absolute():
+            p = self._config_dir / p
+        return p
+
+    @property
+    def synthesis_output_path(self) -> Path:
+        """Return the resolved synthesis output directory as an absolute Path.
+
+        Mirrors :py:meth:`data_path` for ``synthesis.output_dir``: relative
+        paths resolve against the directory that contained ``config.yaml``,
+        NOT against ``data_dir``. The old CLI anchored against
+        ``data_dir.parent``, which only happened to coincide with the
+        config dir for the default ``data_dir = "data"`` layout and broke
+        silently for any other layout.
+        """
+        p = Path(self.synthesis.output_dir)
         if not p.is_absolute():
             p = self._config_dir / p
         return p
@@ -174,6 +224,12 @@ def load_config(config_path: str | Path | None = None) -> Config:
             github_raw.get("backfill_days", GitHubConfig.backfill_days)
         ),
         limiter=github_limiter,
+        fetch_commits=bool(
+            github_raw.get("fetch_commits", GitHubConfig.fetch_commits)
+        ),
+        fetch_timeline=bool(
+            github_raw.get("fetch_timeline", GitHubConfig.fetch_timeline)
+        ),
     )
 
     # --- appswitch (optional section — defaults are fine) ---
@@ -195,10 +251,44 @@ def load_config(config_path: str | Path | None = None) -> Config:
         data_dir=str(data_raw.get("data_dir", DataConfig.data_dir)),
     )
 
+    # --- synthesis (optional section — Epic #17 Phase 2) ---
+    synthesis_raw = raw.get("synthesis", {}) or {}
+    week_start = str(
+        synthesis_raw.get("week_start", SynthesisConfig.week_start)
+    ).lower()
+    if week_start not in _VALID_WEEK_STARTS:
+        raise ConfigError(
+            "Invalid synthesis.week_start: "
+            f"{week_start!r} (expected one of {sorted(_VALID_WEEK_STARTS)!r})"
+        )
+    synthesis_cfg = SynthesisConfig(
+        anthropic_api_key_env=str(
+            synthesis_raw.get(
+                "anthropic_api_key_env", SynthesisConfig.anthropic_api_key_env
+            )
+        ),
+        model=str(synthesis_raw.get("model", SynthesisConfig.model)),
+        output_dir=str(
+            synthesis_raw.get("output_dir", SynthesisConfig.output_dir)
+        ),
+        week_start=week_start,
+        abandonment_days=int(
+            synthesis_raw.get(
+                "abandonment_days", SynthesisConfig.abandonment_days
+            )
+        ),
+        outlier_sigma=float(
+            synthesis_raw.get(
+                "outlier_sigma", SynthesisConfig.outlier_sigma
+            )
+        ),
+    )
+
     return Config(
         session=session_cfg,
         github=github_cfg,
         appswitch=appswitch_cfg,
         data=data_cfg,
+        synthesis=synthesis_cfg,
         _config_dir=Path(config_path).resolve().parent,
     )

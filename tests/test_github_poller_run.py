@@ -84,6 +84,8 @@ class TestDryRun:
 
 
 class TestPollRepo:
+    @patch("collector.github_poller.run.fetch_and_store_issue_timelines", return_value={})
+    @patch("collector.github_poller.run.fetch_and_store_pr_commits", return_value=[])
     @patch("collector.github_poller.run.link_sessions")
     @patch("collector.github_poller.run.count_pushes_after_review")
     @patch("collector.github_poller.run.fetch_pr_edit_history", return_value={})
@@ -95,6 +97,7 @@ class TestPollRepo:
     def test_full_poll_produces_rows(
         self, mock_issues, mock_prs, mock_issue_comments, mock_pr_comments,
         mock_edit_batch, mock_pr_edit, mock_push, mock_link,
+        mock_fetch_commits, mock_fetch_timeline,
         tmp_path
     ):
         mock_issues.return_value = [
@@ -133,6 +136,8 @@ class TestPollRepo:
         assert len(links) == 1  # fix/1-bug resolves to issue #1
         assert len(cursor) == 1  # cursor advanced
 
+    @patch("collector.github_poller.run.fetch_and_store_issue_timelines", return_value={})
+    @patch("collector.github_poller.run.fetch_and_store_pr_commits", return_value=[])
     @patch("collector.github_poller.run.link_sessions")
     @patch("collector.github_poller.run.count_pushes_after_review")
     @patch("collector.github_poller.run.fetch_pr_edit_history", return_value={})
@@ -145,6 +150,7 @@ class TestPollRepo:
     def test_rerun_produces_same_row_count(
         self, mock_issues, mock_prs, mock_issue_comments, mock_pr_comments,
         mock_edit_batch, mock_issue_edit, mock_pr_edit, mock_push, mock_link,
+        mock_fetch_commits, mock_fetch_timeline,
         tmp_path
     ):
         """Re-running poll with same data produces identical row count."""
@@ -180,12 +186,15 @@ class TestPollRepo:
 
 
 class TestHealthJson:
+    @patch("collector.github_poller.run.fetch_and_store_issue_timelines", return_value={})
+    @patch("collector.github_poller.run.fetch_and_store_pr_commits", return_value=[])
     @patch("collector.github_poller.run.link_sessions")
     @patch("collector.github_poller.run.count_pushes_after_review")
     @patch("collector.github_poller.run.fetch_prs")
     @patch("collector.github_poller.run.fetch_issues")
     def test_health_written_on_success(
         self, mock_issues, mock_prs, mock_push, mock_link,
+        mock_fetch_commits, mock_fetch_timeline,
         config_file, tmp_path
     ):
         mock_issues.return_value = []
@@ -201,12 +210,15 @@ class TestHealthJson:
         assert "github_poller" in data
         assert "last_success" in data["github_poller"]
 
+    @patch("collector.github_poller.run.fetch_and_store_issue_timelines", return_value={})
+    @patch("collector.github_poller.run.fetch_and_store_pr_commits", return_value=[])
     @patch("collector.github_poller.run.link_sessions")
     @patch("collector.github_poller.run.count_pushes_after_review")
     @patch("collector.github_poller.run.fetch_prs")
     @patch("collector.github_poller.run.fetch_issues")
     def test_health_not_written_on_failure(
         self, mock_issues, mock_prs, mock_push, mock_link,
+        mock_fetch_commits, mock_fetch_timeline,
         config_file, tmp_path
     ):
         mock_issues.side_effect = Exception("API down")
@@ -215,3 +227,178 @@ class TestHealthJson:
 
         health = tmp_path / "data" / "health.json"
         assert not health.exists()
+
+
+class TestEpic17FetchIntegration:
+    """Epic #17 Sub-Issue 2 (#35): wiring for fetch_commits / fetch_timeline.
+
+    Asserts that ``_poll_repo`` calls the new E-1/E-2 helpers when the
+    flags are on, and skips them when the flags are off — without changing
+    behaviour of the pre-existing issue/PR path.
+    """
+
+    @patch("collector.github_poller.run.link_sessions", return_value=0)
+    @patch("collector.github_poller.run.count_pushes_after_review", return_value=0)
+    @patch("collector.github_poller.run.fetch_pr_edit_history", return_value={})
+    @patch("collector.github_poller.run.fetch_issue_edit_history_batch", return_value={})
+    @patch("collector.github_poller.run.fetch_pr_review_comments", return_value=[])
+    @patch("collector.github_poller.run.fetch_issue_comments", return_value=[])
+    @patch("collector.github_poller.run.fetch_prs")
+    @patch("collector.github_poller.run.fetch_issues")
+    @patch("collector.github_poller.run.fetch_and_store_issue_timelines")
+    @patch("collector.github_poller.run.fetch_and_store_pr_commits")
+    def test_fetchers_called_by_default(
+        self,
+        mock_fetch_commits,
+        mock_fetch_timeline,
+        mock_issues,
+        mock_prs,
+        mock_issue_comments,
+        mock_pr_review_comments,
+        mock_edit_batch,
+        mock_pr_edit,
+        mock_push,
+        mock_link,
+        tmp_path,
+    ):
+        mock_issues.return_value = [
+            {"number": 1, "title": "I", "state": "OPEN", "body": "",
+             "comments": [], "type_label": None, "created_at": None,
+             "closed_at": None},
+        ]
+        mock_prs.return_value = [
+            {"number": 10, "title": "P", "head_ref": "fix/1",
+             "body": "Closes #1", "review_comments": [],
+             "review_comment_count": 0, "created_at": None,
+             "merged_at": None},
+        ]
+        mock_fetch_commits.return_value = []
+        mock_fetch_timeline.return_value = {}
+
+        _poll_repo(
+            "owner/repo",
+            tmp_path / "github.db",
+            tmp_path / "sessions.db",
+            backfill_days=30,
+            dry_run=False,
+            fetch_commits_enabled=True,
+            fetch_timeline_enabled=True,
+        )
+
+        # fetch_and_store_pr_commits was called once per PR.
+        assert mock_fetch_commits.call_count == 1
+        # fetch_and_store_issue_timelines was called with the list of issue numbers.
+        assert mock_fetch_timeline.call_count == 1
+        call_args = mock_fetch_timeline.call_args
+        assert call_args.args[0] == "owner/repo"
+        assert call_args.args[1] == [1]
+
+    @patch("collector.github_poller.run.link_sessions", return_value=0)
+    @patch("collector.github_poller.run.count_pushes_after_review", return_value=0)
+    @patch("collector.github_poller.run.fetch_pr_edit_history", return_value={})
+    @patch("collector.github_poller.run.fetch_issue_edit_history_batch", return_value={})
+    @patch("collector.github_poller.run.fetch_pr_review_comments", return_value=[])
+    @patch("collector.github_poller.run.fetch_issue_comments", return_value=[])
+    @patch("collector.github_poller.run.fetch_prs")
+    @patch("collector.github_poller.run.fetch_issues")
+    @patch("collector.github_poller.run.fetch_and_store_issue_timelines")
+    @patch("collector.github_poller.run.fetch_and_store_pr_commits")
+    def test_fetchers_skipped_when_flags_off(
+        self,
+        mock_fetch_commits,
+        mock_fetch_timeline,
+        mock_issues,
+        mock_prs,
+        mock_issue_comments,
+        mock_pr_review_comments,
+        mock_edit_batch,
+        mock_pr_edit,
+        mock_push,
+        mock_link,
+        tmp_path,
+    ):
+        mock_issues.return_value = [
+            {"number": 1, "title": "I", "state": "OPEN", "body": "",
+             "comments": [], "type_label": None, "created_at": None,
+             "closed_at": None},
+        ]
+        mock_prs.return_value = [
+            {"number": 10, "title": "P", "head_ref": "fix/1",
+             "body": "Closes #1", "review_comments": [],
+             "review_comment_count": 0, "created_at": None,
+             "merged_at": None},
+        ]
+
+        _poll_repo(
+            "owner/repo",
+            tmp_path / "github.db",
+            tmp_path / "sessions.db",
+            backfill_days=30,
+            dry_run=False,
+            fetch_commits_enabled=False,
+            fetch_timeline_enabled=False,
+        )
+
+        # Neither new fetcher was invoked.
+        assert mock_fetch_commits.call_count == 0
+        assert mock_fetch_timeline.call_count == 0
+
+    @patch("collector.github_poller.run.link_sessions", return_value=0)
+    @patch("collector.github_poller.run.count_pushes_after_review", return_value=7)
+    @patch("collector.github_poller.run.fetch_pr_edit_history", return_value={})
+    @patch("collector.github_poller.run.fetch_issue_edit_history_batch", return_value={})
+    @patch("collector.github_poller.run.fetch_pr_review_comments", return_value=[])
+    @patch("collector.github_poller.run.fetch_issue_comments", return_value=[])
+    @patch("collector.github_poller.run.fetch_prs")
+    @patch("collector.github_poller.run.fetch_issues")
+    @patch("collector.github_poller.run.fetch_and_store_issue_timelines", return_value={})
+    @patch("collector.github_poller.run.fetch_and_store_pr_commits")
+    def test_fetch_commits_error_falls_back_to_push_counter_self_fetch(
+        self,
+        mock_fetch_commits,
+        mock_fetch_timeline,
+        mock_issues,
+        mock_prs,
+        mock_issue_comments,
+        mock_pr_review_comments,
+        mock_edit_batch,
+        mock_pr_edit,
+        mock_push,
+        mock_link,
+        tmp_path,
+    ):
+        """F-2 invariant: when fetch_and_store_pr_commits raises GhCliError,
+        count_pushes_after_review is invoked WITHOUT the `commits` kwarg, so
+        push_counter can perform its own /commits fetch. The push_count must
+        NOT collapse to 0 on a transient fetch_commits failure."""
+        from collector.github_poller.gh_client import GhCliError
+
+        mock_issues.return_value = []
+        mock_prs.return_value = [
+            {"number": 10, "title": "P", "head_ref": "fix/1",
+             "body": "Closes #1", "review_comments": [],
+             "review_comment_count": 0, "created_at": None,
+             "merged_at": None},
+        ]
+        # fetch_commits blows up with a transient error.
+        mock_fetch_commits.side_effect = GhCliError(["gh"], 1, "boom")
+
+        _poll_repo(
+            "owner/repo",
+            tmp_path / "github.db",
+            tmp_path / "sessions.db",
+            backfill_days=30,
+            dry_run=False,
+            fetch_commits_enabled=True,
+            fetch_timeline_enabled=False,
+        )
+
+        # count_pushes_after_review must have been called without the kwarg
+        # so push_counter re-fetches /commits itself and returns its own count
+        # (7 per the mock) — NOT 0.
+        assert mock_push.call_count == 1
+        call_kwargs = mock_push.call_args.kwargs
+        assert "commits" not in call_kwargs, (
+            "Fallback path must NOT pass commits=[] — that would collapse "
+            "push_count to 0. See F-2."
+        )

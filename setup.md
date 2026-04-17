@@ -71,6 +71,52 @@ bash scripts/uninstall-launchd.sh
 
 All install scripts default to daily at 02:00. They also install a boot-time fallback trigger so that if your PC is off at 02:00, the run happens automatically the next time you log in. Collectors are idempotent — running twice in one day produces no duplicate data.
 
+### Weekly synthesis cadence
+
+`run_collectors.sh` and `run_collectors.ps1` contain a weekly-cadence
+check that runs `am-synthesize` only on Sundays (or when the
+`AMIS_FORCE_SYNTHESIS=1` environment variable is set). **You do not need
+a separate cron entry / Scheduled Task for synthesis** — as long as the
+daily collector job fires on Sunday, synthesis will run with it.
+
+How it works in each entry point:
+
+- **Linux/macOS (`run_collectors.sh`)** — `date +%u` returns `7` on
+  Sunday. When it does, the script resolves the most recent Sunday's
+  date and invokes `am-synthesize --week <YYYY-MM-DD>`. On all other
+  days the block is skipped.
+- **Windows (`run_collectors.ps1`)** — the same logic via
+  `(Get-Date).DayOfWeek -eq [DayOfWeek]::Sunday`.
+
+If you miss a Sunday (PC off, cron didn't fire), re-run catch-up
+manually:
+
+```bash
+# Linux / macOS
+AMIS_FORCE_SYNTHESIS=1 bash run_collectors.sh
+
+# Windows
+$env:AMIS_FORCE_SYNTHESIS = "1"; .\run_collectors.ps1
+```
+
+Or call `am-synthesize` directly with the week you want to re-generate:
+
+```bash
+am-synthesize --week 2026-04-12
+```
+
+Re-running for the same `--week` is a cheap no-op — the output writer
+refuses to overwrite an existing retrospective, so answers you've added
+under "Clarifying Questions" are safe.
+
+**Verify:** On the Sunday after install, check that
+`retrospectives/<sunday-date>.md` exists and that `data/health.json`
+contains a fresh `synthesis` entry. `python -m am_i_shipping.health_check`
+will warn if the `synthesis` collector has been silent beyond the weekly
+threshold (currently 8 days — see
+`am_i_shipping/health_check.py::STALE_THRESHOLDS["synthesis"]` for the
+source of truth).
+
 ---
 
 ### Manual setup (alternative)

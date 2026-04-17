@@ -125,3 +125,190 @@ class TestLoadConfigErrors:
         })
         with pytest.raises(ConfigError, match="repos"):
             load_config(cfg_path)
+
+
+# --- SynthesisConfig (Epic #17 — Sub-Issue 1) ---
+
+class TestSynthesisConfig:
+    """Synthesis section parsing, defaults, and validation."""
+
+    def test_synthesis_config_defaults(self, tmp_path):
+        """Absent `synthesis:` section yields the default dataclass."""
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+        })
+        cfg = load_config(cfg_path)
+
+        assert cfg.synthesis.anthropic_api_key_env == "ANTHROPIC_API_KEY"
+        assert cfg.synthesis.model == "claude-sonnet-4-5"
+        assert cfg.synthesis.output_dir == "retrospectives"
+        assert cfg.synthesis.week_start == "monday"
+        assert cfg.synthesis.abandonment_days == 14
+        assert cfg.synthesis.outlier_sigma == 2.0
+
+    def test_synthesis_config_override(self, tmp_path):
+        """Every field round-trips from YAML."""
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+            "synthesis": {
+                "anthropic_api_key_env": "CLAUDE_KEY",
+                "model": "claude-opus-4-7",
+                "output_dir": "retros",
+                "week_start": "sunday",
+                "abandonment_days": 21,
+                "outlier_sigma": 1.5,
+            },
+        })
+        cfg = load_config(cfg_path)
+
+        assert cfg.synthesis.anthropic_api_key_env == "CLAUDE_KEY"
+        assert cfg.synthesis.model == "claude-opus-4-7"
+        assert cfg.synthesis.output_dir == "retros"
+        assert cfg.synthesis.week_start == "sunday"
+        assert cfg.synthesis.abandonment_days == 21
+        assert cfg.synthesis.outlier_sigma == 1.5
+
+    def test_synthesis_config_partial_override(self, tmp_path):
+        """Only-some-fields override leaves the rest at defaults."""
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+            "synthesis": {"abandonment_days": 30},
+        })
+        cfg = load_config(cfg_path)
+
+        assert cfg.synthesis.abandonment_days == 30
+        assert cfg.synthesis.outlier_sigma == 2.0
+        assert cfg.synthesis.week_start == "monday"
+
+    def test_synthesis_config_week_start_case_insensitive(self, tmp_path):
+        """`Monday` / `MONDAY` are accepted — normalised to lowercase."""
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+            "synthesis": {"week_start": "MONDAY"},
+        })
+        cfg = load_config(cfg_path)
+        assert cfg.synthesis.week_start == "monday"
+
+    def test_synthesis_config_invalid_week_start(self, tmp_path):
+        """Unknown `week_start` fails loud with ConfigError."""
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+            "synthesis": {"week_start": "tuesday"},
+        })
+        with pytest.raises(ConfigError, match="week_start"):
+            load_config(cfg_path)
+
+    def test_synthesis_config_outlier_sigma_override(self, tmp_path):
+        """Solo override of `outlier_sigma` exercises the float-cast branch
+        without bundling other field changes."""
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+            "synthesis": {"outlier_sigma": 3.5},
+        })
+        cfg = load_config(cfg_path)
+        assert cfg.synthesis.outlier_sigma == 3.5
+        # Other fields remain at defaults.
+        assert cfg.synthesis.abandonment_days == 14
+        assert cfg.synthesis.model == "claude-sonnet-4-5"
+
+    def test_synthesis_config_model_override(self, tmp_path):
+        """Solo override of `model` exercises the str-cast branch in isolation."""
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+            "synthesis": {"model": "claude-opus-4-7"},
+        })
+        cfg = load_config(cfg_path)
+        assert cfg.synthesis.model == "claude-opus-4-7"
+        assert cfg.synthesis.output_dir == "retrospectives"
+
+    def test_synthesis_config_output_dir_override(self, tmp_path):
+        """Solo override of `output_dir` exercises that branch in isolation."""
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+            "synthesis": {"output_dir": "weekly-retros"},
+        })
+        cfg = load_config(cfg_path)
+        assert cfg.synthesis.output_dir == "weekly-retros"
+        assert cfg.synthesis.model == "claude-sonnet-4-5"
+
+
+class TestSynthesisOutputPath:
+    """Issue #39: relative synthesis.output_dir anchors against config dir."""
+
+    def test_relative_output_dir_resolves_against_config_dir(self, tmp_path):
+        # Default "retrospectives" is relative → must land next to the
+        # config file, regardless of where ``data_dir`` points.
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+            "data": {"data_dir": "/var/lib/amis/data"},
+        })
+        cfg = load_config(cfg_path)
+        # Anchor is the config file's directory, NOT /var/lib/amis (the
+        # parent of the data_dir). That's the whole point of F-1-1.
+        assert cfg.synthesis_output_path == tmp_path / "retrospectives"
+
+    def test_absolute_output_dir_is_returned_verbatim(self, tmp_path):
+        absolute = tmp_path / "custom" / "retros"
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+            "synthesis": {"output_dir": str(absolute)},
+        })
+        cfg = load_config(cfg_path)
+        assert cfg.synthesis_output_path == absolute
+
+    def test_relative_output_dir_independent_of_data_dir(self, tmp_path):
+        # Moving data_dir off into /tmp must not shift the retrospectives
+        # location — they are anchored independently now.
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+            "data": {"data_dir": "/tmp/different-data"},
+            "synthesis": {"output_dir": "retros"},
+        })
+        cfg = load_config(cfg_path)
+        assert cfg.synthesis_output_path == tmp_path / "retros"
+        # Sanity: old buggy anchor would have been /tmp/retros
+        # (data_dir.parent / output_dir).
+        assert cfg.synthesis_output_path != Path("/tmp/retros")
+
+
+class TestEpic17FetchFlags:
+    """Epic #17 Sub-Issue 2 (#35): E-1 / E-2 config flags."""
+
+    def test_fetch_flags_default_true(self, tmp_path):
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+        })
+        cfg = load_config(cfg_path)
+        assert cfg.github.fetch_commits is True
+        assert cfg.github.fetch_timeline is True
+
+    def test_fetch_commits_false_disables_e1(self, tmp_path):
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"], "fetch_commits": False},
+        })
+        cfg = load_config(cfg_path)
+        assert cfg.github.fetch_commits is False
+        # fetch_timeline still defaults on.
+        assert cfg.github.fetch_timeline is True
+
+    def test_fetch_timeline_false_disables_e2(self, tmp_path):
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"], "fetch_timeline": False},
+        })
+        cfg = load_config(cfg_path)
+        assert cfg.github.fetch_commits is True
+        assert cfg.github.fetch_timeline is False

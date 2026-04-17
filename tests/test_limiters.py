@@ -418,9 +418,14 @@ class TestAppswitchRemoved:
         data_dir.mkdir()
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
+        # Issue #40 added ``synthesis`` to EXPECTED_COLLECTORS; supply a
+        # fresh entry for it so this assertion still verifies only that
+        # appswitch's absence is tolerated (the thing the test is named
+        # after), not that synthesis happens to be missing too.
         health = {
             "session_parser": {"last_success": now, "last_record_count": 10},
             "github_poller": {"last_success": now, "last_record_count": 20},
+            "synthesis": {"last_success": now, "last_record_count": 3},
         }
         (data_dir / "health.json").write_text(json.dumps(health))
 
