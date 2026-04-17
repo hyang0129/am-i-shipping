@@ -19,7 +19,19 @@ from pathlib import Path
 from typing import List, Tuple, Union
 
 
-EXPECTED_COLLECTORS = ["session_parser", "github_poller"]
+EXPECTED_COLLECTORS = ["session_parser", "github_poller", "synthesis"]
+# Per-collector staleness threshold. Session parser and GitHub poller run
+# daily, so 48h catches a missed run. Synthesis runs weekly (Sundays only)
+# so its threshold has to allow for a full cadence plus a one-day slack
+# window for clock skew / DST / missed-run catch-up.
+STALE_THRESHOLDS = {
+    "session_parser": timedelta(hours=48),
+    "github_poller": timedelta(hours=48),
+    "synthesis": timedelta(days=8),
+}
+# Default kept for backwards compatibility — any collector not in the map
+# above falls back to the original 48h threshold. Callers that import
+# STALE_THRESHOLD directly continue to see the same value.
 STALE_THRESHOLD = timedelta(hours=48)
 
 
@@ -84,11 +96,12 @@ def check_health(
             continue
 
         age = now - last_success
-        if age > STALE_THRESHOLD:
+        threshold = STALE_THRESHOLDS.get(collector, STALE_THRESHOLD)
+        if age > threshold:
             hours_ago = age.total_seconds() / 3600
             messages.append(
                 f"WARNING: {collector} is stale — last success {hours_ago:.1f}h ago "
-                f"(threshold: {STALE_THRESHOLD.total_seconds() / 3600:.0f}h)"
+                f"(threshold: {threshold.total_seconds() / 3600:.0f}h)"
             )
             all_healthy = False
         else:

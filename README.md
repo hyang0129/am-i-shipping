@@ -102,6 +102,68 @@ Exit code 0 means all collectors reported recently. Exit code 1 means one or mor
 
 ---
 
+## Synthesis
+
+Once collectors have been running for at least a week, the synthesis layer
+turns the accumulated data into a weekly retrospective. It aggregates your
+workflow units, runs cross-unit outlier / abandonment detection, then asks
+Claude to produce a Markdown retrospective framed around the idealized
+workflow's preconditions — surfacing where you were slow and where effort
+was wasted, and asking at most two clarifying questions. It does **not**
+prescribe recommendations; that is a separate layer.
+
+### What it does
+
+- Loads the week's `units` rows + graph components from `data/github.db`
+  and `data/sessions.db`
+- Apportions a 512 KB transcript budget across the week's sessions (see
+  `synthesis/weekly.py::water_fill_truncate`)
+- Calls the Anthropic API (or an offline fake when `AMIS_SYNTHESIS_LIVE`
+  is unset) to render the retrospective
+- Writes `retrospectives/YYYY-MM-DD.md` atomically; refuses to overwrite
+  an existing file so your hand-written answers under "Clarifying
+  Questions" survive a re-run
+
+### How to run
+
+```bash
+am-synthesize --week YYYY-MM-DD
+```
+
+The `YYYY-MM-DD` anchor must match a value in `units.week_start` (the
+graph builder picks a Sunday for each week). Re-running with the same
+`--week` is a cheap no-op (the output writer refuses to overwrite).
+
+Dry-run to inspect the assembled prompt without calling the API:
+
+```bash
+am-synthesize --week YYYY-MM-DD --dry-run
+```
+
+### Environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `AMIS_SYNTHESIS_LIVE=1` | Use the real Anthropic API instead of the offline fake client. Requires `ANTHROPIC_API_KEY` (or whichever name `config.synthesis.anthropic_api_key_env` resolves to). |
+| `AMIS_FORCE_SYNTHESIS=1` | Run `am-synthesize` inside `run_collectors.sh` / `.ps1` even when today is not Sunday. Useful for ad-hoc re-runs or catching up after a missed Sunday. |
+
+### Where output goes
+
+```
+retrospectives/YYYY-MM-DD.md      # committed retrospective
+retrospectives/.dry-run/*.prompt.txt   # --dry-run artefacts (ignored)
+```
+
+### Cadence
+
+`run_collectors.sh` / `run_collectors.ps1` invoke `am-synthesize`
+automatically on Sundays (or when `AMIS_FORCE_SYNTHESIS=1`). Daily
+collectors still run unconditionally — only the synthesis step is gated
+on weekly cadence. See [setup.md](setup.md) for the weekly schedule
+step.
+
+---
+
 ## Project Structure
 
 ```

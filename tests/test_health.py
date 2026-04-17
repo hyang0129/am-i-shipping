@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 
 from am_i_shipping.health_writer import write_health
-from am_i_shipping.health_check import check_health
+from am_i_shipping.health_check import (
+    check_health,
+    EXPECTED_COLLECTORS,
+    STALE_THRESHOLDS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +78,7 @@ class TestCheckHealth:
         health = {
             "session_parser": {"last_success": now, "last_record_count": 10},
             "github_poller": {"last_success": now, "last_record_count": 20},
+            "synthesis": {"last_success": now, "last_record_count": 3},
         }
         (data_dir / "health.json").write_text(json.dumps(health))
 
@@ -90,6 +95,7 @@ class TestCheckHealth:
         health = {
             "session_parser": {"last_success": stale, "last_record_count": 10},
             "github_poller": {"last_success": fresh, "last_record_count": 20},
+            "synthesis": {"last_success": fresh, "last_record_count": 3},
         }
         (data_dir / "health.json").write_text(json.dumps(health))
 
@@ -101,7 +107,7 @@ class TestCheckHealth:
         data_dir = tmp_path / "data"
         data_dir.mkdir()
         now = datetime.now(timezone.utc).isoformat()
-        # Only one of two expected collectors present
+        # Only one of three expected collectors present
         health = {
             "session_parser": {"last_success": now, "last_record_count": 10},
         }
@@ -127,3 +133,86 @@ class TestCheckHealth:
         healthy, messages = check_health(data_dir=data_dir)
         assert not healthy
         assert any("Failed to read" in m for m in messages)
+
+
+# ---------------------------------------------------------------------------
+# Synthesis collector wiring (issue #40)
+# ---------------------------------------------------------------------------
+
+class TestSynthesisHealthWiring:
+    """Issue #40 adds synthesis to EXPECTED_COLLECTORS with a weekly threshold."""
+
+    def test_synthesis_in_expected_collectors(self):
+        """EXPECTED_COLLECTORS contains 'synthesis' alongside the daily collectors."""
+        assert "synthesis" in EXPECTED_COLLECTORS
+
+    def test_synthesis_has_weekly_threshold(self):
+        """Synthesis runs weekly, so its threshold must exceed the daily 48h."""
+        # 8 days = 192h; must be strictly greater than the daily 48h so a
+        # Sunday-to-Sunday cadence with a day of slack does not flap.
+        assert STALE_THRESHOLDS["synthesis"] > timedelta(hours=48)
+        assert STALE_THRESHOLDS["synthesis"] >= timedelta(days=7)
+
+    def test_write_health_records_synthesis(self, tmp_path):
+        """write_health('synthesis', ...) produces a readable health.json entry."""
+        data_dir = tmp_path / "data"
+        write_health("synthesis", 5, data_dir=data_dir)
+
+        data = json.loads((data_dir / "health.json").read_text())
+        assert "synthesis" in data
+        assert data["synthesis"]["last_record_count"] == 5
+        assert "last_success" in data["synthesis"]
+
+    def test_synthesis_fresh_is_healthy(self, tmp_path):
+        """A recent synthesis run (inside the 8-day window) reports healthy."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        now = datetime.now(timezone.utc)
+        # 5 days ago — well inside the weekly threshold, well outside the
+        # daily 48h threshold. This is the test that proves the per-
+        # collector threshold lookup is actually being used.
+        five_days_ago = (now - timedelta(days=5)).isoformat()
+        fresh = now.isoformat()
+        health = {
+            "session_parser": {"last_success": fresh, "last_record_count": 10},
+            "github_poller": {"last_success": fresh, "last_record_count": 20},
+            "synthesis": {"last_success": five_days_ago, "last_record_count": 3},
+        }
+        (data_dir / "health.json").write_text(json.dumps(health))
+
+        healthy, messages = check_health(data_dir=data_dir)
+        assert healthy, f"expected healthy, got messages={messages!r}"
+
+    def test_synthesis_stale_beyond_weekly_threshold(self, tmp_path):
+        """Synthesis absent for more than 8 days flips health to red."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        now = datetime.now(timezone.utc)
+        fresh = now.isoformat()
+        way_stale = (now - timedelta(days=10)).isoformat()
+        health = {
+            "session_parser": {"last_success": fresh, "last_record_count": 10},
+            "github_poller": {"last_success": fresh, "last_record_count": 20},
+            "synthesis": {"last_success": way_stale, "last_record_count": 3},
+        }
+        (data_dir / "health.json").write_text(json.dumps(health))
+
+        healthy, messages = check_health(data_dir=data_dir)
+        assert not healthy
+        assert any("synthesis" in m and "stale" in m for m in messages)
+
+    def test_synthesis_missing_entry(self, tmp_path):
+        """Missing synthesis entry flips health to red."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        now = datetime.now(timezone.utc).isoformat()
+        health = {
+            "session_parser": {"last_success": now, "last_record_count": 10},
+            "github_poller": {"last_success": now, "last_record_count": 20},
+            # synthesis intentionally absent
+        }
+        (data_dir / "health.json").write_text(json.dumps(health))
+
+        healthy, messages = check_health(data_dir=data_dir)
+        assert not healthy
+        assert any("synthesis" in m and "never reported" in m for m in messages)

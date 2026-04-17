@@ -75,6 +75,32 @@ foreach ($Collector in $Collectors) {
     Write-Log "--- Finished: $($Collector.Name) ---"
 }
 
+# --- Weekly synthesis ---
+# Only run on Sundays or when AMIS_FORCE_SYNTHESIS=1 is set.
+# .NET DayOfWeek: Sunday=0, Monday=1, ..., Saturday=6. Subtracting the
+# current day-of-week numeric value from "today" always lands on Sunday.
+$Today = (Get-Date).DayOfWeek
+$ForceSynthesis = $env:AMIS_FORCE_SYNTHESIS -eq "1"
+if ($Today -eq [DayOfWeek]::Sunday -or $ForceSynthesis) {
+    $WeekStart = (Get-Date).AddDays(-[int](Get-Date).DayOfWeek).ToString("yyyy-MM-dd")
+    Write-Log "--- Starting: Weekly Synthesis (week=$WeekStart) ---"
+    try {
+        $synthArgs = @("--week", $WeekStart) + $ConfigArg
+        $synthOutput = & am-synthesize @synthArgs 2>&1
+        $synthOutput | ForEach-Object { Write-Log "  $_" }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "ERROR: Weekly Synthesis exited with code $LASTEXITCODE"
+            $FailCount++
+        } else {
+            Write-Log "OK: Weekly Synthesis completed successfully"
+        }
+    } catch {
+        Write-Log "ERROR: Weekly Synthesis threw exception: $_"
+        $FailCount++
+    }
+    Write-Log "--- Finished: Weekly Synthesis ---"
+}
+
 # --- Health check ---
 Write-Log "=== Running health check ==="
 try {

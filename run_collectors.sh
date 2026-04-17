@@ -55,6 +55,24 @@ FAIL_COUNT=0
 run_collector "Session Parser" -m collector.session_parser --mode batch
 run_collector "GitHub Poller"  -m collector.github_poller.run
 
+# Weekly synthesis: only run on Sundays, or when AMIS_FORCE_SYNTHESIS=1 is set.
+# `date +%u` returns 1..7 where 7 = Sunday (POSIX). Both GNU date and BSD date
+# support `+%u` the same way, so no per-OS branching is needed here. The
+# per-OS branching below is for `date -d 'last sunday'` (GNU) vs `date -v-sun`
+# (BSD / macOS) because those two flags are NOT cross-compatible.
+if [ "$(date +%u)" = "7" ] || [ "${AMIS_FORCE_SYNTHESIS:-0}" = "1" ]; then
+    WEEK_START="$(date -d 'last sunday' +%Y-%m-%d 2>/dev/null || date -v-sun +%Y-%m-%d)"
+    log "--- Starting: Weekly Synthesis (week=$WEEK_START) ---"
+    if am-synthesize --week "$WEEK_START" "${CONFIG_ARG[@]}" >> "$LOG_FILE" 2>&1; then
+        log "OK: Weekly Synthesis completed successfully"
+    else
+        rc=$?
+        log "ERROR: Weekly Synthesis exited with code $rc"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+    log "--- Finished: Weekly Synthesis ---"
+fi
+
 log "=== Running health check ==="
 if python3 -m am_i_shipping.health_check >> "$LOG_FILE" 2>&1; then
     log "OK: All collectors healthy"
