@@ -242,6 +242,57 @@ PYTHONPATH=. python3 -c "from am_i_shipping.config_loader import load_config; pr
 
 ---
 
+## Step 4 — Backfill Session Timestamps (one-time)
+
+If you already have historical Claude Code sessions recorded in `~/.claude/projects/`
+before installing this repo, the first collector run will import them into
+`data/sessions.db` but leave `session_started_at` / `session_ended_at` as `NULL` for
+every pre-existing row. Unit metrics such as `dark_time_pct` and session-rooted
+`elapsed_days` depend on those columns, so until the backfill runs the weekly
+synthesis unit-summary table will show zeros.
+
+Run the backfill exactly once per install (and any time you import historical
+sessions from a new source):
+
+```bash
+python -m am_i_shipping.scripts.backfill_session_timestamps
+```
+
+The script walks every row whose timestamps are `NULL`, re-opens the JSONL file
+under `session.projects_path` that produced it, and `UPDATE`s only the two
+timestamp columns in place — every other column (including `raw_content_json`)
+is preserved byte-for-byte. It commits in batches of 500, so interrupting and
+re-running is safe. Running it a second time after all rows are populated is a
+cheap no-op — already-populated rows are filtered out by the `WHERE` clause.
+
+Useful flags:
+
+- `--dry-run` — print counts of what would be updated without writing.
+- `--limit N` — cap the number of rows touched per invocation (smoke-test).
+- `--config path/to/config.yaml` — override the default config lookup.
+
+Rows whose JSONL file is no longer on disk are logged as warnings and left with
+`NULL` timestamps; this is preferable to silently synthesising data. The
+integration-test gate in `tests/test_integration_gate.py` enforces that at least
+90% of `sessions` rows have a populated `session_started_at` before weekly
+synthesis is allowed to run — if this threshold is not met after a backfill,
+check the warnings in stderr to see which JSONL files went missing.
+
+**Verify:**
+
+```bash
+python3 -c "import sqlite3; c = sqlite3.connect('data/sessions.db'); \
+  t = c.execute('SELECT COUNT(*) FROM sessions').fetchone()[0]; \
+  n = c.execute('SELECT COUNT(*) FROM sessions WHERE session_started_at IS NOT NULL').fetchone()[0]; \
+  print(f'{n}/{t} rows have timestamps ({100*n/t:.1f}%)')"
+```
+
+You should see at least 90% coverage. Historical installs typically reach 97–99%;
+the remainder are sessions whose JSONL files were rotated off disk before the
+backfill ran.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Fix |

@@ -243,6 +243,60 @@ class TestIntegrationGate:
         )
 
     # ------------------------------------------------------------------
+    # Session timestamp coverage gate (issue #53)
+    # ------------------------------------------------------------------
+    # Weekly synthesis computes dark_time_pct and elapsed_days from
+    # session_started_at / session_ended_at. When those columns are NULL
+    # (pre-Epic-#17 rows that have never been backfilled), the unit
+    # summary table collapses to zeros and the retrospective is
+    # meaningless. This gate asserts that at least 90% of rows in
+    # sessions.db have a populated session_started_at before the
+    # integration suite is considered green — if the threshold is not
+    # met, the operator must run:
+    #
+    #     python -m am_i_shipping.scripts.backfill_session_timestamps
+    #
+    # See setup.md Step 4 for context.
+
+    SESSION_TIMESTAMP_COVERAGE_MIN = 0.90
+
+    def test_session_timestamp_coverage_gate(self) -> None:
+        """>=90% of rows in sessions.db have a populated session_started_at.
+
+        If sessions.db does not exist yet (fresh install before first
+        collector run), the test is skipped — there is nothing to gate.
+        Once the DB has rows, any drop below 90% fails the gate and
+        directs the operator to the backfill script.
+        """
+        sessions_db = REPO_ROOT / "data" / "sessions.db"
+        if not sessions_db.exists():
+            pytest.skip("data/sessions.db does not exist yet; nothing to gate")
+
+        conn = sqlite3.connect(str(sessions_db))
+        try:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM sessions"
+            ).fetchone()[0]
+            with_ts = conn.execute(
+                "SELECT COUNT(*) FROM sessions "
+                "WHERE session_started_at IS NOT NULL"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        if total == 0:
+            pytest.skip("sessions.db has no rows yet; nothing to gate")
+
+        coverage = with_ts / total
+        assert coverage >= self.SESSION_TIMESTAMP_COVERAGE_MIN, (
+            f"session_started_at coverage is {coverage:.1%} "
+            f"({with_ts}/{total}); required minimum is "
+            f"{self.SESSION_TIMESTAMP_COVERAGE_MIN:.0%}. "
+            "Run: python -m am_i_shipping.scripts.backfill_session_timestamps "
+            "(see setup.md Step 4)."
+        )
+
+    # ------------------------------------------------------------------
     # Weekly synthesis block (issue #40 / F-4 in PR-48 review-fix cycle)
     # ------------------------------------------------------------------
     # The scheduler invokes ``am-synthesize`` on Sundays, or on any day
