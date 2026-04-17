@@ -240,6 +240,48 @@ class TestSynthesisConfig:
         assert cfg.synthesis.model == "claude-sonnet-4-5"
 
 
+class TestSynthesisOutputPath:
+    """Issue #39: relative synthesis.output_dir anchors against config dir."""
+
+    def test_relative_output_dir_resolves_against_config_dir(self, tmp_path):
+        # Default "retrospectives" is relative → must land next to the
+        # config file, regardless of where ``data_dir`` points.
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+            "data": {"data_dir": "/var/lib/amis/data"},
+        })
+        cfg = load_config(cfg_path)
+        # Anchor is the config file's directory, NOT /var/lib/amis (the
+        # parent of the data_dir). That's the whole point of F-1-1.
+        assert cfg.synthesis_output_path == tmp_path / "retrospectives"
+
+    def test_absolute_output_dir_is_returned_verbatim(self, tmp_path):
+        absolute = tmp_path / "custom" / "retros"
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+            "synthesis": {"output_dir": str(absolute)},
+        })
+        cfg = load_config(cfg_path)
+        assert cfg.synthesis_output_path == absolute
+
+    def test_relative_output_dir_independent_of_data_dir(self, tmp_path):
+        # Moving data_dir off into /tmp must not shift the retrospectives
+        # location — they are anchored independently now.
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+            "data": {"data_dir": "/tmp/different-data"},
+            "synthesis": {"output_dir": "retros"},
+        })
+        cfg = load_config(cfg_path)
+        assert cfg.synthesis_output_path == tmp_path / "retros"
+        # Sanity: old buggy anchor would have been /tmp/retros
+        # (data_dir.parent / output_dir).
+        assert cfg.synthesis_output_path != Path("/tmp/retros")
+
+
 class TestEpic17FetchFlags:
     """Epic #17 Sub-Issue 2 (#35): E-1 / E-2 config flags."""
 

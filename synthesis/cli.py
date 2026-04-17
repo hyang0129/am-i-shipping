@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -62,11 +63,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     Exit codes
     ----------
-    * ``0`` — retrospective written (or the file already existed and
-      we skipped atomically — that is idempotent success).
-    * ``0`` — dry-run prompt written.
-    * ``1`` — no units found for the requested week.
+    * ``0`` — retrospective written, dry-run prompt written, the file
+      already existed (idempotent success), or no units were found for
+      the requested week. All of these are non-error conditions.
     * ``2`` — unexpected error (traceback logged).
+
+    The "no units for the week" and "file already exists" cases both
+    collapse to exit 0 because re-running ``am-synthesize --week
+    <same-week>`` is expected to be a cheap no-op per ADR Decision 2
+    (idempotency). A human driver will notice the stderr message
+    ``No retrospective written (...)`` when the run produced nothing.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -83,16 +89,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     github_db = data_dir / "github.db"
     sessions_db = data_dir / "sessions.db"
 
-    # The output_dir in SynthesisConfig is relative to the config file;
-    # resolve it the same way so `retrospectives/` lands next to config.
+    # Resolve the synthesis output dir the same way — via the Config's
+    # own property, which anchors relative paths against the config
+    # file's directory (NOT against ``data_dir.parent``, which only
+    # coincided with the config dir for the default ``data_dir="data"``
+    # layout). See Config.synthesis_output_path.
     synthesis_cfg = config.synthesis
-    output_dir = Path(synthesis_cfg.output_dir)
-    if not output_dir.is_absolute():
-        output_dir = data_dir.parent / output_dir
+    output_dir = config.synthesis_output_path
     # Mutate via a fresh dataclass copy so we don't silently rewrite
     # the caller's config object — replace only the resolved path.
-    from dataclasses import replace
-
     resolved_cfg = replace(synthesis_cfg, output_dir=str(output_dir))
 
     try:
