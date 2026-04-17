@@ -147,6 +147,13 @@ def _extract_timestamps(jsonl_path: Path) -> Optional[Tuple[str, str]]:
     return timestamps[0].isoformat(), timestamps[-1].isoformat()
 
 
+#: How many UPDATEs to stage before committing. Commits are rarer than
+#: UPDATEs (one fsync each), so a larger batch is faster; but a larger
+#: batch also loses more progress on SIGKILL / machine reboot. 500 balances
+#: wall-clock time and crash resilience for the ~15k-row one-shot workload.
+_COMMIT_BATCH_SIZE = 500
+
+
 def backfill(
     sessions_db: Path,
     projects_path: Path,
@@ -163,6 +170,10 @@ def backfill(
     * ``skipped_no_file`` — rows whose JSONL file could not be found under
       *projects_path* (session log rotated out or machine moved).
     * ``errored`` — rows where the JSONL was located but parsing failed.
+
+    Non-dry-run mode commits to the database every ``_COMMIT_BATCH_SIZE``
+    UPDATEs so that an interruption loses at most one batch worth of
+    progress rather than the entire run.
     """
     if not sessions_db.exists():
         raise FileNotFoundError(f"sessions.db not found: {sessions_db}")
@@ -187,6 +198,7 @@ def backfill(
         updated = 0
         skipped_no_file = 0
         errored = 0
+        pending_in_batch = 0
 
         for session_uuid in targets:
             jsonl = _find_session_file(projects_path, session_uuid, index)
@@ -220,8 +232,15 @@ def backfill(
                 (first_ts, last_ts, session_uuid),
             )
             updated += 1
+            pending_in_batch += 1
 
-        if not dry_run:
+            # Commit in batches to bound crash-loss on long runs.
+            if pending_in_batch >= _COMMIT_BATCH_SIZE:
+                conn.commit()
+                pending_in_batch = 0
+                logger.info("committed batch — {} rows updated so far", updated)
+
+        if not dry_run and pending_in_batch > 0:
             conn.commit()
     finally:
         conn.close()

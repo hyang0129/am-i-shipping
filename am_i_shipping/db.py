@@ -170,6 +170,13 @@ CREATE TABLE IF NOT EXISTS pr_review_comment_edits (
 #                                 append-only, keyed on (week_start, unit_id))
 # ---------------------------------------------------------------------------
 
+# Note: ``commits.message`` stores the FULL commit message, including the
+# body. Squash-merge commits can embed every sub-commit's message plus the
+# PR body, pushing individual rows into the multi-kilobyte range. This is
+# intentional — the Phase-2 synthesis engine reasons about "why" as well as
+# "what", and truncating at the first newline would lose that signal. If DB
+# size becomes a concern, consider moving long messages to a sidecar table
+# rather than truncating at ingest time.
 SYNTHESIS_COMMITS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS commits (
     repo        TEXT NOT NULL,
