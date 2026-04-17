@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Union
 
@@ -155,8 +155,12 @@ def _pick_root(
     return best[1], best[2]
 
 
-def _parse_repo_number(node_ref: Optional[str]) -> Optional[tuple[str, int]]:
-    """Return ``(repo, number)`` for ``"owner/repo#N"`` refs, else None."""
+def parse_repo_number(node_ref: Optional[str]) -> Optional[tuple[str, int]]:
+    """Return ``(repo, number)`` for ``"owner/repo#N"`` refs, else None.
+
+    Public helper — ``synthesis.unit_timeline`` imports this to avoid a
+    duplicated copy.
+    """
     if not node_ref or "#" not in node_ref:
         return None
     repo, _, num = node_ref.rpartition("#")
@@ -164,6 +168,10 @@ def _parse_repo_number(node_ref: Optional[str]) -> Optional[tuple[str, int]]:
         return repo, int(num)
     except ValueError:
         return None
+
+
+# Private alias kept so intra-module call sites below do not churn.
+_parse_repo_number = parse_repo_number
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +347,10 @@ def identify_units(
     existing rows are preserved unchanged (append-only).
     """
     if now is None:
-        now = datetime.utcnow()
+        # ``datetime.utcnow()`` is deprecated on 3.12+. Build a naive-UTC
+        # datetime explicitly so the rest of this module's naive-vs-naive
+        # arithmetic keeps working.
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
 
     gh_path = Path(github_db_path)
     sess_path = Path(sessions_db_path)

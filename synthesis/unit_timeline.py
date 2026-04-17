@@ -38,20 +38,14 @@ from __future__ import annotations
 import sqlite3
 from typing import Iterable, Optional
 
+from synthesis.unit_identifier import parse_repo_number as _parse_repo_number
+
 
 # ---------------------------------------------------------------------------
-# Node-ref parsing (mirrors unit_identifier)
+# Node-ref parsing is shared with ``unit_identifier`` via the imported
+# ``parse_repo_number`` (aliased to ``_parse_repo_number`` to match the
+# private-by-convention style used below).
 # ---------------------------------------------------------------------------
-
-
-def _parse_repo_number(node_ref: Optional[str]) -> Optional[tuple[str, int]]:
-    if not node_ref or "#" not in node_ref:
-        return None
-    repo, _, num = node_ref.rpartition("#")
-    try:
-        return repo, int(num)
-    except ValueError:
-        return None
 
 
 # ---------------------------------------------------------------------------

@@ -227,7 +227,13 @@ class TestIdentifyUnitsFixture:
         finally:
             conn.close()
 
-        identify_units(db, db, WEEK_START, now=PINNED_NOW)
+        # After the pre-seed for the singleton (unit_id=0e5eb65932c9f5f7),
+        # identify_units should insert only the other two components —
+        # the seeded row is preserved via INSERT OR IGNORE. Pinning the
+        # return value here closes the gap where a silent overwrite +
+        # re-insert would still make the row-value assertions below pass.
+        inserted = identify_units(db, db, WEEK_START, now=PINNED_NOW)
+        assert inserted == 2
 
         conn = sqlite3.connect(str(db))
         try:
