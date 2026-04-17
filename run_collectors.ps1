@@ -77,26 +77,47 @@ foreach ($Collector in $Collectors) {
 
 # --- Weekly synthesis ---
 # Only run on Sundays or when AMIS_FORCE_SYNTHESIS=1 is set.
-# .NET DayOfWeek: Sunday=0, Monday=1, ..., Saturday=6. Subtracting the
-# current day-of-week numeric value from "today" always lands on Sunday.
+#
+# Week-start semantics: synthesis covers the most recently *completed* week.
+# WEEK_START is ALWAYS the Sunday that began that completed week — i.e. the
+# most recent past Sunday, never today. On Sunday, DayOfWeek=0 so the naive
+# `-DayOfWeek` arithmetic would return today; we explicitly subtract a full
+# 7 days in that case to match the shell-side `date -d 'last sunday'`
+# semantic. This keeps the SH and PS1 schedulers in lock-step (see F-1 in
+# the PR-48 review-fix cycle).
+#
+# .NET DayOfWeek: Sunday=0, Monday=1, ..., Saturday=6.
+#   today - DayOfWeek    = this-week Sunday (== today when today is Sunday)
+#   today - DayOfWeek - 7 (when today is Sunday) = last-week Sunday
+#
+# Exit semantics: a non-zero exit from `am-synthesize` is logged as a
+# WARNING and does NOT increment $FailCount. The overall scheduler's exit
+# code should reflect the daily collectors' health; synthesis is a
+# once-a-week add-on that may legitimately skip (missing API key,
+# AMIS_SYNTHESIS_LIVE=1 without credentials, empty DB, etc.). See F-5.
 $Today = (Get-Date).DayOfWeek
 $ForceSynthesis = $env:AMIS_FORCE_SYNTHESIS -eq "1"
 if ($Today -eq [DayOfWeek]::Sunday -or $ForceSynthesis) {
-    $WeekStart = (Get-Date).AddDays(-[int](Get-Date).DayOfWeek).ToString("yyyy-MM-dd")
+    $DayOfWeekInt = [int](Get-Date).DayOfWeek
+    if ($DayOfWeekInt -eq 0) {
+        # Sunday: go back a full 7 days to land on the previous Sunday.
+        $WeekStart = (Get-Date).AddDays(-7).ToString("yyyy-MM-dd")
+    } else {
+        # Any other day: go back to this week's Sunday.
+        $WeekStart = (Get-Date).AddDays(-$DayOfWeekInt).ToString("yyyy-MM-dd")
+    }
     Write-Log "--- Starting: Weekly Synthesis (week=$WeekStart) ---"
     try {
         $synthArgs = @("--week", $WeekStart) + $ConfigArg
         $synthOutput = & am-synthesize @synthArgs 2>&1
         $synthOutput | ForEach-Object { Write-Log "  $_" }
         if ($LASTEXITCODE -ne 0) {
-            Write-Log "ERROR: Weekly Synthesis exited with code $LASTEXITCODE"
-            $FailCount++
+            Write-Log "WARNING: Weekly Synthesis exited with code $LASTEXITCODE (not counted as a failure)"
         } else {
             Write-Log "OK: Weekly Synthesis completed successfully"
         }
     } catch {
-        Write-Log "ERROR: Weekly Synthesis threw exception: $_"
-        $FailCount++
+        Write-Log "WARNING: Weekly Synthesis threw exception: $_ (not counted as a failure)"
     }
     Write-Log "--- Finished: Weekly Synthesis ---"
 }
