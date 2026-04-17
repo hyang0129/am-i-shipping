@@ -92,8 +92,15 @@ def _build_session_index(projects_path: Path) -> Dict[str, Path]:
                         # file) are ignored.
                         index.setdefault(sid, jsonl)
                         break
-        except OSError:
-            # Unreadable file — skip and continue; the row stays NULL.
+        except OSError as exc:
+            # Unreadable file — skip and continue; the row stays NULL. Log
+            # so the operator can distinguish "file not found" (row never
+            # enters the index) from "file not readable" (row enters as
+            # skipped_no_file without a reason).
+            logger.warning(
+                "could not read session file {} while building index: {}",
+                jsonl, exc,
+            )
             continue
 
     return index

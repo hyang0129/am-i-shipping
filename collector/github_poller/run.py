@@ -17,10 +17,9 @@ Writes ``health.json`` only after all repos succeed.  Supports
 
 The per-repo orchestration is split into named helpers
 (``_apply_item_cap``, ``_attach_comments``, ``_process_issues``,
-``_process_prs``, ``_fetch_commits_step``, ``_fetch_timeline_step``) so new
-collector stages slot in cleanly. The outer ``_poll_repo`` is a
-sequence-of-steps composition; behavior of the pre-existing steps is
-unchanged from the monolithic version.
+``_process_prs``, ``_fetch_timeline_step``) so new collector stages slot in
+cleanly. The outer ``_poll_repo`` is a sequence-of-steps composition;
+behavior of the pre-existing steps is unchanged from the monolithic version.
 
 Usage:
     python -m collector.github_poller.run [--config path/to/config.yaml] [--dry-run]
@@ -537,26 +536,6 @@ def _persist_pr_edits(
             )
 
 
-def _fetch_commits_step(
-    repo: str,
-    prs: List[Dict[str, Any]],
-    github_db: Path,
-    conn: sqlite3.Connection,
-) -> None:
-    """Standalone E-1 fetch step — kept for symmetry with the timeline step.
-
-    In the default flow ``_process_prs`` already calls
-    ``fetch_and_store_pr_commits`` inline so push_counter can reuse the result,
-    so this helper is a no-op on that path. It exists so future refactors
-    (e.g. reordering the DAG so commits fetch before PR upsert) have a named
-    seam to hook into.
-    """
-    # Intentionally empty — the real work happens inside ``_process_prs``
-    # when ``fetch_commits_enabled`` is True. Named seam for future DAG
-    # restructuring; leaving commits out of here avoids double-fetching.
-    return
-
-
 def _fetch_timeline_step(
     repo: str,
     issues: List[Dict[str, Any]],
@@ -646,18 +625,14 @@ def _poll_repo(
         _process_issues(repo, issues, github_db, conn, is_backfill)
 
         # 7. Process PRs (link resolution, push counts, upsert, edit history,
-        # and — when enabled — E-1 commit persistence).
+        # and — when enabled — E-1 commit persistence inline so push_counter
+        # can reuse the commit list).
         _process_prs(
             repo, prs, github_db, conn, is_backfill,
             fetch_commits_enabled=fetch_commits_enabled,
         )
 
-        # 8. E-1 standalone step (currently a no-op — commits persisted inline
-        # via ``_process_prs`` so push_counter can reuse them).
-        if fetch_commits_enabled:
-            _fetch_commits_step(repo, prs, github_db, conn)
-
-        # 9. E-2 timeline events.
+        # 8. E-2 timeline events.
         if fetch_timeline_enabled:
             _fetch_timeline_step(repo, issues, github_db, conn)
 

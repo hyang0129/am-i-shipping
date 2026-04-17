@@ -43,7 +43,10 @@ class GitHubConfig:
     # Epic #17 — Sub-Issue 2/7 (#35): E-1 (commit data) and E-2 (timeline
     # events) collectors. Both default on; flipping to false turns the new
     # collectors off while leaving the rest of the poll cycle unchanged, as
-    # a rollback lever for the synthesis rollout.
+    # a pause lever for the synthesis rollout. NOTE: this pauses *further*
+    # writes — existing rows in ``commits`` and ``timeline_events`` are NOT
+    # removed by flipping the flag. For a full rollback the operator must
+    # also ``DELETE FROM commits; DELETE FROM timeline_events`` on github.db.
     fetch_commits: bool = True
     fetch_timeline: bool = True
 

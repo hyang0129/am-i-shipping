@@ -29,7 +29,8 @@ and decide what to do with it — persistence happens in ``store.upsert_commit``
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 from .gh_client import GhCliError, gh_api
 
@@ -94,7 +95,7 @@ def fetch_pr_commits(repo: str, pr_number: int) -> List[Dict[str, Any]]:
 def fetch_and_store_pr_commits(
     repo: str,
     pr_number: int,
-    github_db,  # Path; kept untyped to avoid circular Path import cost
+    github_db: Union[str, Path],
     conn=None,
     *,
     commits: Optional[List[Dict[str, Any]]] = None,
