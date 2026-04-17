@@ -61,6 +61,38 @@ logger = logging.getLogger(__name__)
 # plenty of room for the static template + per-unit stats blocks.
 TRANSCRIPT_BUDGET_BYTES = 512 * 1024  # 524288
 
+# Issue #54 / Epic #50 P-2 — hard cap on the number of units included in
+# a single synthesis prompt. Keeps the prompt assembly bounded even when
+# the week partition is pathological (e.g. a dev ``week_start='all'``
+# run with thousands of units). A real weekly run is ~42 units, so 100
+# is generous for the expected case while still catching runaway input
+# before it reaches the LLM. Kept as a module constant (not a
+# ``SynthesisConfig`` field) per ADR Q2 — this is a safety rail, not a
+# user-tuneable knob.
+MAX_UNITS_PER_PROMPT = 100
+
+# Issue #54 / Epic #50 P-2 — two-tier ceiling on the total assembled
+# prompt (system + user content, in bytes):
+#
+# * ``MAX_PROMPT_SOFT_WARN_BYTES`` (512 KB) is the epic-#50 acceptance
+#   criterion for a real weekly run. Between this and the hard cap we
+#   log a WARNING so the epic's "prompt ≤ 512 KB for a real week" check
+#   stays enforceable during smoke tests without raising on edge cases.
+# * ``MAX_PROMPT_BYTES`` (1 MiB) is the fail-loud rail. Above this we
+#   ``raise RuntimeError`` rather than ship — a prompt that large
+#   points to a bug upstream (missed truncation, runaway unit set,
+#   oversized per-unit metadata) and silently truncating it would hide
+#   the signal. 1 MiB is ~2x the transcript budget (512 KB) plus
+#   headroom for the static template + per-unit metadata blocks.
+#
+# The soft threshold is coincidentally equal to ``TRANSCRIPT_BUDGET_BYTES``
+# above. They are independent ceilings with the same numeric value by
+# chance (ADR Decision 4 and epic #50 both landed on 512 KB) — keep
+# them as separate constants so a future tweak to one does not
+# silently move the other.
+MAX_PROMPT_SOFT_WARN_BYTES = 512 * 1024  # 524288 — epic-#50 target
+MAX_PROMPT_BYTES = 1_048_576  # 1 MiB — hard raise threshold
+
 # Upper bound on output tokens for the weekly synthesis call. The real
 # response is a few hundred tokens of Markdown; the ceiling exists so a
 # runaway generation does not burn tokens indefinitely.
@@ -569,6 +601,62 @@ def run_synthesis(
             )
             return None
 
+        # --- Issue #54 P-2: prioritise + cap unit count ---------------
+        # Prompt-size safety rail. Units are ordered so that the most
+        # signal-bearing ones survive a truncation:
+        #   1. abandonment_flag=1 first (most actionable — user stalled)
+        #   2. units with non-empty outlier_flags next (metric outliers)
+        #   3. longer-running units (elapsed_days desc)
+        #   4. unit_id asc as the final tie-break (determinism)
+        #
+        # NOTE on ordering — issue #54's "Proposed Fix" listed
+        # ``outlier_flag > abandonment_flag > elapsed_days desc``. We
+        # intentionally invert the first two: an abandoned unit is a
+        # user who stalled for ≥14 days with no event, which is the
+        # most actionable signal we surface; an outlier only means "a
+        # metric exceeded 2σ", which may just be a tail observation.
+        # When we truncate under pressure, the abandoned units are the
+        # ones we most want the retrospective to reason about. The
+        # deviation from the issue spec is deliberate — not a typo.
+        #
+        # ``outlier_flags`` is a JSON string ("[]" / '["x","y"]' / NULL)
+        # produced upstream via ``json.dumps`` with default separators
+        # (see ``synthesis/cross_unit.py``). We only need empty-vs-
+        # non-empty, so a literal compare against "[]" is sufficient
+        # without parsing. If an upstream producer ever emits the same
+        # payload with different whitespace/separators this comparison
+        # would need ``json.loads`` — guard the invariant there.
+        #
+        # ``elapsed_days`` is NULLable in the cross-unit schema; we
+        # coerce ``None`` to 0.0, which sorts NULL-elapsed units below
+        # any unit with a real elapsed value. ``unit_id`` is the
+        # ``units`` PRIMARY KEY (non-NULL by schema) so no ``or ""``
+        # fallback is needed.
+        def _priority_key(u: dict) -> tuple:
+            abandoned = 1 if u.get("abandonment_flag") == 1 else 0
+            flags = u.get("outlier_flags")
+            has_outliers = 1 if (flags is not None and flags != "[]") else 0
+            elapsed = u.get("elapsed_days") or 0.0
+            unit_id = u["unit_id"]
+            # Negate the fields we want DESC so a plain ``sorted`` ASC
+            # yields the right order with unit_id as the final ASC key.
+            return (-abandoned, -has_outliers, -elapsed, unit_id)
+
+        units.sort(key=_priority_key)
+
+        if len(units) > MAX_UNITS_PER_PROMPT:
+            logger.warning(
+                "Unit count %d exceeds MAX_UNITS_PER_PROMPT=%d for "
+                "week_start=%s; truncating to top %d by priority "
+                "(abandonment_flag=1, then non-empty outlier_flags, "
+                "then elapsed_days desc, then unit_id asc)",
+                len(units),
+                MAX_UNITS_PER_PROMPT,
+                week_start,
+                MAX_UNITS_PER_PROMPT,
+            )
+            units = units[:MAX_UNITS_PER_PROMPT]
+
         # Resolve every unit's component so we can pull the session
         # UUIDs (for transcripts) and feed the timeline renderer.
         unit_components: dict = {}
@@ -608,6 +696,48 @@ def run_synthesis(
         system_prompt, messages = _assemble_prompt(
             units, unit_transcripts, unit_timelines, week_start
         )
+
+        # --- Issue #54 P-2: prompt-size guard -------------------------
+        # Two-tier ceiling on the assembled prompt (system + user).
+        # Runs BEFORE the dry-run short-circuit AND before the live
+        # network call so both paths react identically.
+        #
+        # * ``> MAX_PROMPT_SOFT_WARN_BYTES`` (512 KB) — log WARNING.
+        #   This is epic #50's stated "≤ 512 KB for a real week"
+        #   acceptance threshold, enforced as a signal rather than a
+        #   raise because real weekly runs are ~42 units and any
+        #   breach means something is off upstream.
+        # * ``> MAX_PROMPT_BYTES`` (1 MiB) — raise ``RuntimeError``.
+        #   Fail-loud rail. The unit cap above is the first line of
+        #   defence; this catches the case where even the capped unit
+        #   set produces a prompt that is too large (e.g. a single
+        #   unit with a very long metadata block).
+        total_bytes = len(system_prompt) + sum(
+            len(m["content"]) for m in messages
+        )
+        if total_bytes > MAX_PROMPT_BYTES:
+            raise RuntimeError(
+                f"Assembled prompt is {total_bytes} bytes, exceeds "
+                f"MAX_PROMPT_BYTES={MAX_PROMPT_BYTES} for week_start="
+                f"{week_start!r} with {len(units)} units. Refusing to "
+                f"call the LLM (or write a dry-run artefact) with a "
+                f"prompt this large — this usually indicates a bug "
+                f"upstream (missed transcript truncation, runaway unit "
+                f"set, or oversized per-unit metadata)."
+            )
+        if total_bytes > MAX_PROMPT_SOFT_WARN_BYTES:
+            logger.warning(
+                "Assembled prompt is %d bytes, exceeds "
+                "MAX_PROMPT_SOFT_WARN_BYTES=%d (epic #50 target) for "
+                "week_start=%s with %d units. Proceeding, but the "
+                "prompt is above the epic's acceptance threshold — "
+                "investigate whether the unit cap or transcript "
+                "budget needs tightening.",
+                total_bytes,
+                MAX_PROMPT_SOFT_WARN_BYTES,
+                week_start,
+                len(units),
+            )
 
         # --- dry-run short-circuit ------------------------------------
         if dry_run:
@@ -656,4 +786,7 @@ __all__ = [
     "run_synthesis",
     "water_fill_truncate",
     "TRANSCRIPT_BUDGET_BYTES",
+    "MAX_UNITS_PER_PROMPT",
+    "MAX_PROMPT_SOFT_WARN_BYTES",
+    "MAX_PROMPT_BYTES",
 ]
