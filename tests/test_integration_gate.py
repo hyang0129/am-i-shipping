@@ -14,6 +14,7 @@ sources. They require:
 
 from __future__ import annotations
 
+import datetime
 import os
 import re
 import sqlite3
@@ -396,7 +397,7 @@ class TestIntegrationGate:
 # ``pytestmark`` above.
 
 
-def _last_sunday(today: "datetime.date | None" = None) -> str:
+def _last_sunday(today: datetime.date | None = None) -> str:
     """Return the most recent Sunday as ``YYYY-MM-DD``.
 
     Python's ``weekday()`` returns 0 for Monday and 6 for Sunday. Any
@@ -406,8 +407,6 @@ def _last_sunday(today: "datetime.date | None" = None) -> str:
     a Sunday, that Sunday is returned (not the Sunday seven days
     prior) so reruns on Sunday target the current week.
     """
-    import datetime
-
     if today is None:
         today = datetime.date.today()
     # weekday(): Mon=0 ... Sun=6. Days since last Sunday:
@@ -464,8 +463,14 @@ class TestPhase2Pipeline:
     DRY_RUN_SIZE_LIMIT_BYTES = 512 * 1024
 
     # Regex for the doubled type-prefix regression fixed by P-3 (#51).
-    # Matches ``session:session:``, ``issue:issue:``, ``pr:pr:``.
-    DOUBLE_PREFIX_PATTERN = re.compile(r"(session|issue|pr):\1:")
+    # The original bug lived in the unit-graph ID formatter and could
+    # double any namespace prefix — not just the ones that happened to
+    # exist when P-3 landed. Match ANY lowercase-identifier prefix
+    # doubled with a colon separator (e.g. ``session:session:``,
+    # ``issue:issue:``, ``pr:pr:``, and any future node families such
+    # as ``commit:commit:`` or ``unit:unit:``). If a new node family
+    # is added to the graph, no update to this regex is required.
+    DOUBLE_PREFIX_PATTERN = re.compile(r"\b([a-z][a-z_]*):\1:")
 
     # >=90% of sessions must have ``session_started_at`` set. This
     # gates the P-4 (#53) backfill — without it, Phase 2 unit summaries
@@ -686,11 +691,15 @@ class TestPhase2Pipeline:
             f"({units_before} -> {units_after})"
         )
 
-        # Allow the prompt to differ on lines that embed a live
-        # timestamp (e.g. "generated_at: ...") — compare line-by-line
-        # and require that non-timestamp lines match. A single-line
-        # timestamp divergence is acceptable; anything else is a real
-        # non-determinism bug.
+        # Allow the prompt to differ on at most one line that looks
+        # like a timestamp. The dry-run prompt assembler in
+        # ``synthesis.weekly`` does not (yet) emit a single, stable,
+        # named field for the generation timestamp — so this check
+        # uses a heuristic (keyword or ISO-date fragment) rather than
+        # an exact field-prefix match. Once the assembler commits to
+        # a canonical field name, tighten this to that prefix. Until
+        # then: single-line timestamp divergence is acceptable;
+        # anything else is a real non-determinism bug.
         lines_before = content_before.splitlines()
         lines_after = content_after.splitlines()
         if lines_before == lines_after:
@@ -714,10 +723,21 @@ class TestPhase2Pipeline:
         )
         if diffs:
             _, a, b = diffs[0]
-            timestampy = any(
-                token in a.lower() or token in b.lower()
-                for token in ("time", "date", "generated", "-04-", "-03-")
+            # A line qualifies as "just a timestamp" if either (a) it
+            # contains one of the explicit timestamp-field keywords or
+            # (b) either side embeds an ISO-8601 date fragment
+            # (``YYYY-MM-DD``) — the latter is month-agnostic, so this
+            # check does not rot when the calendar rolls into a month
+            # not explicitly listed here.
+            iso_date = re.compile(r"\b20\d{2}-\d{2}-\d{2}\b")
+            lower_a = a.lower()
+            lower_b = b.lower()
+            keyword_hit = any(
+                token in lower_a or token in lower_b
+                for token in ("time", "date", "generated", "timestamp")
             )
+            iso_hit = bool(iso_date.search(a) or iso_date.search(b))
+            timestampy = keyword_hit or iso_hit
             assert timestampy, (
                 f"dry-run prompt differs on a non-timestamp line: "
                 f"{a!r} vs {b!r}"
