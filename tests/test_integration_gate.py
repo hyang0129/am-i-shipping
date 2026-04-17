@@ -77,8 +77,17 @@ class TestIntegrationGate:
             f"stdout: {result.stdout}\nstderr: {result.stderr}"
         )
 
-    # Known tables for each database — avoids dynamic SQL construction
-    GITHUB_TABLES = ("issues", "pull_requests", "pushes", "issue_pr_links")
+    # Known tables for each database — avoids dynamic SQL construction.
+    # Epic #17 Sub-Issue 2 (#35) adds ``commits`` and ``timeline_events``;
+    # both are populated by the new E-1 / E-2 collectors enabled by default.
+    GITHUB_TABLES = (
+        "issues",
+        "pull_requests",
+        "pushes",
+        "issue_pr_links",
+        "commits",
+        "timeline_events",
+    )
 
     def test_databases_have_data(self) -> None:
         """After a run, implemented collector DBs contain rows."""

@@ -86,3 +86,25 @@ class TestPushCounter:
         """If API calls fail, returns 0 rather than raising."""
         mock_api.side_effect = GhCliError(["gh", "api"], 1, "timeout")
         assert count_pushes_after_review("owner/repo", 1) == 0
+
+    @patch("collector.github_poller.push_counter.gh_api")
+    def test_pre_fetched_commits_skip_second_roundtrip(self, mock_api):
+        """Epic #17 E-1: when callers pass pre-fetched commits, push_counter
+        does NOT hit /commits again — it reuses what fetch_commits already
+        pulled."""
+        reviews = [{"submitted_at": "2024-01-20T12:00:00Z"}]
+        pre_fetched = [
+            # Normalised shape from fetch_commits.fetch_pr_commits.
+            {"sha": "a", "pushed_at": "2024-01-19T10:00:00Z"},  # before review
+            {"sha": "b", "pushed_at": "2024-01-20T14:00:00Z"},  # after
+            {"sha": "c", "pushed_at": "2024-01-21T09:00:00Z"},  # after
+        ]
+        # Only /reviews is fetched — not /commits.
+        mock_api.return_value = reviews
+
+        count = count_pushes_after_review(
+            "owner/repo", 1, commits=pre_fetched,
+        )
+        assert count == 2
+        # Exactly one gh_api call (for reviews).
+        assert mock_api.call_count == 1

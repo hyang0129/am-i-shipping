@@ -51,6 +51,13 @@ class SessionRecord:
     cache_creation_tokens: int
     cache_read_tokens: int
     fast_mode_turns: int
+    # Epic #17 — Sub-Issue 2 (Decision 1): synthesis-layer session anchors.
+    # ``session_started_at`` is the first timestamp observed in the JSONL
+    # (across all entry types), and ``session_ended_at`` is the last. Both
+    # are ISO-8601 strings with tzinfo offset preserved from the source, or
+    # ``None`` when no timestamps were parsed (malformed or ancient session).
+    session_started_at: Optional[str] = None
+    session_ended_at: Optional[str] = None
 
 
 def _git_branch_from_dir(cwd: str) -> Optional[str]:
@@ -245,6 +252,19 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
     if len(timestamps) >= 2:
         duration = (timestamps[-1] - timestamps[0]).total_seconds()
 
+    # Session timestamp anchors for Phase-2 synthesis (Epic #17 Decision 1).
+    # We intentionally use ``timestamps`` unsorted — they're appended in file
+    # order, which is already wall-clock ascending. Even if they were not,
+    # taking min/max would be equivalent. Falling back to None when the file
+    # had no timestamped entries keeps the column NULL-able and matches the
+    # schema default set in db.py.
+    if timestamps:
+        session_started_at = timestamps[0].isoformat()
+        session_ended_at = timestamps[-1].isoformat()
+    else:
+        session_started_at = None
+        session_ended_at = None
+
     # Detect reprompts
     reprompt_count, bail_out = detect_reprompts(
         messages, threshold=threshold
@@ -268,6 +288,8 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
         cache_creation_tokens=cache_creation_tokens,
         cache_read_tokens=cache_read_tokens,
         fast_mode_turns=fast_mode_turns,
+        session_started_at=session_started_at,
+        session_ended_at=session_ended_at,
     )
 
 
