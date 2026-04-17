@@ -29,7 +29,7 @@ experiment loop generates recommendations).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, List
 
 
@@ -74,11 +74,10 @@ class FakeMessage:
     model: str = "fake-claude"
     role: str = "assistant"
     stop_reason: str = "end_turn"
-    usage: FakeUsage = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.usage is None:
-            self.usage = FakeUsage()
+    # ``default_factory`` gives each FakeMessage its own fresh FakeUsage
+    # instance — safer than a class-level default if callers ever mutate
+    # ``.usage`` fields (token counters) in place.
+    usage: FakeUsage = field(default_factory=FakeUsage)
 
 
 # ---------------------------------------------------------------------------

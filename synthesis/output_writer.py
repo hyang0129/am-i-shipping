@@ -97,13 +97,18 @@ def write_retrospective(
     except Exception:
         # Best-effort cleanup — we do not want to leave ``.tmp``
         # droppings that could confuse a later run into thinking it
-        # crashed. Swallow cleanup failures so the original exception
-        # is what propagates.
+        # crashed. Log (don't raise) cleanup failures so the original
+        # exception is what propagates, but a later operator can see
+        # that the tmp file may still be sitting on disk.
         try:
             if tmp_path.exists():
                 tmp_path.unlink()
-        except OSError:
-            pass
+        except OSError as cleanup_err:
+            logger.warning(
+                "Failed to clean up tmp file %s after write failure: %s",
+                tmp_path,
+                cleanup_err,
+            )
         raise
 
     logger.info("Wrote retrospective to %s", output_path)

@@ -278,5 +278,11 @@ class TestNoUnitsForWeek:
 class TestWaterFillBudgetConstant:
     def test_budget_is_512kb(self):
         # Pin the constant so a future refactor cannot silently shrink
-        # or grow the budget without a test diff.
-        assert TRANSCRIPT_BUDGET_BYTES == 524288
+        # or grow the budget without a test diff. The number comes from
+        # Epic #17 ADR Decision 4 ("cumulative transcript budget of
+        # 512 KB per synthesis run"); changing it requires an ADR
+        # update, not just a code change.
+        assert TRANSCRIPT_BUDGET_BYTES == 524288, (
+            "TRANSCRIPT_BUDGET_BYTES is pinned by Epic #17 ADR Decision 4 "
+            "(512 KB = 524288 bytes). Update the ADR before changing it."
+        )
