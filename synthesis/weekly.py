@@ -113,15 +113,19 @@ def water_fill_truncate(
     Example
     -------
     ``budget=10, contents=["aaaaa", "bbbbbbbbbbbbbbb"]`` → ``["aaaaa",
-    "bbbbb"]``. The small session's 5-byte saving does not move budget
-    to the large one because the large one exceeded its share anyway;
-    the net effect is the small one passed through, the large one took
-    a 5-byte haircut.
+    "bbbbb"]``. Two entries, initial share = 10 // 2 = 5. Small session
+    fits its share exactly (5 bytes ≤ share 5) and passes through
+    whole, consuming all 5 bytes of its slice. Remaining budget = 5,
+    remaining count = 1, so the large session's share = 5; it
+    truncates from 15 down to 5. Net: small unchanged, large takes a
+    10-byte haircut.
 
     ``budget=12, contents=["aaaaa", "bbbbbbbbbbbbbbb"]`` → ``["aaaaa",
     "bbbbbbb"]``. First pass gives each session share=6. The 5-byte
-    session consumes 5, leaving 7 for the large session. Large session
-    truncates to 7.
+    session consumes 5 (under its share of 6), leaving 7 for the large
+    session. Large session truncates to 7. This is where the "savings
+    cascade" actually shows up — the small session spent less than its
+    share, and the remainder flowed to the large one.
 
     ``budget=10, contents=["aaaaaaaa", "bbbbbbbbb"]`` → ``["aaaaa",
     "bbbbb"]``. Neither session fits its initial share=5; both
@@ -347,9 +351,15 @@ def _format_unit_block(unit: dict, transcript: str) -> str:
 
     Includes the metrics, flags, and (potentially truncated) transcript.
     Keeps the Markdown readable by an LLM — table-less, heading-heavy.
+
+    ``outlier_flags`` and ``abandonment_flag`` are NULLable in the
+    ``units`` schema (see cross_unit.py migration). We expect both keys
+    to be present — ``_load_units`` always populates them — so the
+    explicit ``is None`` check handles the NULL case only, not a
+    missing key (which would be a programming error elsewhere).
     """
-    flags = unit.get("outlier_flags") or "[]"
-    abandoned = unit.get("abandonment_flag")
+    flags = unit["outlier_flags"] if unit["outlier_flags"] is not None else "[]"
+    abandoned = unit["abandonment_flag"]
     abandoned_str = "yes" if abandoned == 1 else ("no" if abandoned == 0 else "n/a")
     lines = [
         f"### unit {unit['unit_id']}",
@@ -411,18 +421,24 @@ def _assemble_prompt(
 # ---------------------------------------------------------------------------
 
 
-def _get_client(config: SynthesisConfig):
-    """Return the client to use for the synthesis call.
+def _get_client(config: SynthesisConfig) -> Tuple[object, bool]:
+    """Return ``(client, is_live)`` for the synthesis call.
 
-    * ``AMIS_SYNTHESIS_LIVE`` unset / falsy → the offline fake.
-    * ``AMIS_SYNTHESIS_LIVE=1``              → the live Anthropic SDK.
+    * ``AMIS_SYNTHESIS_LIVE`` unset / falsy → ``(FakeAnthropicClient(), False)``.
+    * ``AMIS_SYNTHESIS_LIVE=1``              → ``(anthropic.Anthropic(...), True)``.
       Import is lazy so an unset ``anthropic`` install does not break
       offline runs. The ``ANTHROPIC_API_KEY`` env var (or whichever var
       ``config.anthropic_api_key_env`` names) must be set — the SDK
       picks it up via its usual env-var dance.
+
+    Returning the ``is_live`` flag alongside the client lets
+    :func:`_call_llm` pick the system-prompt shape (plain string vs.
+    list-of-blocks with ``cache_control``) without re-reading the env
+    var. The flag that drove client selection is also the flag that
+    drives the cache shape — they cannot drift.
     """
     if not os.environ.get("AMIS_SYNTHESIS_LIVE"):
-        return FakeAnthropicClient()
+        return FakeAnthropicClient(), False
 
     # Live path — lazy import so the anthropic dep is not required at
     # import time, only when actually called with AMIS_SYNTHESIS_LIVE=1.
@@ -434,19 +450,30 @@ def _get_client(config: SynthesisConfig):
             f"AMIS_SYNTHESIS_LIVE is set but {config.anthropic_api_key_env} "
             f"is empty — cannot call the Anthropic API"
         )
-    return anthropic.Anthropic(api_key=api_key)
+    return anthropic.Anthropic(api_key=api_key), True
 
 
-def _call_llm(client, config: SynthesisConfig, system_prompt: str, messages: list) -> str:
+def _call_llm(
+    client,
+    config: SynthesisConfig,
+    system_prompt: str,
+    messages: list,
+    is_live: bool,
+) -> str:
     """Dispatch the synthesis call and return the Markdown text.
 
-    When ``AMIS_SYNTHESIS_LIVE=1`` the system prompt is wrapped in a
+    When *is_live* is True, the system prompt is wrapped in a
     list-of-blocks shape with ``cache_control`` so the Anthropic API
     treats it as an ephemeral cache entry. The fake client accepts the
     same shape (ignores the caching hint) so the call site needs no
-    branching.
+    branching — but we still use the plain form offline so the offline
+    path never silently depends on the SDK's block parser.
+
+    *is_live* comes from :func:`_get_client` so the flag that drove
+    client selection is also the flag that drives the cache shape;
+    they cannot drift via an env var being toggled mid-run.
     """
-    if os.environ.get("AMIS_SYNTHESIS_LIVE"):
+    if is_live:
         # List-of-blocks form enables prompt caching on the static
         # context. See https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
         system_blocks = [
@@ -520,7 +547,18 @@ def run_synthesis(
     gh_path = Path(github_db)
     sess_path = Path(sessions_db)
     gh_conn = sqlite3.connect(str(gh_path))
-    sess_conn = gh_conn if sess_path == gh_path else sqlite3.connect(str(sess_path))
+    # Share the connection only when both paths resolve to the SAME file
+    # on disk. ``Path.__eq__`` is a string compare, which misses
+    # equivalent-but-non-normalised paths (e.g. ``a/b`` vs ``a/./b``).
+    # ``os.path.samefile`` follows symlinks and normalises, but requires
+    # both files to exist — we only call it after opening ``gh_conn``
+    # (which creates the file if missing) and fall back to string
+    # compare when samefile raises.
+    try:
+        _same = sess_path.exists() and os.path.samefile(str(gh_path), str(sess_path))
+    except OSError:
+        _same = str(gh_path) == str(sess_path)
+    sess_conn = gh_conn if _same else sqlite3.connect(str(sess_path))
 
     try:
         units = _load_units(gh_conn, week_start)
@@ -590,8 +628,8 @@ def run_synthesis(
             return dry_path
 
         # --- live / fake synthesis ------------------------------------
-        client = _get_client(config)
-        markdown = _call_llm(client, config, system_prompt, messages)
+        client, is_live = _get_client(config)
+        markdown = _call_llm(client, config, system_prompt, messages, is_live)
 
         return write_retrospective(markdown, config.output_dir, week_start)
 
