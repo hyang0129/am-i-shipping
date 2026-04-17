@@ -424,6 +424,16 @@ def _assert_schema(
             ).fetchall()
         }
         for table, expected_columns in expected.items():
+            # SQLite does not support parameter binding for DDL identifiers,
+            # so table name is f-string-interpolated into the PRAGMA below.
+            # Reject anything that isn't a plain identifier to keep that
+            # interpolation safe even if a future caller passes a
+            # non-source-controlled table name (CLI flag, config value, etc.).
+            if not table.isidentifier():
+                raise ValueError(
+                    f"Invalid table identifier passed to _assert_schema: "
+                    f"{table!r}"
+                )
             if table not in existing_tables:
                 raise RuntimeError(
                     f"Schema assertion failed for {db_path}: "
