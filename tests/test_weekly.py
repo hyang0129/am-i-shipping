@@ -14,7 +14,11 @@ import pytest
 
 from am_i_shipping.config_loader import SynthesisConfig
 from synthesis.weekly import (
+    MAX_PROMPT_BYTES,
+    MAX_UNITS_PER_PROMPT,
     TRANSCRIPT_BUDGET_BYTES,
+    _format_unit_block,
+    _load_units,
     run_synthesis,
     water_fill_truncate,
 )
@@ -446,6 +450,88 @@ class TestRunSynthesisHealthWiring:
             )
 
 
+# ---------------------------------------------------------------------------
+# Regression — Issue #51: root_node line must not double the namespace
+# ---------------------------------------------------------------------------
+# The golden fixture built by ``build_golden.py`` uses short fake node
+# IDs (e.g. ``n-u1-issue``) that would never surface this bug. Production
+# node IDs are already namespaced — ``session:<uuid>``, ``issue:<repo>#N``,
+# ``pr:<repo>#N``, ``commit:<sha>`` — so a naive ``{root_node_type}:{root_node_id}``
+# render emits ``session:session:<uuid>``. This test seeds a handcrafted
+# DB (pattern borrowed from ``test_cross_unit.py``) with real-shape node
+# IDs and asserts the rendered block never contains the doubled prefix.
+# Do NOT extend ``build_golden.py`` to cover this — that would couple the
+# bug's regression test to the expensive golden-snapshot pipeline.
+
+
+def test_format_unit_block_no_double_namespace(tmp_path: Path) -> None:
+    """``_format_unit_block`` must not emit ``<type>:<type>:<id>``.
+
+    Regression for issue #51. The formatter previously prefixed the
+    already-namespaced ``root_node_id`` with ``root_node_type:``, so a
+    unit rooted at ``session:<uuid>`` came out as ``session:session:<uuid>``
+    in the prompt. This test asserts the double-namespace pattern is
+    absent for every real-shape root node type (session / issue / pr /
+    commit) via a handcrafted inline DB — no reliance on the committed
+    ``golden.sqlite`` or ``expected_retrospective.md`` fixtures.
+    """
+    import re
+
+    from am_i_shipping.db import init_github_db
+
+    week_start = "2025-04-07"
+    # Production-shape, already-namespaced node IDs — each one would
+    # collide with its ``root_node_type`` if the formatter re-prefixed.
+    cases = [
+        ("unit-session", "session", "session:3f2a9e14-1b6d-4a0e-9a2c-1234567890ab"),
+        ("unit-issue",   "issue",   "issue:example/repo#201"),
+        ("unit-pr",      "pr",      "pr:example/repo#42"),
+        ("unit-commit",  "commit",  "commit:deadbeefcafef00d1234567890abcdef01234567"),
+    ]
+
+    db_path = tmp_path / "github.db"
+    init_github_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        for unit_id, node_type, node_id in cases:
+            conn.execute(
+                "INSERT INTO units "
+                "(week_start, unit_id, root_node_type, root_node_id, "
+                " elapsed_days, dark_time_pct, total_reprompts, "
+                " review_cycles, status, outlier_flags, abandonment_flag) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    week_start, unit_id, node_type, node_id,
+                    1.0, 0.0, 0, 0, "closed", "[]", 0,
+                ),
+            )
+        conn.commit()
+        units = _load_units(conn, week_start)
+    finally:
+        conn.close()
+
+    assert len(units) == len(cases), (
+        f"expected {len(cases)} units, got {len(units)}"
+    )
+
+    double_ns = re.compile(
+        r"(?:session|issue|pr|commit):(?:session|issue|pr|commit):"
+    )
+
+    for unit in units:
+        block = _format_unit_block(unit, transcript="")
+        assert double_ns.search(block) is None, (
+            f"double-namespace pattern leaked into block for unit "
+            f"{unit['unit_id']!r} (root_node_id={unit['root_node_id']!r}, "
+            f"root_node_type={unit['root_node_type']!r}):\n{block}"
+        )
+        # And the raw root_node_id must still appear verbatim — the fix
+        # drops the prefix, it does not drop the identifier itself.
+        assert unit["root_node_id"] in block, (
+            f"root_node_id {unit['root_node_id']!r} missing from block:\n{block}"
+        )
+
+
 class TestWaterFillBudgetConstant:
     def test_budget_is_512kb(self):
         # Pin the constant so a future refactor cannot silently shrink
@@ -457,3 +543,376 @@ class TestWaterFillBudgetConstant:
             "TRANSCRIPT_BUDGET_BYTES is pinned by Epic #17 ADR Decision 4 "
             "(512 KB = 524288 bytes). Update the ADR before changing it."
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #54 P-2 — unit cap + prompt-byte guard
+# ---------------------------------------------------------------------------
+# These tests nail down the safety rails that keep ``run_synthesis``
+# from silently shipping a 5-MB prompt when the week partition is
+# pathological (dev ``week_start='all'`` with thousands of units) or
+# when a single unit produces an oversized metadata block. The cap and
+# the guard are independent — the cap truncates the unit list BEFORE
+# assembly, the guard fails loudly AFTER assembly — so each gets its
+# own end-to-end test against a handcrafted DB.
+
+
+def _seed_unit_row(
+    conn: sqlite3.Connection,
+    *,
+    week_start: str,
+    unit_id: str,
+    root_node_type: str = "session",
+    root_node_id: str = "",
+    elapsed_days: float = 1.0,
+    dark_time_pct: float = 0.0,
+    total_reprompts: int = 0,
+    review_cycles: int = 0,
+    status: str = "closed",
+    outlier_flags: str = "[]",
+    abandonment_flag: int = 0,
+) -> None:
+    """Insert one ``units`` row with test-friendly defaults.
+
+    Mirrors the helper pattern in ``test_cross_unit.py`` / the inline
+    INSERT in ``test_format_unit_block_no_double_namespace`` so the new
+    tests do not drag in the full ``build_golden`` pipeline just to
+    exercise the cap / guard.
+    """
+    if not root_node_id:
+        root_node_id = f"n-{unit_id}"
+    conn.execute(
+        "INSERT INTO units "
+        "(week_start, unit_id, root_node_type, root_node_id, "
+        " elapsed_days, dark_time_pct, total_reprompts, "
+        " review_cycles, status, outlier_flags, abandonment_flag) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            week_start,
+            unit_id,
+            root_node_type,
+            root_node_id,
+            elapsed_days,
+            dark_time_pct,
+            total_reprompts,
+            review_cycles,
+            status,
+            outlier_flags,
+            abandonment_flag,
+        ),
+    )
+
+
+def test_unit_cap_truncates_and_warns(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """150 units → WARNING logged and only MAX_UNITS_PER_PROMPT survive.
+
+    Seeds a handcrafted DB with 150 units under a single week_start,
+    runs ``run_synthesis`` in dry-run mode (so we can inspect the
+    assembled prompt without a network call), and asserts:
+
+    1. A WARNING log line is emitted naming both the before (150) and
+       after (MAX_UNITS_PER_PROMPT=100) counts.
+    2. The assembled prompt reports ``Total units this week: 100`` — the
+       prompt body encodes the post-cap count, so this is the cleanest
+       end-to-end check that the cap took effect.
+    3. Exactly ``MAX_UNITS_PER_PROMPT`` ``### unit `` headings appear in
+       the assembled prompt — double-locks the count via the per-unit
+       block renderer.
+    """
+    from am_i_shipping.db import init_github_db
+
+    week_start = "2025-04-14"
+    total_units = 150
+    assert total_units > MAX_UNITS_PER_PROMPT, (
+        "test precondition: seed size must exceed the cap"
+    )
+
+    db_path = tmp_path / "github.db"
+    init_github_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        # Seed a mix of abandoned / outlier / plain units so the sort
+        # key has something to rank against. The cap must still land on
+        # exactly MAX_UNITS_PER_PROMPT regardless of the priority mix.
+        for i in range(total_units):
+            flags = "[\"elapsed_days\"]" if i % 7 == 0 else "[]"
+            abandoned = 1 if i % 11 == 0 else 0
+            _seed_unit_row(
+                conn,
+                week_start=week_start,
+                unit_id=f"unit-{i:04d}",
+                elapsed_days=float(i % 30),
+                outlier_flags=flags,
+                abandonment_flag=abandoned,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = tmp_path / "retrospectives"
+    cfg = _make_config(tmp_path, out)
+
+    caplog.set_level("WARNING", logger="synthesis.weekly")
+
+    # Dry-run keeps us off the LLM and gives us the assembled prompt on
+    # disk — cleanest surface to assert on without reaching into
+    # private helpers.
+    result = run_synthesis(cfg, db_path, db_path, week_start, dry_run=True)
+    assert result is not None, "dry-run must produce a prompt artefact"
+
+    # 1. WARNING emitted naming the before/after counts.
+    warnings = [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and r.name == "synthesis.weekly"
+    ]
+    assert warnings, "expected at least one WARNING log from the unit cap"
+    msg_blob = " ".join(r.getMessage() for r in warnings)
+    assert str(total_units) in msg_blob, (
+        f"warning must mention the before-count {total_units}: {msg_blob!r}"
+    )
+    assert str(MAX_UNITS_PER_PROMPT) in msg_blob, (
+        f"warning must mention the after-count {MAX_UNITS_PER_PROMPT}: "
+        f"{msg_blob!r}"
+    )
+
+    # 2. Prompt body encodes the post-cap count.
+    prompt_text = result.read_text(encoding="utf-8")
+    assert f"Total units this week: {MAX_UNITS_PER_PROMPT}" in prompt_text, (
+        "assembled prompt did not report the capped unit count"
+    )
+
+    # 3. Exactly MAX_UNITS_PER_PROMPT per-unit blocks rendered.
+    rendered_unit_blocks = prompt_text.count("### unit ")
+    assert rendered_unit_blocks == MAX_UNITS_PER_PROMPT, (
+        f"expected {MAX_UNITS_PER_PROMPT} unit blocks in the assembled "
+        f"prompt, got {rendered_unit_blocks}"
+    )
+
+
+def test_prompt_byte_guard_raises(tmp_path: Path) -> None:
+    """An oversized unit block pushes the prompt past MAX_PROMPT_BYTES → RuntimeError.
+
+    Strategy: inject a single unit whose ``outlier_flags`` field is a
+    JSON string large enough that rendering its block alone exceeds
+    ``MAX_PROMPT_BYTES``. ``_format_unit_block`` embeds
+    ``outlier_flags`` verbatim, so a multi-megabyte JSON string flows
+    straight into the assembled prompt. This avoids any dependence on
+    session transcripts (which water-fill would truncate) and exercises
+    the guard against oversized *metadata*, which is the actual gap
+    the guard exists to close.
+
+    The guard MUST fire before any network call and before the dry-run
+    artefact is written. We exercise the dry-run path here because it
+    hits the guard without needing a live SDK stub — the guard is
+    shared across both paths.
+    """
+    from am_i_shipping.db import init_github_db
+
+    week_start = "2025-04-14"
+
+    db_path = tmp_path / "github.db"
+    init_github_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        # Build an ``outlier_flags`` payload that alone exceeds the
+        # byte ceiling. 2 * MAX_PROMPT_BYTES is comfortably over the
+        # limit even accounting for the static system prompt savings.
+        bloated_flags = "[" + ("\"x\"," * (2 * MAX_PROMPT_BYTES // 4)) + "\"x\"]"
+        assert len(bloated_flags) > MAX_PROMPT_BYTES, (
+            "test precondition: bloated_flags must itself exceed the cap"
+        )
+        _seed_unit_row(
+            conn,
+            week_start=week_start,
+            unit_id="unit-bloat",
+            outlier_flags=bloated_flags,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = tmp_path / "retrospectives"
+    cfg = _make_config(tmp_path, out)
+
+    with pytest.raises(RuntimeError, match="MAX_PROMPT_BYTES"):
+        run_synthesis(cfg, db_path, db_path, week_start, dry_run=True)
+
+    # And the dry-run artefact must NOT have been written — the guard
+    # runs before the write.
+    dry_path = out / ".dry-run" / f"{week_start}.prompt.txt"
+    assert not dry_path.exists(), (
+        "prompt-byte guard must fire before the dry-run artefact is written"
+    )
+
+
+def test_prompt_byte_guard_blocks_live_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The byte-guard must also fire BEFORE the LLM call on ``dry_run=False``.
+
+    ``test_prompt_byte_guard_raises`` above only exercises the dry-run
+    branch. The guard's contract (documented in the module comment and
+    the PR description) is "no network call, no dry-run write" — so we
+    also need a live-path assertion. We install a spy as
+    ``synthesis.weekly._call_llm`` that raises ``AssertionError`` if
+    ever invoked, then call ``run_synthesis(..., dry_run=False)`` with
+    the same oversized seed. A ``RuntimeError`` from the guard is the
+    only acceptable outcome; if the spy is touched the guard landed
+    *below* the LLM dispatch (regression) and the test fails loudly.
+    """
+    from am_i_shipping.db import init_github_db
+    import synthesis.weekly as weekly_module
+
+    week_start = "2025-04-14"
+    db_path = tmp_path / "github.db"
+    init_github_db(db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        bloated_flags = "[" + ("\"x\"," * (2 * MAX_PROMPT_BYTES // 4)) + "\"x\"]"
+        assert len(bloated_flags) > MAX_PROMPT_BYTES
+        _seed_unit_row(
+            conn,
+            week_start=week_start,
+            unit_id="unit-bloat-live",
+            outlier_flags=bloated_flags,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Spy: if _call_llm runs, the guard regressed.
+    def _forbidden_call_llm(*args, **kwargs) -> str:
+        raise AssertionError(
+            "_call_llm must not be invoked when the prompt-byte guard "
+            "should have fired — the guard regressed below the LLM "
+            "dispatch"
+        )
+
+    monkeypatch.setattr(weekly_module, "_call_llm", _forbidden_call_llm)
+
+    out = tmp_path / "retrospectives"
+    cfg = _make_config(tmp_path, out)
+
+    with pytest.raises(RuntimeError, match="MAX_PROMPT_BYTES"):
+        run_synthesis(cfg, db_path, db_path, week_start, dry_run=False)
+
+    # No retrospective file should have been written either — the guard
+    # sits above ``write_retrospective`` just as it sits above the
+    # dry-run write.
+    assert not (out / f"{week_start}.md").exists(), (
+        "live-path guard regression: retrospective was written despite "
+        "an oversized prompt"
+    )
+
+
+def test_unit_cap_preserves_priority_order(
+    tmp_path: Path,
+) -> None:
+    """The 100 units that survive truncation must be the highest-priority ones.
+
+    ``test_unit_cap_truncates_and_warns`` asserts the *count* is 100.
+    This test asserts the *identity* of the survivors — that the
+    documented priority (abandonment_flag=1 > non-empty outlier_flags >
+    elapsed_days desc > unit_id asc) actually drives the truncation.
+    A regression that dropped a ``-`` from ``_priority_key`` (sorting
+    abandoned units to the BOTTOM instead of the top) would still pass
+    the count assertion; this test fails loudly on that bug.
+
+    Seeding strategy:
+      * 5 guaranteed survivors: ``unit-A-00..04`` with abandonment_flag=1.
+      * 5 more guaranteed survivors: ``unit-B-00..04`` with non-empty
+        outlier_flags (and abandonment=0).
+      * 120 filler units: ``unit-Z-000..119`` with both flags clear.
+        Only 90 of these can fit (100 cap − 10 already spoken for).
+        The 30 extras must be dropped.
+    After the cap:
+      * Every A-unit must be present (top priority).
+      * Every B-unit must be present (second priority).
+      * At least one Z-unit must be absent (proof the cap actually
+        discarded low-priority units rather than high-priority ones).
+    """
+    from am_i_shipping.db import init_github_db
+
+    week_start = "2025-04-14"
+    db_path = tmp_path / "github.db"
+    init_github_db(db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        # 5 abandoned (guaranteed top-priority survivors)
+        for i in range(5):
+            _seed_unit_row(
+                conn,
+                week_start=week_start,
+                unit_id=f"unit-A-{i:02d}",
+                abandonment_flag=1,
+                outlier_flags="[]",
+                elapsed_days=0.0,
+            )
+        # 5 outlier-flagged (guaranteed second-priority survivors)
+        for i in range(5):
+            _seed_unit_row(
+                conn,
+                week_start=week_start,
+                unit_id=f"unit-B-{i:02d}",
+                abandonment_flag=0,
+                outlier_flags="[\"elapsed_days\"]",
+                elapsed_days=0.0,
+            )
+        # 120 filler units (flags all clear — lowest priority)
+        for i in range(120):
+            _seed_unit_row(
+                conn,
+                week_start=week_start,
+                unit_id=f"unit-Z-{i:03d}",
+                abandonment_flag=0,
+                outlier_flags="[]",
+                elapsed_days=0.0,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = tmp_path / "retrospectives"
+    cfg = _make_config(tmp_path, out)
+
+    result = run_synthesis(cfg, db_path, db_path, week_start, dry_run=True)
+    assert result is not None
+    prompt_text = result.read_text(encoding="utf-8")
+
+    # Every abandonment-flagged unit must survive.
+    for i in range(5):
+        uid = f"unit-A-{i:02d}"
+        assert f"### unit {uid}" in prompt_text, (
+            f"top-priority (abandoned) unit {uid} was dropped — "
+            "priority ordering regressed"
+        )
+    # Every outlier-flagged unit must survive.
+    for i in range(5):
+        uid = f"unit-B-{i:02d}"
+        assert f"### unit {uid}" in prompt_text, (
+            f"second-priority (outlier) unit {uid} was dropped — "
+            "priority ordering regressed"
+        )
+    # At least 20 low-priority fillers must be absent — proof that the
+    # cap discarded the right tail of the priority order. We assert the
+    # loose bound (>=20) rather than the tight expectation (==30,
+    # because 120 filler - 90 surviving slots = 30 dropped) so future
+    # tweaks to the tie-break (e.g. a secondary sort field) do not
+    # require updating this test. The tight expectation is that
+    # exactly 30 filler units drop; anything looser than 20 means the
+    # cap is not doing its job.
+    missing_z = [
+        i for i in range(120)
+        if f"### unit unit-Z-{i:03d}" not in prompt_text
+    ]
+    assert len(missing_z) >= 20, (
+        f"expected >=20 filler units to be dropped under the 100-unit "
+        f"cap (120 filler + 10 priority = 130 total, cap=100), got "
+        f"{len(missing_z)} dropped — the cap may not be engaging"
+    )
