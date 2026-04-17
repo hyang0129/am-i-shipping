@@ -77,6 +77,24 @@ run_collector "GitHub Poller"  -m collector.github_poller.run
 # PR-48 review-fix cycle.
 if [ "$(date +%u)" = "7" ] || [ "${AMIS_FORCE_SYNTHESIS:-0}" = "1" ]; then
     WEEK_START="$(date -d 'last sunday' +%Y-%m-%d 2>/dev/null || date -v-sun +%Y-%m-%d)"
+
+    # am-prepare-week orchestrates build_graph -> identify_units ->
+    # compute_flags so that am-synthesize below has a populated units
+    # table to read. It shares the same non-fatal semantics as
+    # am-synthesize: prepare failures log a WARNING but do NOT flip
+    # FAIL_COUNT, because the prepare stage can legitimately be a no-op
+    # (empty DB, no graph data for the week) and the scheduler's red/green
+    # signal must still reflect only the daily collectors. See Issue #52
+    # (P-1 of Epic #50) for why this step exists at all.
+    log "--- Starting: Weekly Prepare (week=$WEEK_START) ---"
+    if am-prepare-week --week "$WEEK_START" "${CONFIG_ARG[@]}" >> "$LOG_FILE" 2>&1; then
+        log "OK: Weekly Prepare completed successfully"
+    else
+        rc=$?
+        log "WARNING: Weekly Prepare exited with code $rc (not counted as a failure)"
+    fi
+    log "--- Finished: Weekly Prepare ---"
+
     log "--- Starting: Weekly Synthesis (week=$WEEK_START) ---"
     if am-synthesize --week "$WEEK_START" "${CONFIG_ARG[@]}" >> "$LOG_FILE" 2>&1; then
         log "OK: Weekly Synthesis completed successfully"

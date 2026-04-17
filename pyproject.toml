@@ -21,6 +21,7 @@ am-session-parser = "collector.session_parser:main"
 am-github-poller = "collector.github_poller.run:main"
 am-appswitch-export = "collector.appswitch.export:main"
 am-synthesize = "synthesis.cli:main"
+am-prepare-week = "synthesis.prepare:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
