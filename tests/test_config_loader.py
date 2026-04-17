@@ -202,3 +202,39 @@ class TestSynthesisConfig:
         })
         with pytest.raises(ConfigError, match="week_start"):
             load_config(cfg_path)
+
+    def test_synthesis_config_outlier_sigma_override(self, tmp_path):
+        """Solo override of `outlier_sigma` exercises the float-cast branch
+        without bundling other field changes."""
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+            "synthesis": {"outlier_sigma": 3.5},
+        })
+        cfg = load_config(cfg_path)
+        assert cfg.synthesis.outlier_sigma == 3.5
+        # Other fields remain at defaults.
+        assert cfg.synthesis.abandonment_days == 14
+        assert cfg.synthesis.model == "claude-sonnet-4-5"
+
+    def test_synthesis_config_model_override(self, tmp_path):
+        """Solo override of `model` exercises the str-cast branch in isolation."""
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+            "synthesis": {"model": "claude-opus-4-7"},
+        })
+        cfg = load_config(cfg_path)
+        assert cfg.synthesis.model == "claude-opus-4-7"
+        assert cfg.synthesis.output_dir == "retrospectives"
+
+    def test_synthesis_config_output_dir_override(self, tmp_path):
+        """Solo override of `output_dir` exercises that branch in isolation."""
+        cfg_path = _write_config(tmp_path, {
+            "session": {"projects_path": "/path"},
+            "github": {"repos": ["a/b"]},
+            "synthesis": {"output_dir": "weekly-retros"},
+        })
+        cfg = load_config(cfg_path)
+        assert cfg.synthesis.output_dir == "weekly-retros"
+        assert cfg.synthesis.model == "claude-sonnet-4-5"
