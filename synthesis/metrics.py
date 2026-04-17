@@ -42,14 +42,24 @@ from typing import Iterable, Optional
 # ---------------------------------------------------------------------------
 
 
-def _parse_ts(value: Optional[str]) -> Optional[datetime]:
+def parse_ts(value: Optional[str]) -> Optional[datetime]:
     """Parse an ISO-8601 string into a naive UTC ``datetime``.
 
     The collectors store timestamps in ``YYYY-MM-DDTHH:MM:SSZ`` form. We
     accept any ``fromisoformat``-compatible variant and drop the ``Z``
     suffix, because ``datetime.fromisoformat`` on Python 3.10 cannot
-    parse it. Returns ``None`` for falsy / unparseable input so callers
-    can skip missing values uniformly.
+    parse it. We also tolerate offset-suffixed inputs such as
+    ``+00:00`` / ``+HH:MM`` (occasionally emitted by some GitHub REST
+    endpoints) by stripping the tzinfo after parsing — the rest of this
+    module assumes *naive UTC*, so mixing aware/naive datetimes in
+    subtraction would raise ``TypeError``.
+
+    Returns ``None`` for falsy / unparseable input so callers can skip
+    missing values uniformly.
+
+    Public (``parse_ts``) because ``synthesis.unit_identifier`` needs the
+    same parsing rules for its status-derivation logic. Keeping a single
+    implementation avoids drift between the two modules.
     """
     if not value:
         return None
@@ -57,9 +67,21 @@ def _parse_ts(value: Optional[str]) -> Optional[datetime]:
     if s.endswith("Z"):
         s = s[:-1]
     try:
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
     except ValueError:
         return None
+    # Drop tzinfo if present so callers can subtract against naive
+    # ``datetime`` values (e.g. ``datetime.utcnow()``) without raising.
+    if dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt
+
+
+# Backwards-compatible private alias — internal callers within this
+# module continue to use ``_parse_ts`` so the original module-local
+# style is preserved even as the function gains a public name for
+# cross-module use.
+_parse_ts = parse_ts
 
 
 # ---------------------------------------------------------------------------

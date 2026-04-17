@@ -268,7 +268,7 @@ def _summarise_unit(
         for created, merged, updated in pr_rows:
             if merged:
                 continue
-            latest = metrics._parse_ts(updated) or metrics._parse_ts(created)
+            latest = metrics.parse_ts(updated) or metrics.parse_ts(created)
             if latest is None:
                 continue
             if now - latest <= timedelta(days=abandonment_days):
@@ -284,7 +284,7 @@ def _summarise_unit(
         # as "abandoned" — they just completed).
         last_activity: Optional[datetime] = None
         for ts in all_timestamps:
-            parsed = metrics._parse_ts(ts)
+            parsed = metrics.parse_ts(ts)
             if parsed is None:
                 continue
             if last_activity is None or parsed > last_activity:
