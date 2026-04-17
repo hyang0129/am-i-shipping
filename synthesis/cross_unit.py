@@ -79,68 +79,32 @@ def _median_and_stdev(values: list[float]) -> tuple[float, float]:
 
 
 def _latest_node_ts(
-    github_conn: sqlite3.Connection,
-    week_start: str,
-    unit_id: str,
+    root_id: Optional[str],
+    nodes: dict[str, Optional[str]],
+    adj: dict[str, set[str]],
 ) -> Optional[datetime]:
-    """Return the latest ``graph_nodes.created_at`` for *unit_id*.
+    """Return the latest ``graph_nodes.created_at`` reachable from *root_id*.
 
-    The mapping from unit to nodes is reconstructed via the usual
-    identifier path: the component is the connected set of nodes
-    referenced by ``graph_edges`` for the week, plus any singletons that
-    hash into the same ``unit_id``. Reproducing union-find here would
-    duplicate logic from :mod:`synthesis.unit_identifier`; instead we
-    pull every node that appears in *any* edge whose other endpoint
-    resolves into this unit, starting from the unit's ``root_node_id``
-    and expanding. For fixtures (and real data) where singletons map
-    1:1 to units, the root_node_id alone is sufficient.
+    Walks every node reachable from the unit's ``root_node_id`` via
+    ``graph_edges`` within the week (BFS over the adjacency map), parses
+    each reachable node's ``created_at`` via :func:`metrics.parse_ts`,
+    and returns the latest naive-UTC ``datetime`` found.
 
-    The query is simpler than a full component walk because the only
-    decision the abandonment flag cares about is "does ANY node of this
-    unit have a recent timestamp?" — a single row with a recent
-    ``created_at`` short-circuits the answer.
+    Returns ``None`` when ``root_id`` is falsy, is not present in
+    *nodes* (orphaned unit), or no reachable node has a parseable
+    timestamp. Callers treat ``None`` as "abandoned".
+
+    Pure function — no DB access. The caller hoists the
+    ``graph_nodes`` / ``graph_edges`` reads out of the per-unit loop in
+    :func:`compute_flags` and passes *nodes* + *adj* in so one scan
+    serves every unit for the week (F-1-1). ``nodes`` maps
+    ``node_id -> created_at_text``; ``adj`` is an undirected adjacency
+    ``node_id -> set[node_id]``.
     """
-    # Pull every node for the week and every edge for the week; reuse
-    # the small-scale graph in memory. Units rarely number in the
-    # thousands per week, so the scan cost is negligible.
-    nodes = {
-        nid: created_at
-        for nid, created_at in github_conn.execute(
-            "SELECT node_id, created_at FROM graph_nodes "
-            "WHERE week_start = ?",
-            (week_start,),
-        ).fetchall()
-    }
-    if not nodes:
+    if not root_id or root_id not in nodes:
         return None
 
-    edges = github_conn.execute(
-        "SELECT src_node_id, dst_node_id FROM graph_edges "
-        "WHERE week_start = ?",
-        (week_start,),
-    ).fetchall()
-
-    # Build an adjacency map then BFS from the unit's root node. We
-    # look up the unit's root via the ``units`` row because
-    # ``unit_id`` is a hash of the sorted node list — not directly
-    # invertible.
-    root_row = github_conn.execute(
-        "SELECT root_node_id FROM units "
-        "WHERE week_start = ? AND unit_id = ?",
-        (week_start, unit_id),
-    ).fetchone()
-    if not root_row or not root_row[0]:
-        return None
-    root_id = root_row[0]
-    if root_id not in nodes:
-        return None
-
-    adj: dict[str, set[str]] = {}
-    for src, dst in edges:
-        adj.setdefault(src, set()).add(dst)
-        adj.setdefault(dst, set()).add(src)
-
-    # BFS over the component.
+    # BFS over the component starting from the unit's root node.
     seen = {root_id}
     stack = [root_id]
     while stack:
@@ -216,9 +180,13 @@ def compute_flags(
 
     conn = sqlite3.connect(str(github_db_path))
     try:
+        # Pull the per-unit metrics AND the root_node_id in one scan.
+        # Historically ``root_node_id`` was re-queried per unit inside
+        # ``_latest_node_ts``; hoisting it into this single SELECT removes
+        # an N+1 round trip against the ``units`` table.
         rows = conn.execute(
             "SELECT unit_id, elapsed_days, dark_time_pct, "
-            "       total_reprompts, review_cycles "
+            "       total_reprompts, review_cycles, root_node_id "
             "FROM units WHERE week_start = ?",
             (week_start,),
         ).fetchall()
@@ -226,6 +194,28 @@ def compute_flags(
         if not rows:
             # No units to evaluate — nothing to do, not an error.
             return 0
+
+        # --- shared graph_nodes / graph_edges scan (F-1-1) -----------
+        # These queries return the same data for every unit in the
+        # week, so we execute them once and pass the materialised dicts
+        # into ``_latest_node_ts`` below. Previously the per-unit loop
+        # re-queried them, producing O(N) redundant DB round trips.
+        nodes: dict[str, Optional[str]] = {
+            nid: created_at
+            for nid, created_at in conn.execute(
+                "SELECT node_id, created_at FROM graph_nodes "
+                "WHERE week_start = ?",
+                (week_start,),
+            ).fetchall()
+        }
+        adj: dict[str, set[str]] = {}
+        for src, dst in conn.execute(
+            "SELECT src_node_id, dst_node_id FROM graph_edges "
+            "WHERE week_start = ?",
+            (week_start,),
+        ).fetchall():
+            adj.setdefault(src, set()).add(dst)
+            adj.setdefault(dst, set()).add(src)
 
         # --- per-metric thresholds -----------------------------------
         # Build one list per metric, dropping NULLs. Thresholds are
@@ -261,6 +251,7 @@ def compute_flags(
         updated = 0
         for row in rows:
             unit_id = row[0]
+            root_node_id = row[5]
 
             # Outlier flags: list of metric names that breach the cutoff.
             flagged: list[str] = []
@@ -281,7 +272,7 @@ def compute_flags(
             outlier_flags_json = json.dumps(flagged)
 
             # Abandonment flag: 1 if no node event within cutoff.
-            latest = _latest_node_ts(conn, week_start, unit_id)
+            latest = _latest_node_ts(root_node_id, nodes, adj)
             if latest is None or latest < cutoff:
                 abandonment_flag = 1
             else:
