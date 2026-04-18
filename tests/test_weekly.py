@@ -833,15 +833,17 @@ def test_prompt_byte_guard_blocks_live_path(
     finally:
         conn.close()
 
-    # Spy: if _call_llm runs, the guard regressed.
-    def _forbidden_call_llm(*args, **kwargs) -> str:
-        raise AssertionError(
-            "_call_llm must not be invoked when the prompt-byte guard "
-            "should have fired — the guard regressed below the LLM "
-            "dispatch"
-        )
+    # Spy: if the adapter is reached, the guard regressed.
+    import synthesis.llm_adapter as llm_adapter_module
 
-    monkeypatch.setattr(weekly_module, "_call_llm", _forbidden_call_llm)
+    class _ForbiddenAdapter:
+        def call(self, *args, **kwargs):
+            raise AssertionError(
+                "_get_adapter().call() must not be invoked when the prompt-byte "
+                "guard should have fired — the guard regressed below the LLM dispatch"
+            )
+
+    monkeypatch.setattr(llm_adapter_module, "_get_adapter", lambda _config: _ForbiddenAdapter())
 
     out = tmp_path / "retrospectives"
     cfg = _make_config(tmp_path, out)

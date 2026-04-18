@@ -47,7 +47,7 @@ from typing import List, Optional, Tuple, Union
 
 from am_i_shipping.config_loader import SynthesisConfig
 from am_i_shipping.health_writer import write_health
-from synthesis.fake_client import FakeAnthropicClient
+from synthesis.llm_adapter import _get_adapter
 from synthesis.output_writer import write_retrospective
 from synthesis.unit_timeline import render_timeline
 
@@ -462,88 +462,8 @@ def _assemble_prompt(
 
 
 # ---------------------------------------------------------------------------
-# Client selection
+# Client selection — see synthesis.llm_adapter._get_adapter
 # ---------------------------------------------------------------------------
-
-
-def _get_client(config: SynthesisConfig) -> Tuple[object, bool]:
-    """Return ``(client, is_live)`` for the synthesis call.
-
-    * ``AMIS_SYNTHESIS_LIVE`` unset / falsy → ``(FakeAnthropicClient(), False)``.
-    * ``AMIS_SYNTHESIS_LIVE=1``              → ``(anthropic.Anthropic(...), True)``.
-      Import is lazy so an unset ``anthropic`` install does not break
-      offline runs. The ``ANTHROPIC_API_KEY`` env var (or whichever var
-      ``config.anthropic_api_key_env`` names) must be set — the SDK
-      picks it up via its usual env-var dance.
-
-    Returning the ``is_live`` flag alongside the client lets
-    :func:`_call_llm` pick the system-prompt shape (plain string vs.
-    list-of-blocks with ``cache_control``) without re-reading the env
-    var. The flag that drove client selection is also the flag that
-    drives the cache shape — they cannot drift.
-    """
-    if not os.environ.get("AMIS_SYNTHESIS_LIVE"):
-        return FakeAnthropicClient(), False
-
-    # Live path — lazy import so the anthropic dep is not required at
-    # import time, only when actually called with AMIS_SYNTHESIS_LIVE=1.
-    import anthropic  # noqa: WPS433 — deliberate lazy import
-
-    api_key = os.environ.get(config.anthropic_api_key_env)
-    if not api_key:
-        raise RuntimeError(
-            f"AMIS_SYNTHESIS_LIVE is set but {config.anthropic_api_key_env} "
-            f"is empty — cannot call the Anthropic API"
-        )
-    return anthropic.Anthropic(api_key=api_key), True
-
-
-def _call_llm(
-    client,
-    config: SynthesisConfig,
-    system_prompt: str,
-    messages: list,
-    is_live: bool,
-) -> str:
-    """Dispatch the synthesis call and return the Markdown text.
-
-    When *is_live* is True, the system prompt is wrapped in a
-    list-of-blocks shape with ``cache_control`` so the Anthropic API
-    treats it as an ephemeral cache entry. The fake client accepts the
-    same shape (ignores the caching hint) so the call site needs no
-    branching — but we still use the plain form offline so the offline
-    path never silently depends on the SDK's block parser.
-
-    *is_live* comes from :func:`_get_client` so the flag that drove
-    client selection is also the flag that drives the cache shape;
-    they cannot drift via an env var being toggled mid-run.
-    """
-    if is_live:
-        # List-of-blocks form enables prompt caching on the static
-        # context. See https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
-        system_blocks = [
-            {
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ]
-    else:
-        # Fake client accepts either a plain string or the blocks form.
-        # We use the plain form offline so the offline path never
-        # silently depends on the SDK's block parser.
-        system_blocks = system_prompt
-
-    resp = client.messages.create(
-        model=config.model,
-        max_tokens=_MAX_OUTPUT_TOKENS,
-        system=system_blocks,
-        messages=messages,
-    )
-    # Both the real SDK's Message and our FakeMessage expose
-    # ``content[0].text`` for a single-block text response, which is
-    # what a non-tool-use synthesis call returns.
-    return resp.content[0].text
 
 
 # ---------------------------------------------------------------------------
@@ -765,8 +685,8 @@ def run_synthesis(
             return dry_path
 
         # --- live / fake synthesis ------------------------------------
-        client, is_live = _get_client(config)
-        markdown = _call_llm(client, config, system_prompt, messages, is_live)
+        user_content = messages[0]["content"]
+        markdown = _get_adapter(config).call(system_prompt, user_content, config.model, _MAX_OUTPUT_TOKENS).text
 
         result = write_retrospective(markdown, config.output_dir, week_start)
 

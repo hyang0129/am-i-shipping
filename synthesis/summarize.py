@@ -35,8 +35,8 @@ from typing import List, Optional, Sequence, Tuple
 
 from am_i_shipping.config_loader import SynthesisConfig, load_config
 from am_i_shipping.db import init_github_db
-from synthesis.fake_client import FakeAnthropicClient
-from synthesis.weekly import _get_client, _load_session_transcripts, _unit_nodes
+from synthesis.llm_adapter import _get_adapter
+from synthesis.weekly import _load_session_transcripts, _unit_nodes
 
 
 logger = logging.getLogger(__name__)
@@ -218,35 +218,17 @@ def _build_unit_input(
 
 
 def _summarize_unit(
-    client,
     config: SynthesisConfig,
     unit_input: str,
-    is_live: bool,
 ) -> str:
-    """Call the LLM to produce a prose narrative for one unit.
-
-    Mirrors :func:`synthesis.weekly._call_llm` — the system prompt is
-    wrapped in ``cache_control: ephemeral`` blocks in live mode; the
-    plain-string form is used offline.
-    """
-    if is_live:
-        system = [
-            {
-                "type": "text",
-                "text": _SUMMARY_SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ]
-    else:
-        system = _SUMMARY_SYSTEM_PROMPT
-
-    resp = client.messages.create(
-        model=config.summary_model,
-        max_tokens=_MAX_OUTPUT_TOKENS,
-        system=system,
-        messages=[{"role": "user", "content": unit_input}],
+    """Call the LLM to produce a prose narrative for one unit."""
+    result = _get_adapter(config).call(
+        _SUMMARY_SYSTEM_PROMPT,
+        unit_input,
+        config.summary_model,
+        _MAX_OUTPUT_TOKENS,
     )
-    return resp.content[0].text
+    return result.text
 
 
 def _store_summary(
@@ -303,7 +285,6 @@ def run_summarization(
     # init_github_db is idempotent (CREATE TABLE IF NOT EXISTS).
     init_github_db(github_db)
 
-    client, is_live = _get_client(config)
 
     sessions_conn = None
     gh_conn = sqlite3.connect(github_db)
@@ -333,7 +314,7 @@ def run_summarization(
                     gh_conn, sessions_conn, unit_id, week_start
                 )
                 try:
-                    summary_text = _summarize_unit(client, config, unit_input, is_live)
+                    summary_text = _summarize_unit(config, unit_input)
                 except Exception as exc:
                     logger.warning(
                         "Failed to summarize unit %s: %s — skipping", unit_id, exc

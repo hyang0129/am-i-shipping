@@ -238,9 +238,9 @@ def test_skip_when_summary_exists(tmp_path: Path):
     call_count = [0]
     real_summarize_unit = summarize_module._summarize_unit
 
-    def _counting_summarize(client, config, unit_input, is_live):
+    def _counting_summarize(config, unit_input):
         call_count[0] += 1
-        return real_summarize_unit(client, config, unit_input, is_live)
+        return real_summarize_unit(config, unit_input)
 
     with mock.patch.object(summarize_module, "_summarize_unit", side_effect=_counting_summarize):
         result = _run(github_db, sessions_db)
@@ -279,9 +279,9 @@ def test_rebuild_summaries_wipes_and_regenerates(tmp_path: Path):
     call_count = [0]
     real_summarize_unit = summarize_module._summarize_unit
 
-    def _counting_summarize(client, config, unit_input, is_live):
+    def _counting_summarize(config, unit_input):
         call_count[0] += 1
-        return real_summarize_unit(client, config, unit_input, is_live)
+        return real_summarize_unit(config, unit_input)
 
     with mock.patch.object(summarize_module, "_summarize_unit", side_effect=_counting_summarize):
         result = _run(github_db, sessions_db, rebuild=True)
@@ -322,16 +322,25 @@ def test_uses_summary_model_config(tmp_path: Path):
     captured_models: list[str] = []
     real_summarize = summarize_module._summarize_unit
 
-    def _capturing_summarize(client, config, unit_input, is_live):
-        # Wrap client.messages.create to record the model kwarg.
-        original_create = client.messages.create
+    def _capturing_summarize(config, unit_input):
+        # Patch _get_adapter on the summarize module (where it was imported)
+        # so calls from within _summarize_unit see the spy.
+        import synthesis.summarize as summarize_module
+        real_get_adapter = summarize_module._get_adapter
 
-        def _spy_create(**kwargs):
-            captured_models.append(kwargs.get("model", ""))
-            return original_create(**kwargs)
+        def _spy_get_adapter(cfg):
+            adapter = real_get_adapter(cfg)
+            original_call = adapter.call
 
-        client.messages.create = _spy_create
-        return real_summarize(client, config, unit_input, is_live)
+            def _spy_call(system, user, model, max_tokens):
+                captured_models.append(model)
+                return original_call(system, user, model, max_tokens)
+
+            adapter.call = _spy_call
+            return adapter
+
+        with mock.patch.object(summarize_module, "_get_adapter", side_effect=_spy_get_adapter):
+            return real_summarize(config, unit_input)
 
     with mock.patch.object(summarize_module, "_summarize_unit", side_effect=_capturing_summarize):
         result = _run(github_db, sessions_db, config=cfg)
@@ -388,52 +397,75 @@ def test_zero_transcript_unit_writes_placeholder(tmp_path: Path):
 
 
 def test_cache_control_block_shape_live(tmp_path: Path):
-    """In live mode, _summarize_unit sends system= as a list with cache_control.
+    """AnthropicAdapter wraps the system prompt with cache_control: ephemeral.
 
-    Calls ``_summarize_unit`` directly with a mock client so we can
-    inspect the ``system=`` kwarg without needing a real Anthropic key.
-    Asserts the list-of-blocks shape with ``cache_control: {"type":
-    "ephemeral"}`` that enables prompt caching on the static system prompt.
+    Tests the adapter layer directly — no real Anthropic key required.
+    The cache_control behaviour used to live in ``_summarize_unit``; it
+    now lives in ``AnthropicAdapter.call()`` so that all live SDK paths
+    share it automatically.
     """
-    import synthesis.summarize as summarize_module
-    from synthesis.summarize import _summarize_unit
+    from synthesis.llm_adapter import AnthropicAdapter
 
     captured_kwargs: list[dict] = []
 
-    class _CapturingMessages:
+    class _FakeContent:
+        text = "cached narrative"
+
+    class _FakeUsage:
+        input_tokens = 10
+        output_tokens = 5
+
+    class _FakeResponse:
+        content = [_FakeContent()]
+        usage = _FakeUsage()
+
+    class _FakeMessages:
         def create(self, **kwargs):
             captured_kwargs.append(kwargs)
-            # Return a minimal fake response with the same shape as the
-            # real SDK and FakeAnthropicClient.
-            class _FakeContent:
-                text = "cached narrative"
-            class _FakeResponse:
-                content = [_FakeContent()]
             return _FakeResponse()
 
-    class _CapturingClient:
-        messages = _CapturingMessages()
+    class _FakeSDKClient:
+        messages = _FakeMessages()
 
-    config = _make_synthesis_config()
-    unit_input = "## Unit: unit-live-test\n- status: closed"
+    # Patch anthropic.Anthropic so AnthropicAdapter uses our capturing client.
+    with mock.patch("synthesis.llm_adapter.AnthropicAdapter.call", autospec=True) as _mock:
+        pass  # just verify import
 
-    # Call with is_live=True — this exercises the cache_control branch.
-    result = _summarize_unit(_CapturingClient(), config, unit_input, is_live=True)
+    # Call AnthropicAdapter.call() directly with a patched anthropic module.
+    import synthesis.llm_adapter as llm_adapter_module
 
-    assert result == "cached narrative"
+    real_anthropic = None
+    try:
+        import anthropic as _real_anthropic
+        real_anthropic = _real_anthropic
+    except ImportError:
+        pass
+
+    class _FakeAnthropicModule:
+        class Anthropic:
+            def __init__(self, **kwargs):
+                self.messages = _FakeMessages()
+
+    with mock.patch.dict("sys.modules", {"anthropic": _FakeAnthropicModule}):
+        adapter = AnthropicAdapter(api_key="test-key")
+        result_obj = adapter.call(
+            system="You are a summarizer.",
+            user="## Unit: unit-live-test\n- status: closed",
+            model="claude-haiku-4-5",
+            max_tokens=1024,
+        )
+
+    assert result_obj.text == "cached narrative"
     assert len(captured_kwargs) == 1, "expected exactly one messages.create call"
 
     system_arg = captured_kwargs[0]["system"]
     assert isinstance(system_arg, list), (
-        f"live-mode system= must be a list, got {type(system_arg)}"
+        f"AnthropicAdapter system= must be a list, got {type(system_arg)}"
     )
-    assert len(system_arg) == 1, (
-        f"expected one block in system list, got {len(system_arg)}"
-    )
+    assert len(system_arg) == 1, f"expected one block, got {len(system_arg)}"
     block = system_arg[0]
     assert block.get("type") == "text", f"block type must be 'text', got {block.get('type')!r}"
     assert block.get("cache_control") == {"type": "ephemeral"}, (
-        f"block must have cache_control={{'type': 'ephemeral'}}, "
-        f"got {block.get('cache_control')!r}"
+        f"block must have cache_control={{'type': 'ephemeral'}}, got {block.get('cache_control')!r}"
     )
     assert "text" in block and block["text"], "block must have non-empty 'text'"
