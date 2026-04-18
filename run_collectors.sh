@@ -95,6 +95,15 @@ if [ "$(date +%u)" = "7" ] || [ "${AMIS_FORCE_SYNTHESIS:-0}" = "1" ]; then
     fi
     log "--- Finished: Weekly Prepare ---"
 
+    log "--- Starting: Weekly Summarize (week=$WEEK_START) ---"
+    if am-summarize-units --week "$WEEK_START" "${CONFIG_ARG[@]}" >> "$LOG_FILE" 2>&1; then
+        log "OK: Weekly Summarize completed successfully"
+    else
+        rc=$?
+        log "WARNING: Weekly Summarize exited with code $rc (not counted as a failure)"
+    fi
+    log "--- Finished: Weekly Summarize ---"
+
     log "--- Starting: Weekly Synthesis (week=$WEEK_START) ---"
     if am-synthesize --week "$WEEK_START" "${CONFIG_ARG[@]}" >> "$LOG_FILE" 2>&1; then
         log "OK: Weekly Synthesis completed successfully"

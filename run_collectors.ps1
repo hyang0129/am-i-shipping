@@ -106,6 +106,36 @@ if ($Today -eq [DayOfWeek]::Sunday -or $ForceSynthesis) {
         # Any other day: go back to this week's Sunday.
         $WeekStart = (Get-Date).AddDays(-$DayOfWeekInt).ToString("yyyy-MM-dd")
     }
+    Write-Log "--- Starting: Weekly Prepare (week=$WeekStart) ---"
+    try {
+        $prepareArgs = @("--week", $WeekStart) + $ConfigArg
+        $prepareOutput = & am-prepare-week @prepareArgs 2>&1
+        $prepareOutput | ForEach-Object { Write-Log "  $_" }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "WARNING: Weekly Prepare exited with code $LASTEXITCODE (not counted as a failure)"
+        } else {
+            Write-Log "OK: Weekly Prepare completed successfully"
+        }
+    } catch {
+        Write-Log "WARNING: Weekly Prepare threw exception: $_ (not counted as a failure)"
+    }
+    Write-Log "--- Finished: Weekly Prepare ---"
+
+    Write-Log "--- Starting: Weekly Summarize (week=$WeekStart) ---"
+    try {
+        $summarizeArgs = @("--week", $WeekStart) + $ConfigArg
+        $summarizeOutput = & am-summarize-units @summarizeArgs 2>&1
+        $summarizeOutput | ForEach-Object { Write-Log "  $_" }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "WARNING: Weekly Summarize exited with code $LASTEXITCODE (not counted as a failure)"
+        } else {
+            Write-Log "OK: Weekly Summarize completed successfully"
+        }
+    } catch {
+        Write-Log "WARNING: Weekly Summarize threw exception: $_ (not counted as a failure)"
+    }
+    Write-Log "--- Finished: Weekly Summarize ---"
+
     Write-Log "--- Starting: Weekly Synthesis (week=$WeekStart) ---"
     try {
         $synthArgs = @("--week", $WeekStart) + $ConfigArg

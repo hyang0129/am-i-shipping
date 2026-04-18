@@ -77,6 +77,7 @@ class SynthesisConfig:
 
     anthropic_api_key_env: str = "ANTHROPIC_API_KEY"
     model: str = "claude-sonnet-4-5"
+    summary_model: str = "claude-haiku-4-5"
     output_dir: str = "retrospectives"
     week_start: str = "monday"  # "monday" or "sunday"
     abandonment_days: int = 14
@@ -268,6 +269,9 @@ def load_config(config_path: str | Path | None = None) -> Config:
             )
         ),
         model=str(synthesis_raw.get("model", SynthesisConfig.model)),
+        summary_model=str(
+            synthesis_raw.get("summary_model", SynthesisConfig.summary_model)
+        ),
         output_dir=str(
             synthesis_raw.get("output_dir", SynthesisConfig.output_dir)
         ),

@@ -102,6 +102,9 @@ synthesis:
   # Anthropic model used for the weekly retrospective call.
   model: "claude-sonnet-4-5"
 
+  # model used for per-unit summarization (default: claude-haiku-4-5)
+  # summary_model: claude-haiku-4-5
+
   # Directory for retrospective markdown files (relative paths
   # resolved from the repo root).
   output_dir: "retrospectives"

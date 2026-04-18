@@ -151,7 +151,7 @@ class TestInitDb:
         assert "session_ended_at" in columns
 
     def test_github_db_has_synthesis_tables(self, tmp_path):
-        """All five new synthesis tables live in github.db."""
+        """All synthesis tables (including unit_summaries) live in github.db."""
         config = _make_config(tmp_path)
         init_all(config)
 
@@ -170,9 +170,30 @@ class TestInitDb:
             "graph_nodes",
             "graph_edges",
             "units",
+            "unit_summaries",
         }
         assert expected.issubset(tables), (
             f"Missing synthesis tables: {expected - tables}"
+        )
+
+    def test_unit_summaries_has_expected_columns(self, tmp_path):
+        """unit_summaries table has all required columns."""
+        config = _make_config(tmp_path)
+        init_all(config)
+
+        conn = sqlite3.connect(str(tmp_path / "data" / "github.db"))
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(unit_summaries)").fetchall()
+        }
+        conn.close()
+
+        expected = {
+            "week_start", "unit_id", "summary_text", "model",
+            "input_bytes", "generated_at",
+        }
+        assert expected.issubset(columns), (
+            f"Missing unit_summaries columns: {expected - columns}"
         )
 
     def test_units_has_expected_columns(self, tmp_path):
