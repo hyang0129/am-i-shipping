@@ -308,8 +308,9 @@ def test_rebuild_summaries_wipes_and_regenerates(tmp_path: Path):
 
 
 def test_uses_summary_model_config(tmp_path: Path):
-    """The model arg passed to client.messages.create must match config.summary_model."""
+    """The model arg passed to adapter.call must match config.summary_model."""
     import synthesis.summarize as summarize_module
+    from synthesis.llm_adapter import _FakeAdapter
 
     github_db = _make_github_db(tmp_path)
     sessions_db = _make_sessions_db(tmp_path)
@@ -320,29 +321,19 @@ def test_uses_summary_model_config(tmp_path: Path):
     cfg = _make_synthesis_config(summary_model=sentinel_model)
 
     captured_models: list[str] = []
-    real_summarize = summarize_module._summarize_unit
 
-    def _capturing_summarize(config, unit_input):
-        # Patch _get_adapter on the summarize module (where it was imported)
-        # so calls from within _summarize_unit see the spy.
-        import synthesis.summarize as summarize_module
-        real_get_adapter = summarize_module._get_adapter
+    def _spy_get_adapter(cfg):
+        fake = _FakeAdapter()
+        real_call = fake.call
 
-        def _spy_get_adapter(cfg):
-            adapter = real_get_adapter(cfg)
-            original_call = adapter.call
+        def _spy_call(system, user, model, max_tokens):
+            captured_models.append(model)
+            return real_call(system, user, model, max_tokens)
 
-            def _spy_call(system, user, model, max_tokens):
-                captured_models.append(model)
-                return original_call(system, user, model, max_tokens)
+        fake.call = _spy_call
+        return fake
 
-            adapter.call = _spy_call
-            return adapter
-
-        with mock.patch.object(summarize_module, "_get_adapter", side_effect=_spy_get_adapter):
-            return real_summarize(config, unit_input)
-
-    with mock.patch.object(summarize_module, "_summarize_unit", side_effect=_capturing_summarize):
+    with mock.patch.object(summarize_module, "_get_adapter", side_effect=_spy_get_adapter):
         result = _run(github_db, sessions_db, config=cfg)
 
     assert result == 0
