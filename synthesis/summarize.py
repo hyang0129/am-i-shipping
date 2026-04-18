@@ -206,12 +206,12 @@ def _build_unit_input(
     non_empty = [(uid, content) for uid, content in transcripts if content]
 
     if not non_empty:
-        return ("(no session transcripts for this unit)", 0)
-
-    parts.append("\n### Session Transcripts")
-    for uid, content in non_empty:
-        parts.append(f"\n#### Session {uid}")
-        parts.append(content)
+        parts.append("\n(no session transcripts for this unit)")
+    else:
+        parts.append("\n### Session Transcripts")
+        for uid, content in non_empty:
+            parts.append(f"\n#### Session {uid}")
+            parts.append(content)
 
     assembled = "\n".join(parts)
     return assembled, len(assembled.encode())
@@ -292,8 +292,7 @@ def run_summarization(
         _same = sessions_db == github_db
         try:
             if not _same:
-                import os as _os
-                _same = _os.path.samefile(github_db, sessions_db)
+                _same = os.path.samefile(github_db, sessions_db)
         except OSError:
             pass
         sessions_conn = gh_conn if _same else sqlite3.connect(sessions_db)
@@ -308,10 +307,17 @@ def run_summarization(
                 )
                 return 0
 
+            failure_count = 0
             for unit in units:
                 unit_id = unit["unit_id"]
                 unit_input, input_bytes = _build_unit_input(
                     gh_conn, sessions_conn, unit_id, week_start
+                )
+                logger.debug(
+                    "Summarizing unit %s: input_bytes=%d placeholder=%s",
+                    unit_id,
+                    input_bytes,
+                    unit_input.startswith("(no session"),
                 )
                 try:
                     summary_text = _summarize_unit(config, unit_input)
@@ -319,6 +325,7 @@ def run_summarization(
                     logger.warning(
                         "Failed to summarize unit %s: %s — skipping", unit_id, exc
                     )
+                    failure_count += 1
                     continue
                 _store_summary(
                     gh_conn,
@@ -337,6 +344,14 @@ def run_summarization(
                         unit_id,
                         word_count,
                     )
+
+            if failure_count > 0:
+                logger.warning(
+                    "%d/%d unit(s) failed summarization",
+                    failure_count,
+                    len(units),
+                )
+                return 1
 
         finally:
             if sessions_conn is not None and sessions_conn is not gh_conn:
