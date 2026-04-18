@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from am_i_shipping.config_loader import SynthesisConfig
+from am_i_shipping.db import SYNTHESIS_UNIT_SUMMARIES_SCHEMA
 from synthesis.weekly import (
     MAX_PROMPT_BYTES,
     MAX_UNITS_PER_PROMPT,
@@ -121,6 +122,38 @@ def _fixture_copy(tmp_path: Path) -> Path:
     dst = tmp_path / "golden.sqlite"
     shutil.copy(FIXTURE_SRC, dst)
     return dst
+
+
+def _insert_unit_summaries(
+    conn: sqlite3.Connection,
+    week_start: str,
+    summaries: dict,
+) -> None:
+    """Insert rows into ``unit_summaries`` for the given week.
+
+    Creates the table first (via ``SYNTHESIS_UNIT_SUMMARIES_SCHEMA``) in
+    case the connection is to an in-memory or freshly-created DB that does
+    not yet have the table — this is always a no-op on a DB that already
+    has the table (``CREATE TABLE IF NOT EXISTS``).
+
+    Parameters
+    ----------
+    conn:
+        Open ``sqlite3.Connection``.
+    week_start:
+        The ``YYYY-MM-DD`` anchor that matches the ``units`` rows.
+    summaries:
+        Mapping of ``unit_id -> summary_text``.
+    """
+    conn.execute(SYNTHESIS_UNIT_SUMMARIES_SCHEMA)
+    for unit_id, summary_text in summaries.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO unit_summaries "
+            "(week_start, unit_id, summary_text, model, input_bytes) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (week_start, unit_id, summary_text, "claude-haiku-4-5", len(summary_text)),
+        )
+    conn.commit()
 
 
 @pytest.fixture(autouse=True)
@@ -648,6 +681,13 @@ def test_unit_cap_truncates_and_warns(
                 outlier_flags=flags,
                 abandonment_flag=abandoned,
             )
+        # Insert a unit_summaries row for every seeded unit so run_synthesis
+        # does not hit the fail-loud guard (units without summaries raise).
+        _insert_unit_summaries(
+            conn,
+            week_start,
+            {f"unit-{i:04d}": f"Summary for unit-{i:04d}." for i in range(total_units)},
+        )
         conn.commit()
     finally:
         conn.close()
@@ -730,6 +770,9 @@ def test_prompt_byte_guard_raises(tmp_path: Path) -> None:
             unit_id="unit-bloat",
             outlier_flags=bloated_flags,
         )
+        # Provide a unit_summaries row so run_synthesis passes the fail-loud
+        # guard for missing summaries and reaches the prompt-byte guard.
+        _insert_unit_summaries(conn, week_start, {"unit-bloat": "Summary for unit-bloat."})
         conn.commit()
     finally:
         conn.close()
@@ -781,19 +824,26 @@ def test_prompt_byte_guard_blocks_live_path(
             unit_id="unit-bloat-live",
             outlier_flags=bloated_flags,
         )
+        # Provide a unit_summaries row so run_synthesis passes the fail-loud
+        # guard for missing summaries and reaches the prompt-byte guard.
+        _insert_unit_summaries(
+            conn, week_start, {"unit-bloat-live": "Summary for unit-bloat-live."}
+        )
         conn.commit()
     finally:
         conn.close()
 
-    # Spy: if _call_llm runs, the guard regressed.
-    def _forbidden_call_llm(*args, **kwargs) -> str:
-        raise AssertionError(
-            "_call_llm must not be invoked when the prompt-byte guard "
-            "should have fired — the guard regressed below the LLM "
-            "dispatch"
-        )
+    # Spy: if the adapter is reached, the guard regressed.
+    import synthesis.weekly as weekly_module
 
-    monkeypatch.setattr(weekly_module, "_call_llm", _forbidden_call_llm)
+    class _ForbiddenAdapter:
+        def call(self, *args, **kwargs):
+            raise AssertionError(
+                "_get_adapter().call() must not be invoked when the prompt-byte "
+                "guard should have fired — the guard regressed below the LLM dispatch"
+            )
+
+    monkeypatch.setattr(weekly_module, "_get_adapter", lambda _config: _ForbiddenAdapter())
 
     out = tmp_path / "retrospectives"
     cfg = _make_config(tmp_path, out)
@@ -874,6 +924,15 @@ def test_unit_cap_preserves_priority_order(
                 outlier_flags="[]",
                 elapsed_days=0.0,
             )
+        # Insert unit_summaries for all seeded units so run_synthesis passes
+        # the fail-loud missing-summary guard.
+        all_unit_summaries = {}
+        for i in range(5):
+            all_unit_summaries[f"unit-A-{i:02d}"] = f"Summary for unit-A-{i:02d}."
+            all_unit_summaries[f"unit-B-{i:02d}"] = f"Summary for unit-B-{i:02d}."
+        for i in range(120):
+            all_unit_summaries[f"unit-Z-{i:03d}"] = f"Summary for unit-Z-{i:03d}."
+        _insert_unit_summaries(conn, week_start, all_unit_summaries)
         conn.commit()
     finally:
         conn.close()
@@ -916,3 +975,42 @@ def test_unit_cap_preserves_priority_order(
         f"cap (120 filler + 10 priority = 130 total, cap=100), got "
         f"{len(missing_z)} dropped — the cap may not be engaging"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #64 — fail-loud guard for missing unit_summaries rows
+# ---------------------------------------------------------------------------
+
+
+def test_run_synthesis_raises_when_summary_missing(tmp_path: Path) -> None:
+    """``run_synthesis`` must raise ``RuntimeError`` when a unit has no summary row.
+
+    Seeds a DB with one unit but NO ``unit_summaries`` row for that unit.
+    The fail-loud guard in ``run_synthesis`` must raise a ``RuntimeError``
+    whose message contains ``"am-summarize-units"`` — the command the
+    operator should run to fix the missing row.
+    """
+    from am_i_shipping.db import init_github_db
+
+    week_start = "2025-04-21"
+    db_path = tmp_path / "github.db"
+    init_github_db(db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        _seed_unit_row(
+            conn,
+            week_start=week_start,
+            unit_id="unit-no-summary",
+        )
+        conn.commit()
+        # Deliberately do NOT insert a unit_summaries row — this is the
+        # condition the guard is meant to catch.
+    finally:
+        conn.close()
+
+    out = tmp_path / "retrospectives"
+    cfg = _make_config(tmp_path, out)
+
+    with pytest.raises(RuntimeError, match=r"unit-no-summary.*am-summarize-units"):
+        run_synthesis(cfg, db_path, db_path, week_start, dry_run=True)

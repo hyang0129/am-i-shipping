@@ -22,6 +22,7 @@ am-github-poller = "collector.github_poller.run:main"
 am-appswitch-export = "collector.appswitch.export:main"
 am-synthesize = "synthesis.cli:main"
 am-prepare-week = "synthesis.prepare:main"
+am-summarize-units = "synthesis.summarize:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

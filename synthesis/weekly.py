@@ -25,7 +25,8 @@ What lives where
   independently; no DB access).
 * ``_assemble_prompt`` — Markdown prompt assembly (static cacheable
   context + per-unit dynamic block).
-* ``_get_client`` — picks between live SDK and
+* Adapter selection is handled by :func:`synthesis.llm_adapter._get_adapter`,
+  which picks between the live SDK and
   :class:`synthesis.fake_client.FakeAnthropicClient` based on
   ``AMIS_SYNTHESIS_LIVE``.
 
@@ -47,7 +48,7 @@ from typing import List, Optional, Tuple, Union
 
 from am_i_shipping.config_loader import SynthesisConfig
 from am_i_shipping.health_writer import write_health
-from synthesis.fake_client import FakeAnthropicClient
+from synthesis.llm_adapter import _get_adapter
 from synthesis.output_writer import write_retrospective
 from synthesis.unit_timeline import render_timeline
 
@@ -321,6 +322,18 @@ def _load_session_transcripts(
     return [(uid, by_uuid.get(uid, "")) for uid in session_uuids]
 
 
+def _load_unit_summaries(
+    gh_conn: sqlite3.Connection,
+    week_start: str,
+) -> dict:
+    """Return ``{unit_id: summary_text}`` from ``unit_summaries`` for *week_start*."""
+    rows = gh_conn.execute(
+        "SELECT unit_id, summary_text FROM unit_summaries WHERE week_start = ?",
+        (week_start,),
+    ).fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
 # ---------------------------------------------------------------------------
 # Prompt assembly
 # ---------------------------------------------------------------------------
@@ -405,7 +418,7 @@ def _format_unit_block(unit: dict, transcript: str) -> str:
         f"- outlier_flags: {flags}",
         f"- abandonment_flag: {abandoned_str}",
         "",
-        "#### transcript",
+        "#### summary",
         "```",
         transcript,
         "```",
@@ -450,88 +463,8 @@ def _assemble_prompt(
 
 
 # ---------------------------------------------------------------------------
-# Client selection
+# Client selection — see synthesis.llm_adapter._get_adapter
 # ---------------------------------------------------------------------------
-
-
-def _get_client(config: SynthesisConfig) -> Tuple[object, bool]:
-    """Return ``(client, is_live)`` for the synthesis call.
-
-    * ``AMIS_SYNTHESIS_LIVE`` unset / falsy → ``(FakeAnthropicClient(), False)``.
-    * ``AMIS_SYNTHESIS_LIVE=1``              → ``(anthropic.Anthropic(...), True)``.
-      Import is lazy so an unset ``anthropic`` install does not break
-      offline runs. The ``ANTHROPIC_API_KEY`` env var (or whichever var
-      ``config.anthropic_api_key_env`` names) must be set — the SDK
-      picks it up via its usual env-var dance.
-
-    Returning the ``is_live`` flag alongside the client lets
-    :func:`_call_llm` pick the system-prompt shape (plain string vs.
-    list-of-blocks with ``cache_control``) without re-reading the env
-    var. The flag that drove client selection is also the flag that
-    drives the cache shape — they cannot drift.
-    """
-    if not os.environ.get("AMIS_SYNTHESIS_LIVE"):
-        return FakeAnthropicClient(), False
-
-    # Live path — lazy import so the anthropic dep is not required at
-    # import time, only when actually called with AMIS_SYNTHESIS_LIVE=1.
-    import anthropic  # noqa: WPS433 — deliberate lazy import
-
-    api_key = os.environ.get(config.anthropic_api_key_env)
-    if not api_key:
-        raise RuntimeError(
-            f"AMIS_SYNTHESIS_LIVE is set but {config.anthropic_api_key_env} "
-            f"is empty — cannot call the Anthropic API"
-        )
-    return anthropic.Anthropic(api_key=api_key), True
-
-
-def _call_llm(
-    client,
-    config: SynthesisConfig,
-    system_prompt: str,
-    messages: list,
-    is_live: bool,
-) -> str:
-    """Dispatch the synthesis call and return the Markdown text.
-
-    When *is_live* is True, the system prompt is wrapped in a
-    list-of-blocks shape with ``cache_control`` so the Anthropic API
-    treats it as an ephemeral cache entry. The fake client accepts the
-    same shape (ignores the caching hint) so the call site needs no
-    branching — but we still use the plain form offline so the offline
-    path never silently depends on the SDK's block parser.
-
-    *is_live* comes from :func:`_get_client` so the flag that drove
-    client selection is also the flag that drives the cache shape;
-    they cannot drift via an env var being toggled mid-run.
-    """
-    if is_live:
-        # List-of-blocks form enables prompt caching on the static
-        # context. See https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
-        system_blocks = [
-            {
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ]
-    else:
-        # Fake client accepts either a plain string or the blocks form.
-        # We use the plain form offline so the offline path never
-        # silently depends on the SDK's block parser.
-        system_blocks = system_prompt
-
-    resp = client.messages.create(
-        model=config.model,
-        max_tokens=_MAX_OUTPUT_TOKENS,
-        system=system_blocks,
-        messages=messages,
-    )
-    # Both the real SDK's Message and our FakeMessage expose
-    # ``content[0].text`` for a single-block text response, which is
-    # what a non-tool-use synthesis call returns.
-    return resp.content[0].text
 
 
 # ---------------------------------------------------------------------------
@@ -657,40 +590,34 @@ def run_synthesis(
             )
             units = units[:MAX_UNITS_PER_PROMPT]
 
-        # Resolve every unit's component so we can pull the session
-        # UUIDs (for transcripts) and feed the timeline renderer.
+        # Load pre-computed unit summaries from the unit_summaries table.
+        # These are generated by ``am-summarize-units`` (synthesis/summarize.py)
+        # and replace the old water-filled raw transcript assembly path.
+        unit_summaries = _load_unit_summaries(gh_conn, week_start)
+
+        # Resolve every unit's component so we can feed the timeline renderer.
+        # We still walk graph_nodes/graph_edges per unit — the timeline is
+        # separate from the summary and still reads live from the graph tables.
         unit_components: dict = {}
-        all_session_uuids: List[str] = []
-        per_unit_uuids: dict = {}
         for u in units:
             comp = _unit_nodes(gh_conn, week_start, u["root_node_id"])
             unit_components[u["unit_id"]] = comp
-            uuids = [nr for nid, nt, nr in comp if nt == "session" and nr]
-            per_unit_uuids[u["unit_id"]] = uuids
-            all_session_uuids.extend(uuids)
 
-        # Water-fill the transcripts across ALL sessions in ALL units
-        # so the 512 KB budget is global, not per-unit. ADR Decision 4
-        # phrases it as "cumulative budget".
-        raw = _load_session_transcripts(sess_conn, all_session_uuids)
-        # raw is aligned with all_session_uuids by construction.
-        truncated = water_fill_truncate(
-            [content for _uid, content in raw],
-            TRANSCRIPT_BUDGET_BYTES,
-        )
-        by_uuid = {uid: tc for (uid, _), tc in zip(raw, truncated)}
-
-        # Per-unit transcript = concatenation of the unit's (truncated)
-        # sessions. Blank units yield an empty transcript block — the
-        # prompt still renders them so the LLM can reason about
-        # "why is this unit empty".
+        # Fail loud if any unit in this week's set has no summary row.
+        # This prevents a silent empty-transcript block from reaching the LLM.
         unit_transcripts: dict = {}
         unit_timelines: dict = {}
         for u in units:
-            parts = [by_uuid.get(uid, "") for uid in per_unit_uuids[u["unit_id"]]]
-            unit_transcripts[u["unit_id"]] = "\n\n".join(p for p in parts if p)
-            unit_timelines[u["unit_id"]] = render_timeline(
-                unit_components[u["unit_id"]], gh_conn, sess_conn
+            uid = u["unit_id"]
+            if uid not in unit_summaries:
+                raise RuntimeError(
+                    f"unit_summaries row missing for unit_id={uid!r} "
+                    f"(week={week_start!r}). "
+                    f"Run: am-summarize-units --week {week_start}"
+                )
+            unit_transcripts[uid] = unit_summaries[uid]
+            unit_timelines[uid] = render_timeline(
+                unit_components[uid], gh_conn, sess_conn
             )
 
         system_prompt, messages = _assemble_prompt(
@@ -759,8 +686,8 @@ def run_synthesis(
             return dry_path
 
         # --- live / fake synthesis ------------------------------------
-        client, is_live = _get_client(config)
-        markdown = _call_llm(client, config, system_prompt, messages, is_live)
+        user_content = messages[0]["content"]
+        markdown = _get_adapter(config).call(system_prompt, user_content, config.model, _MAX_OUTPUT_TOKENS).text
 
         result = write_retrospective(markdown, config.output_dir, week_start)
 

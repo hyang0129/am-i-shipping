@@ -239,6 +239,19 @@ CREATE TABLE IF NOT EXISTS units (
 );
 """
 
+SYNTHESIS_UNIT_SUMMARIES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS unit_summaries (
+    week_start    TEXT NOT NULL,
+    unit_id       TEXT NOT NULL,
+    summary_text  TEXT NOT NULL,
+    model         TEXT,
+    input_bytes   INTEGER,
+    generated_at  TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (week_start, unit_id),
+    FOREIGN KEY (week_start, unit_id) REFERENCES units(week_start, unit_id)
+);
+"""
+
 # Columns added to existing tables after initial schema — migrated on init
 _GITHUB_MIGRATIONS = [
     "ALTER TABLE issues ADD COLUMN updated_at TEXT",
@@ -403,6 +416,7 @@ EXPECTED_GITHUB_TABLES: dict[str, set[str]] = {
         "outlier_flags",
         "abandonment_flag",
     },
+    "unit_summaries": {"week_start", "unit_id", "summary_text", "model", "input_bytes", "generated_at"},
 }
 
 EXPECTED_APPSWITCH_TABLES: dict[str, set[str]] = {
@@ -528,6 +542,7 @@ def init_github_db(db_path: Path) -> None:
         conn.execute(SYNTHESIS_GRAPH_NODES_SCHEMA)
         conn.execute(SYNTHESIS_GRAPH_EDGES_SCHEMA)
         conn.execute(SYNTHESIS_UNITS_SCHEMA)
+        conn.execute(SYNTHESIS_UNIT_SUMMARIES_SCHEMA)
         for migration in _GITHUB_MIGRATIONS:
             try:
                 conn.execute(migration)
