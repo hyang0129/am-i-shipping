@@ -25,7 +25,8 @@ What lives where
   independently; no DB access).
 * ``_assemble_prompt`` — Markdown prompt assembly (static cacheable
   context + per-unit dynamic block).
-* ``_get_client`` — picks between live SDK and
+* Adapter selection is handled by :func:`synthesis.llm_adapter._get_adapter`,
+  which picks between the live SDK and
   :class:`synthesis.fake_client.FakeAnthropicClient` based on
   ``AMIS_SYNTHESIS_LIVE``.
 

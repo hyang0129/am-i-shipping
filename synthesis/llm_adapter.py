@@ -43,12 +43,15 @@ from __future__ import annotations
 
 import glob
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from am_i_shipping.config_loader import SynthesisConfig
@@ -118,7 +121,18 @@ class AnthropicAdapter:
             system=system_param,
             messages=[{"role": "user", "content": user}],
         )
-        text = resp.content[0].text
+        if not resp.content:
+            raise RuntimeError(
+                f"Anthropic API returned empty content list (model={model})"
+            )
+        block = resp.content[0]
+        block_type = getattr(block, "type", "text")  # default "text" for mock objects without type
+        if block_type != "text":
+            raise RuntimeError(
+                f"Anthropic API returned unexpected first content block type "
+                f"(model={model}, type={block_type})"
+            )
+        text = block.text
         cost = _anthropic_cost(model, resp.usage.input_tokens, resp.usage.output_tokens)
         return LLMResult(
             text=text,
@@ -151,10 +165,7 @@ def resolve_cli_path(raw: str) -> str:
 
 
 def _claude_cmd() -> str:
-    import logging
     import sys
-
-    logger = logging.getLogger(__name__)
 
     if sys.platform != "win32":
         linux_explicit = os.environ.get("LINUX_CLAUDE_CLI_PATH")
@@ -221,9 +232,9 @@ class ClaudeCliAdapter:
         if node_dir:
             env["PATH"] = node_dir + os.pathsep + env.get("PATH", "")
 
-        print(
-            f"[LLM] claude-cli call: model={model} max_tokens={max_tokens} "
-            f"system_len={len(system)} user_len={len(user)}"
+        logger.debug(
+            "[LLM] claude-cli call: model=%s max_tokens=%d system_len=%d user_len=%d",
+            model, max_tokens, len(system), len(user),
         )
 
         tmp_files: list[str] = []
@@ -289,10 +300,12 @@ class ClaudeCliAdapter:
         output_tokens = raw_output_tokens if isinstance(raw_output_tokens, int) else 0
         text = data.get("result", data.get("content", ""))
         cost = float(data.get("total_cost_usd", data.get("cost_usd", 0.0)))
-        print(
-            f"[LLM] claude-cli response: keys={keys} stop_reason={stop_reason!r} "
-            f"is_error={is_error} tokens=({raw_input_tokens} in, {raw_output_tokens} out) "
-            f"text_len={len(text)} text_preview={text[:200]!r}"
+        logger.debug(
+            "[LLM] claude-cli response: keys=%s stop_reason=%r is_error=%s "
+            "tokens=(%s in, %s out) text_len=%d text_preview=%r",
+            keys, stop_reason, is_error,
+            raw_input_tokens, raw_output_tokens,
+            len(text), text[:200],
         )
         return LLMResult(
             text=text,

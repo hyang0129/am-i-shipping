@@ -834,7 +834,7 @@ def test_prompt_byte_guard_blocks_live_path(
         conn.close()
 
     # Spy: if the adapter is reached, the guard regressed.
-    import synthesis.llm_adapter as llm_adapter_module
+    import synthesis.weekly as weekly_module
 
     class _ForbiddenAdapter:
         def call(self, *args, **kwargs):
@@ -843,7 +843,7 @@ def test_prompt_byte_guard_blocks_live_path(
                 "guard should have fired — the guard regressed below the LLM dispatch"
             )
 
-    monkeypatch.setattr(llm_adapter_module, "_get_adapter", lambda _config: _ForbiddenAdapter())
+    monkeypatch.setattr(weekly_module, "_get_adapter", lambda _config: _ForbiddenAdapter())
 
     out = tmp_path / "retrospectives"
     cfg = _make_config(tmp_path, out)
