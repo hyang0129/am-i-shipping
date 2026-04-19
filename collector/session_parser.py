@@ -104,7 +104,7 @@ def _strip_content_blocks(content: Any) -> Any:
     return content
 
 
-def _extract_gh_events(entry: dict, working_directory: Optional[str]) -> list:
+def _extract_gh_events(entry: dict) -> list:
     """Extract GitHub/git CLI events from a single JSONL entry.
 
     Scans tool_use Bash blocks for gh CLI and git push commands, returning a
@@ -113,6 +113,12 @@ def _extract_gh_events(entry: dict, working_directory: Optional[str]) -> list:
 
     tool_result blocks are used to upgrade "pending" refs for create events
     (issue/PR numbers extracted from stdout URLs).
+
+    Scope note: only ``gh`` invocations that include an explicit ``--repo
+    OWNER/REPO`` flag (or a full GitHub URL target) are captured. Invocations
+    where the repo is inferred from the working directory (i.e. those without
+    ``--repo``) are intentionally not captured in this version — cwd-based
+    repo inference is a separate task.
     """
     if entry.get("type") not in ("user", "assistant"):
         return []
@@ -444,7 +450,7 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
 
                 # Extract GitHub/git events from this entry
                 gh_events_list.extend(
-                    _extract_gh_events(entry, working_directory)
+                    _extract_gh_events(entry)
                 )
 
                 # Accumulate token usage from assistant messages

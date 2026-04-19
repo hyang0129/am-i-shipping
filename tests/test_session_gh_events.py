@@ -92,7 +92,7 @@ class TestExtractGhEvents:
                 ],
             },
         }
-        events = _extract_gh_events(entry, working_directory=None)
+        events = _extract_gh_events(entry)
         assert len(events) == 1
         ev = events[0]
         assert ev["event_type"] == "issue_create"
@@ -116,7 +116,7 @@ class TestExtractGhEvents:
                 ],
             },
         }
-        events = _extract_gh_events(entry, working_directory=None)
+        events = _extract_gh_events(entry)
         assert len(events) == 1
         assert events[0]["event_type"] == "issue_create"
         assert events[0]["ref"] == "pending"
@@ -137,7 +137,7 @@ class TestExtractGhEvents:
                 ],
             },
         }
-        events = _extract_gh_events(entry, working_directory=None)
+        events = _extract_gh_events(entry)
         assert len(events) == 1
         ev = events[0]
         assert ev["event_type"] == "issue_comment"
@@ -163,7 +163,7 @@ class TestExtractGhEvents:
                 ],
             },
         }
-        events = _extract_gh_events(entry, working_directory=None)
+        events = _extract_gh_events(entry)
         assert len(events) == 1
         ev = events[0]
         assert ev["event_type"] == "pr_create"
@@ -186,7 +186,7 @@ class TestExtractGhEvents:
                 ],
             },
         }
-        events = _extract_gh_events(entry, working_directory=None)
+        events = _extract_gh_events(entry)
         assert len(events) == 1
         ev = events[0]
         assert ev["event_type"] == "git_push"
@@ -203,7 +203,7 @@ class TestExtractGhEvents:
                 ],
             },
         }
-        assert _extract_gh_events(entry, working_directory=None) == []
+        assert _extract_gh_events(entry) == []
 
     def test_string_content_returns_empty(self):
         """Entries with string content (not a list) return empty list."""
@@ -211,7 +211,7 @@ class TestExtractGhEvents:
             "type": "assistant",
             "message": {"content": "just a string"},
         }
-        assert _extract_gh_events(entry, working_directory=None) == []
+        assert _extract_gh_events(entry) == []
 
 
 # ---------------------------------------------------------------------------
