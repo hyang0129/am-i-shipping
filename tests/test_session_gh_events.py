@@ -413,6 +413,53 @@ class TestParseSessionGhEvents:
         )
         assert has_text, "User text turn should be present in raw_content_json"
 
+    def test_parse_session_flushes_unresolved_pending(self, tmp_path):
+        """parse_session flushes pending_creates at session end for unresolved tool_use.
+
+        A tool_use block for gh issue create with no corresponding tool_result
+        should still appear in gh_events with ref == 'pending' after parse_session
+        completes (via the end-of-session pending flush at line 504-505 of
+        session_parser.py).
+        """
+        session_uuid = "dddd-pending-flush-uuid"
+        entry_user = {
+            "type": "user",
+            "sessionId": session_uuid,
+            "timestamp": "2025-01-10T10:00:00Z",
+            "message": {
+                "role": "user",
+                "content": [_make_text_block("Please create an issue.")],
+            },
+        }
+        entry_assistant = {
+            "type": "assistant",
+            "sessionId": session_uuid,
+            "timestamp": "2025-01-10T10:00:05Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    _make_tool_use_block(
+                        "tu-pending-flush",
+                        "gh issue create --repo foo/bar --title x",
+                    ),
+                ],
+            },
+        }
+        # No tool_result entry — the create is left unresolved
+
+        filepath = tmp_path / f"{session_uuid}.jsonl"
+        with filepath.open("w") as f:
+            for entry in [entry_user, entry_assistant]:
+                f.write(json.dumps(entry) + "\n")
+
+        record = parse_session(filepath)
+
+        assert len(record.gh_events) == 1
+        ev = record.gh_events[0]
+        assert ev["event_type"] == "issue_create"
+        assert ev["ref"] == "pending"
+        assert ev["repo"] == "foo/bar"
+
 
 # ---------------------------------------------------------------------------
 # Tests for upsert_session + github.db session_gh_events persistence

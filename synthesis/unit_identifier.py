@@ -395,6 +395,11 @@ def identify_units(
         for comp in components:
             # Drop components that have no issue or PR anchor — they are
             # pure session noise and do not constitute a meaningful unit.
+            # Session-only components still retain their graph_nodes /
+            # graph_edges rows (the graph builder wrote them), but they
+            # are intentionally excluded from ``units`` because there is
+            # no issue or PR anchor to attribute the work to.  See
+            # issue #66 for the design rationale.
             comp_types = {node_info[nid][0] for nid in comp}
             if "issue" not in comp_types and "pr" not in comp_types:
                 continue

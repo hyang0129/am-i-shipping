@@ -387,7 +387,13 @@ class TestSessionGhEventsTable:
         assert_schema(db_path, {"session_gh_events": EXPECTED_GITHUB_TABLES["session_gh_events"]})
 
     def test_session_gh_events_primary_key(self, tmp_path):
-        """session_gh_events enforces (session_uuid, event_type, repo, ref) PK."""
+        """session_gh_events enforces (session_uuid, event_type, repo, ref) PK.
+
+        This test covers the schema-level constraint only (raw INSERT raises
+        IntegrityError).  The write-path ``INSERT OR IGNORE`` idempotency —
+        i.e. that the collector silently skips duplicate rows — is verified
+        separately in ``test_store.py::test_upsert_session_gh_events_idempotent``.
+        """
         from am_i_shipping.db import init_github_db
 
         db_path = tmp_path / "github.db"

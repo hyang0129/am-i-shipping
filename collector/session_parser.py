@@ -121,6 +121,8 @@ def _extract_gh_events(entry: dict, pending_creates: dict) -> list:
     (issue/PR numbers extracted from stdout URLs). When a create command omits
     ``--repo``, the repo is also resolved from the tool_result URL.
     """
+    # NOTE: sidechain entries and subagent Task-tool `gh` calls may appear in
+    # separate JSONL files and are NOT captured by this extractor.
     if entry.get("type") not in ("user", "assistant"):
         return []
     content = entry.get("message", {}).get("content", "")
@@ -154,6 +156,9 @@ def _extract_gh_events(entry: dict, pending_creates: dict) -> list:
                 }
 
             # gh issue create (no --repo — repo resolved from tool_result URL)
+            # CAUTION: shell-quoted --repo inside --title (e.g. --title "use --repo flag")
+            # can cause the --repo branch above to misattribute the repo; this parser
+            # does not understand shell quoting.
             if ev is None:
                 m = re.search(r"gh\s+issue\s+create\b", command, re.DOTALL)
                 if m:
@@ -204,6 +209,9 @@ def _extract_gh_events(entry: dict, pending_creates: dict) -> list:
                     }
 
             # gh pr create (no --repo — repo resolved from tool_result URL)
+            # CAUTION: shell-quoted --repo inside --title (e.g. --title "use --repo flag")
+            # can cause the --repo branch above to misattribute the repo; this parser
+            # does not understand shell quoting.
             if ev is None:
                 m = re.search(r"gh\s+pr\s+create\b", command, re.DOTALL)
                 if m:
@@ -275,6 +283,9 @@ def _extract_gh_events(entry: dict, pending_creates: dict) -> list:
                     }
 
             # git push (best effort: extract branch if present)
+            # NOTE: this regex matches `git push` inside quoted strings (echo, grep, etc.);
+            # false positives are possible but confined to the audit table since git_push
+            # events don't create graph edges.
             if ev is None and re.search(r"\bgit\s+push\b", command, re.DOTALL):
                 # Robust branch extraction:
                 # 1. Strip flags like -u/--set-upstream before parsing

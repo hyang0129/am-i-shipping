@@ -15,17 +15,11 @@ from pathlib import Path
 from collector.session_parser import parse_session
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+# Auto-discover all project dirs under ~/.claude/projects/ so future
+# workspace containers are picked up without editing this list.
 PROJECT_DIRS = [
-    CLAUDE_PROJECTS / "-workspaces-hub-1",
-    CLAUDE_PROJECTS / "-workspaces-hub-2",
-    CLAUDE_PROJECTS / "-workspaces-hub-3",
-    CLAUDE_PROJECTS / "-workspaces-hub-4",
-    CLAUDE_PROJECTS / "-workspaces-hub-5",
-    CLAUDE_PROJECTS / "-workspaces-hub-1-video-agent-long",
-    CLAUDE_PROJECTS / "-workspaces-hub-2-video-agent-long",
-    CLAUDE_PROJECTS / "-workspaces-hub-3-video-agent-long",
-    CLAUDE_PROJECTS / "-workspaces-hub-4-video-agent-long",
-    CLAUDE_PROJECTS / "-workspaces-hub-5-video-agent-long",
+    d for d in (CLAUDE_PROJECTS).iterdir()
+    if d.is_dir() and not d.name.startswith(".")
 ]
 
 candidates = []
