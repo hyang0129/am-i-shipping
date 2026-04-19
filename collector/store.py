@@ -121,31 +121,30 @@ def upsert_session(
     gh_events = getattr(record, "gh_events", None) or []
     if gh_events:
         github_db_path = db_path.parent / "github.db"
-        if github_db_path.exists():
-            if not skip_init:
-                from am_i_shipping.db import init_github_db
+        if not skip_init:
+            from am_i_shipping.db import init_github_db
 
-                init_github_db(github_db_path)
-            gh_conn = sqlite3.connect(str(github_db_path))
-            try:
-                for ev in gh_events:
-                    gh_conn.execute(
-                        "INSERT OR IGNORE INTO session_gh_events "
-                        "(session_uuid, event_type, repo, ref, url, confidence, created_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            record.session_uuid,
-                            ev["event_type"],
-                            ev["repo"],
-                            ev["ref"],
-                            ev.get("url"),
-                            ev.get("confidence"),
-                            ev.get("created_at"),
-                        ),
-                    )
-                gh_conn.commit()
-            finally:
-                gh_conn.close()
+            init_github_db(github_db_path)
+        gh_conn = sqlite3.connect(str(github_db_path))
+        try:
+            for ev in gh_events:
+                gh_conn.execute(
+                    "INSERT OR IGNORE INTO session_gh_events "
+                    "(session_uuid, event_type, repo, ref, url, confidence, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        record.session_uuid,
+                        ev["event_type"],
+                        ev["repo"],
+                        ev["ref"],
+                        ev.get("url"),
+                        ev.get("confidence"),
+                        ev.get("created_at"),
+                    ),
+                )
+            gh_conn.commit()
+        finally:
+            gh_conn.close()
 
     if not skip_health:
         write_health("session_parser", 1, data_dir=data_dir)
