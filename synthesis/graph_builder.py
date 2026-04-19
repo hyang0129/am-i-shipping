@@ -56,10 +56,13 @@ attaching twice.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 from pathlib import Path
 from typing import Iterable, Optional, Union
+
+logger = logging.getLogger(__name__)
 
 from collector.github_poller.link_resolver import resolve_link
 
@@ -155,14 +158,35 @@ def _read_timeline(conn: sqlite3.Connection) -> list[tuple]:
     ).fetchall()
 
 
-def _read_session_gh_events(conn: sqlite3.Connection) -> list[tuple]:
+def _read_session_gh_events(
+    conn: sqlite3.Connection,
+    week_start: Optional[str] = None,
+) -> list[tuple]:
+    """Return session_gh_events rows, optionally filtered to a week window.
+
+    When ``week_start`` is provided (YYYY-MM-DD), only rows whose
+    ``created_at`` falls in ``[week_start, week_start + 7 days)`` are
+    returned, symmetric to the ``_read_sessions`` date-window pattern.
+    """
     try:
-        return conn.execute(
-            "SELECT session_uuid, event_type, repo, ref "
+        rows = conn.execute(
+            "SELECT session_uuid, event_type, repo, ref, created_at "
             "FROM session_gh_events ORDER BY session_uuid, event_type, repo, ref"
         ).fetchall()
     except sqlite3.OperationalError:
         return []  # table may not exist on older installs
+    if not week_start:
+        # Drop the extra created_at column to keep the return shape consistent
+        # with what callers expect: (session_uuid, event_type, repo, ref).
+        return [(r[0], r[1], r[2], r[3]) for r in rows]
+    week_end = _add_days(week_start, 7)
+    filtered: list[tuple] = []
+    for session_uuid, event_type, repo, ref, created_at in rows:
+        if not created_at:
+            continue
+        if week_start <= created_at < week_end:
+            filtered.append((session_uuid, event_type, repo, ref))
+    return filtered
 
 
 def _read_sessions(
@@ -278,7 +302,7 @@ def build_graph(
         pr_sessions = _read_pr_sessions(gh)
         commits = _read_commits(gh)
         timeline = _read_timeline(gh)
-        session_gh_events = _read_session_gh_events(gh)
+        session_gh_events = _read_session_gh_events(gh, week_start)
         sessions = _read_sessions(sess, week_start)
 
         nodes: dict[str, tuple[str, str, str]] = {}
@@ -438,6 +462,11 @@ def build_graph(
             try:
                 ref_int = int(ref)
             except (ValueError, TypeError):
+                logger.debug(
+                    "skipping session_gh_events row with non-numeric ref=%r (session=%s)",
+                    ref,
+                    session_uuid,
+                )
                 continue
             sess_nid = _session_node(session_uuid)
             if sess_nid not in nodes:

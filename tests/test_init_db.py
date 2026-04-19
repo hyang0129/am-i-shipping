@@ -384,26 +384,7 @@ class TestSessionGhEventsTable:
         db_path = tmp_path / "github.db"
         init_github_db(str(db_path))
 
-        conn = sqlite3.connect(str(db_path))
-        try:
-            cols = {
-                r[1]
-                for r in conn.execute(
-                    "PRAGMA table_info(session_gh_events)"
-                ).fetchall()
-            }
-        finally:
-            conn.close()
-
-        assert cols >= {
-            "session_uuid",
-            "event_type",
-            "repo",
-            "ref",
-            "url",
-            "confidence",
-            "created_at",
-        }
+        assert_schema(db_path, {"session_gh_events": EXPECTED_GITHUB_TABLES["session_gh_events"]})
 
     def test_session_gh_events_primary_key(self, tmp_path):
         """session_gh_events enforces (session_uuid, event_type, repo, ref) PK."""

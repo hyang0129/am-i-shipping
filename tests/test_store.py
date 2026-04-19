@@ -236,14 +236,14 @@ class TestUpsertSessionGhEvents:
         conn = sqlite3.connect(str(gh_db_path))
         try:
             rows = conn.execute(
-                "SELECT session_uuid, event_type, repo, ref "
+                "SELECT session_uuid, event_type, repo, ref, url, confidence "
                 "FROM session_gh_events"
             ).fetchall()
         finally:
             conn.close()
 
         assert len(rows) == 1
-        assert rows[0] == ("gh-events-uuid", "issue_comment", "a/b", "1")
+        assert rows[0] == ("gh-events-uuid", "issue_comment", "a/b", "1", "", "high")
 
     def test_upsert_session_gh_events_idempotent(self, tmp_path):
         """Calling upsert_session twice produces exactly one row (INSERT OR IGNORE)."""
