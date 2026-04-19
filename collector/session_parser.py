@@ -104,21 +104,22 @@ def _strip_content_blocks(content: Any) -> Any:
     return content
 
 
-def _extract_gh_events(entry: dict) -> list:
+def _extract_gh_events(entry: dict, pending_creates: dict) -> list:
     """Extract GitHub/git CLI events from a single JSONL entry.
 
     Scans tool_use Bash blocks for gh CLI and git push commands, returning a
     list of event dicts with keys: event_type, repo, ref, url, confidence,
     created_at.
 
-    tool_result blocks are used to upgrade "pending" refs for create events
-    (issue/PR numbers extracted from stdout URLs).
+    pending_creates is a session-scoped dict (tool_use_id -> event dict) that
+    is mutated in-place. Pass the same dict across all entries in a session so
+    that tool_result blocks arriving in a later entry can resolve pending refs.
+    The caller (parse_session) flushes any remaining pending events after the
+    last entry.
 
-    Scope note: only ``gh`` invocations that include an explicit ``--repo
-    OWNER/REPO`` flag (or a full GitHub URL target) are captured. Invocations
-    where the repo is inferred from the working directory (i.e. those without
-    ``--repo``) are intentionally not captured in this version — cwd-based
-    repo inference is a separate task.
+    tool_result blocks are used to upgrade "pending" refs for create events
+    (issue/PR numbers extracted from stdout URLs). When a create command omits
+    ``--repo``, the repo is also resolved from the tool_result URL.
     """
     if entry.get("type") not in ("user", "assistant"):
         return []
@@ -128,9 +129,6 @@ def _extract_gh_events(entry: dict) -> list:
 
     created_at = entry.get("timestamp", "")
 
-    # First pass: collect tool_use Bash commands, keyed by tool_use_id
-    # so we can correlate with tool_result blocks in the same entry.
-    pending_creates: dict = {}  # tool_use_id -> event dict (ref="pending")
     events: list = []
 
     for block in content:
@@ -154,6 +152,19 @@ def _extract_gh_events(entry: dict) -> list:
                     "confidence": "medium",
                     "created_at": created_at,
                 }
+
+            # gh issue create (no --repo — repo resolved from tool_result URL)
+            if ev is None:
+                m = re.search(r"gh\s+issue\s+create\b", command, re.DOTALL)
+                if m:
+                    ev = {
+                        "event_type": "issue_create",
+                        "repo": "",
+                        "ref": "pending",
+                        "url": "",
+                        "confidence": "medium",
+                        "created_at": created_at,
+                    }
 
             # gh issue comment N --repo OWNER/REPO  or  gh issue comment --repo OWNER/REPO N
             if ev is None:
@@ -186,6 +197,19 @@ def _extract_gh_events(entry: dict) -> list:
                     ev = {
                         "event_type": "pr_create",
                         "repo": m.group(1),
+                        "ref": "pending",
+                        "url": "",
+                        "confidence": "medium",
+                        "created_at": created_at,
+                    }
+
+            # gh pr create (no --repo — repo resolved from tool_result URL)
+            if ev is None:
+                m = re.search(r"gh\s+pr\s+create\b", command, re.DOTALL)
+                if m:
+                    ev = {
+                        "event_type": "pr_create",
+                        "repo": "",
                         "ref": "pending",
                         "url": "",
                         "confidence": "medium",
@@ -313,6 +337,8 @@ def _extract_gh_events(entry: dict) -> list:
                     ev["ref"] = m.group(2)
                     ev["url"] = m.group(0)
                     ev["confidence"] = "high"
+                    if not ev["repo"]:
+                        ev["repo"] = m.group(1)
                 else:
                     # Look for https://github.com/OWNER/REPO/pull/N
                     m = re.search(
@@ -324,11 +350,9 @@ def _extract_gh_events(entry: dict) -> list:
                         ev["ref"] = m.group(2)
                         ev["url"] = m.group(0)
                         ev["confidence"] = "high"
+                        if not ev["repo"]:
+                            ev["repo"] = m.group(1)
                 events.append(ev)
-
-    # Any pending creates that had no corresponding tool_result in this entry
-    for ev in pending_creates.values():
-        events.append(ev)
 
     return events
 
@@ -373,6 +397,7 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
     cache_read_tokens = 0
     fast_mode_turns = 0
     gh_events_list: List[Dict[str, Any]] = []
+    pending_creates: Dict[str, Any] = {}
 
     try:
         with open(filepath, "r", encoding="utf-8") as f:
@@ -448,9 +473,10 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
                             if block.get("is_error"):
                                 tool_failure_count += 1
 
-                # Extract GitHub/git events from this entry
+                # Extract GitHub/git events from this entry; pending_creates is
+                # session-scoped so tool_results in later entries can resolve refs.
                 gh_events_list.extend(
-                    _extract_gh_events(entry)
+                    _extract_gh_events(entry, pending_creates)
                 )
 
                 # Accumulate token usage from assistant messages
@@ -474,6 +500,9 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
 
     except OSError as exc:
         raise SessionParseError(f"Cannot read session file {filepath}: {exc}") from exc
+
+    # Flush any create events whose tool_result never arrived
+    gh_events_list.extend(pending_creates.values())
 
     if session_uuid is None:
         raise SessionParseError(

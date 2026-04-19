@@ -92,7 +92,7 @@ class TestExtractGhEvents:
                 ],
             },
         }
-        events = _extract_gh_events(entry)
+        events = _extract_gh_events(entry, {})
         assert len(events) == 1
         ev = events[0]
         assert ev["event_type"] == "issue_create"
@@ -102,7 +102,7 @@ class TestExtractGhEvents:
         assert ev["confidence"] == "high"
 
     def test_issue_create_pending_when_no_result(self):
-        """gh issue create without a tool_result leaves ref as 'pending'."""
+        """gh issue create without a tool_result stays in pending_creates (not emitted yet)."""
         entry = {
             "type": "assistant",
             "timestamp": "2025-01-10T10:00:00Z",
@@ -116,11 +116,43 @@ class TestExtractGhEvents:
                 ],
             },
         }
-        events = _extract_gh_events(entry)
+        pending = {}
+        events = _extract_gh_events(entry, pending)
+        # Event is held in pending_creates, not emitted — caller flushes at session end
+        assert len(events) == 0
+        assert len(pending) == 1
+        ev = list(pending.values())[0]
+        assert ev["event_type"] == "issue_create"
+        assert ev["ref"] == "pending"
+        assert ev["confidence"] == "medium"
+
+    def test_issue_create_no_repo_resolved_from_tool_result(self):
+        """gh issue create without --repo resolves both repo and ref from tool_result URL."""
+        entry = {
+            "type": "assistant",
+            "timestamp": "2025-01-10T10:00:00Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    _make_tool_use_block(
+                        "tu-nr",
+                        "gh issue create --title x --body y",
+                    ),
+                    _make_tool_result_block(
+                        "tu-nr",
+                        "https://github.com/foo/bar/issues/55\n",
+                    ),
+                ],
+            },
+        }
+        events = _extract_gh_events(entry, {})
         assert len(events) == 1
-        assert events[0]["event_type"] == "issue_create"
-        assert events[0]["ref"] == "pending"
-        assert events[0]["confidence"] == "medium"
+        ev = events[0]
+        assert ev["event_type"] == "issue_create"
+        assert ev["repo"] == "foo/bar"
+        assert ev["ref"] == "55"
+        assert ev["url"] == "https://github.com/foo/bar/issues/55"
+        assert ev["confidence"] == "high"
 
     def test_issue_comment_extracts_ref_and_repo(self):
         """gh issue comment N --repo owner/repo extracts number as ref."""
@@ -137,7 +169,7 @@ class TestExtractGhEvents:
                 ],
             },
         }
-        events = _extract_gh_events(entry)
+        events = _extract_gh_events(entry, {})
         assert len(events) == 1
         ev = events[0]
         assert ev["event_type"] == "issue_comment"
@@ -163,7 +195,7 @@ class TestExtractGhEvents:
                 ],
             },
         }
-        events = _extract_gh_events(entry)
+        events = _extract_gh_events(entry, {})
         assert len(events) == 1
         ev = events[0]
         assert ev["event_type"] == "pr_create"
@@ -186,7 +218,7 @@ class TestExtractGhEvents:
                 ],
             },
         }
-        events = _extract_gh_events(entry)
+        events = _extract_gh_events(entry, {})
         assert len(events) == 1
         ev = events[0]
         assert ev["event_type"] == "git_push"
@@ -203,7 +235,7 @@ class TestExtractGhEvents:
                 ],
             },
         }
-        assert _extract_gh_events(entry) == []
+        assert _extract_gh_events(entry, {}) == []
 
     def test_string_content_returns_empty(self):
         """Entries with string content (not a list) return empty list."""
@@ -211,7 +243,7 @@ class TestExtractGhEvents:
             "type": "assistant",
             "message": {"content": "just a string"},
         }
-        assert _extract_gh_events(entry) == []
+        assert _extract_gh_events(entry, {}) == []
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +308,50 @@ def _build_session_jsonl(tmp_path: Path, session_uuid: str) -> Path:
     return filepath
 
 
+def _build_cross_entry_jsonl(tmp_path: Path, session_uuid: str) -> Path:
+    """Write a JSONL where tool_use is in entry N and tool_result is in entry N+1.
+
+    This mirrors real Claude Code logs where the assistant emits a tool_use
+    block and the next user entry carries the corresponding tool_result.
+    """
+    entry_assistant = {
+        "type": "assistant",
+        "sessionId": session_uuid,
+        "timestamp": "2025-01-10T10:00:00Z",
+        "message": {
+            "role": "assistant",
+            "content": [
+                _make_tool_use_block("tu-cross", "gh issue create --repo foo/bar --title x"),
+            ],
+        },
+    }
+    entry_user_result = {
+        "type": "user",
+        "sessionId": session_uuid,
+        "timestamp": "2025-01-10T10:00:05Z",
+        "message": {
+            "role": "user",
+            "content": [
+                _make_tool_result_block("tu-cross", "https://github.com/foo/bar/issues/77\n"),
+            ],
+        },
+    }
+    entry_user_text = {
+        "type": "user",
+        "sessionId": session_uuid,
+        "timestamp": "2025-01-10T10:01:00Z",
+        "message": {
+            "role": "user",
+            "content": [_make_text_block("Thanks.")],
+        },
+    }
+    filepath = tmp_path / f"{session_uuid}_cross.jsonl"
+    with filepath.open("w") as f:
+        for entry in [entry_assistant, entry_user_result, entry_user_text]:
+            f.write(json.dumps(entry) + "\n")
+    return filepath
+
+
 class TestParseSessionGhEvents:
     SESSION_UUID = "aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb"
 
@@ -311,6 +387,17 @@ class TestParseSessionGhEvents:
             elif isinstance(content, str):
                 # Pure text turns — allowed
                 pass
+
+    def test_cross_entry_pending_resolution(self, tmp_path):
+        """tool_result in entry N+1 resolves pending ref from tool_use in entry N."""
+        path = _build_cross_entry_jsonl(tmp_path, "cccc-cross-entry-uuid")
+        record = parse_session(path)
+        assert len(record.gh_events) == 1
+        ev = record.gh_events[0]
+        assert ev["event_type"] == "issue_create"
+        assert ev["repo"] == "foo/bar"
+        assert ev["ref"] == "77"
+        assert ev["confidence"] == "high"
 
     def test_raw_content_json_has_user_text_turn(self, tmp_path):
         """The user text turn should survive stripping and appear in raw_content_json."""
