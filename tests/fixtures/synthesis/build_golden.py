@@ -11,8 +11,9 @@ readers.  The three units are:
   and outlier detection exercise this unit.
 * Unit 2 — *abandoned*.  One open issue, one closed-unmerged PR, no
   sessions within 14+ days.  Abandonment flag tests exercise this unit.
-* Unit 3 — *singleton*.  One session not linked to any PR or issue.
-  ``dark_time_pct`` for a single-session unit must be ``0.0`` — tested.
+* Unit 3 — *unattributed session*.  One session not linked to any PR or issue.
+  Per #66, session-only components are NOT written to ``units``.  The session
+  row and graph node still exist for audit purposes.
 
 Determinism
 -----------
@@ -176,9 +177,15 @@ GRAPH_EDGES = [
 ]
 
 UNITS = [
-    (WEEK_START, "unit-0001-multi",    "issue",   "n-u1-issue", 2.1, 0.89,  1, 0, "completed"),
-    (WEEK_START, "unit-0002-abandoned","issue",   "n-u2-issue", 27.0, 1.0,  0, 0, "abandoned"),
-    (WEEK_START, "unit-0003-singleton","session", "n-u3-sess",  0.014, 0.0, 0, 0, "completed"),
+    (WEEK_START, "unit-0001-multi",    "issue",   "n-u1-issue", 2.1, 0.89,  1, 0, "completed", None, 0),
+    (WEEK_START, "unit-0002-abandoned","issue",   "n-u2-issue", 27.0, 1.0,  0, 0, "abandoned", None, 0),
+    # Unit 3 (session-only) is intentionally absent: #66 requires at least one
+    # issue or PR node in a component for it to become a unit.
+]
+
+UNIT_SUMMARIES = [
+    (WEEK_START, "unit-0001-multi",    "Unit 1 multi-session summary: two sessions, two merged PRs, one issue resolved.", "claude-haiku-4-5", 80),
+    (WEEK_START, "unit-0002-abandoned","Unit 2 abandoned summary: issue open, PR closed unmerged, no recent sessions.", "claude-haiku-4-5", 76),
 ]
 
 PR_SESSIONS = [
@@ -303,8 +310,12 @@ def build(path: Path = FIXTURE_PATH) -> None:
             GRAPH_EDGES,
         )
         conn.executemany(
-            "INSERT INTO units VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO units VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             UNITS,
+        )
+        conn.executemany(
+            "INSERT INTO unit_summaries (week_start, unit_id, summary_text, model, input_bytes) VALUES (?, ?, ?, ?, ?)",
+            UNIT_SUMMARIES,
         )
         conn.commit()
     finally:

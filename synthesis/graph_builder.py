@@ -25,6 +25,12 @@ Edge types (src → dst)
 * ``commit_refs_issue`` — ``#N`` scan of commit messages.
 * ``timeline_ref``    — ``cross-referenced`` / ``referenced`` events link the
   originating issue to the referenced issue or PR.
+* ``session_refs_issue`` — a session row in ``session_gh_events`` with
+  ``event_type`` in ``("issue_create", "issue_comment")`` links the session
+  to the referenced issue (only when the issue node already exists).
+* ``session_refs_pr``    — a session row in ``session_gh_events`` with
+  ``event_type`` in ``("pr_create", "pr_comment")`` links the session to the
+  referenced PR (only when the PR node already exists).
 
 Determinism
 -----------
@@ -149,6 +155,16 @@ def _read_timeline(conn: sqlite3.Connection) -> list[tuple]:
     ).fetchall()
 
 
+def _read_session_gh_events(conn: sqlite3.Connection) -> list[tuple]:
+    try:
+        return conn.execute(
+            "SELECT session_uuid, event_type, repo, ref "
+            "FROM session_gh_events ORDER BY session_uuid, event_type, repo, ref"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []  # table may not exist on older installs
+
+
 def _read_sessions(
     conn: sqlite3.Connection,
     week_start: Optional[str],
@@ -262,6 +278,7 @@ def build_graph(
         pr_sessions = _read_pr_sessions(gh)
         commits = _read_commits(gh)
         timeline = _read_timeline(gh)
+        session_gh_events = _read_session_gh_events(gh)
         sessions = _read_sessions(sess, week_start)
 
         nodes: dict[str, tuple[str, str, str]] = {}
@@ -412,6 +429,33 @@ def build_graph(
             if dst_nid not in nodes:
                 continue
             edges.add((src_nid, dst_nid, "timeline_ref"))
+
+        # session_refs_issue / session_refs_pr (from session_gh_events)
+        for session_uuid, event_type, repo, ref in session_gh_events:
+            # Skip pending or empty refs, and non-numeric refs.
+            if not ref or ref == "pending":
+                continue
+            try:
+                ref_int = int(ref)
+            except (ValueError, TypeError):
+                continue
+            sess_nid = _session_node(session_uuid)
+            if sess_nid not in nodes:
+                continue
+            if event_type in ("issue_create", "issue_comment"):
+                dst = _issue_node(repo, ref_int)
+                etype = "session_refs_issue"
+            elif event_type in ("pr_create", "pr_comment"):
+                dst = _pr_node(repo, ref_int)
+                etype = "session_refs_pr"
+            else:
+                # git_push and other event types have no target node.
+                continue
+            # Never create stub nodes — only add the edge when the target
+            # already exists in the graph.
+            if dst not in nodes:
+                continue
+            edges.add((sess_nid, dst, etype))
 
         # --- write -----------------------------------------------------
         sorted_nodes = sorted(nodes.items(), key=lambda kv: (kv[1][0], kv[0]))

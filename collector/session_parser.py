@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -58,6 +59,7 @@ class SessionRecord:
     # ``None`` when no timestamps were parsed (malformed or ancient session).
     session_started_at: Optional[str] = None
     session_ended_at: Optional[str] = None
+    gh_events: list = field(default_factory=list)
 
 
 def _git_branch_from_dir(cwd: str) -> Optional[str]:
@@ -102,6 +104,165 @@ def _strip_content_blocks(content: Any) -> Any:
     return content
 
 
+def _extract_gh_events(entry: dict, working_directory: Optional[str]) -> list:
+    """Extract GitHub/git CLI events from a single JSONL entry.
+
+    Scans tool_use Bash blocks for gh CLI and git push commands, returning a
+    list of event dicts with keys: event_type, repo, ref, url, confidence,
+    created_at.
+
+    tool_result blocks are used to upgrade "pending" refs for create events
+    (issue/PR numbers extracted from stdout URLs).
+    """
+    if entry.get("type") not in ("user", "assistant"):
+        return []
+    content = entry.get("message", {}).get("content", "")
+    if not isinstance(content, list):
+        return []
+
+    created_at = entry.get("timestamp", "")
+
+    # First pass: collect tool_use Bash commands, keyed by tool_use_id
+    # so we can correlate with tool_result blocks in the same entry.
+    pending_creates: dict = {}  # tool_use_id -> event dict (ref="pending")
+    events: list = []
+
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type", "")
+
+        if btype == "tool_use" and block.get("name") == "Bash":
+            command = block.get("input", {}).get("command", "") or ""
+            tool_use_id = block.get("id", "")
+            ev = None
+
+            # gh issue create --repo OWNER/REPO
+            m = re.search(r"gh\s+issue\s+create\b.*?--repo\s+(\S+)", command)
+            if m:
+                ev = {
+                    "event_type": "issue_create",
+                    "repo": m.group(1),
+                    "ref": "pending",
+                    "url": "",
+                    "confidence": "medium",
+                    "created_at": created_at,
+                }
+
+            # gh issue comment N --repo OWNER/REPO  or  gh issue comment --repo OWNER/REPO N
+            if ev is None:
+                m = re.search(r"gh\s+issue\s+comment\s+(\d+)\s+.*?--repo\s+(\S+)", command)
+                if m:
+                    ev = {
+                        "event_type": "issue_comment",
+                        "repo": m.group(2),
+                        "ref": m.group(1),
+                        "url": "",
+                        "confidence": "high",
+                        "created_at": created_at,
+                    }
+            if ev is None:
+                m = re.search(r"gh\s+issue\s+comment\s+--repo\s+(\S+)\s+(\d+)", command)
+                if m:
+                    ev = {
+                        "event_type": "issue_comment",
+                        "repo": m.group(1),
+                        "ref": m.group(2),
+                        "url": "",
+                        "confidence": "high",
+                        "created_at": created_at,
+                    }
+
+            # gh pr create --repo OWNER/REPO
+            if ev is None:
+                m = re.search(r"gh\s+pr\s+create\b.*?--repo\s+(\S+)", command)
+                if m:
+                    ev = {
+                        "event_type": "pr_create",
+                        "repo": m.group(1),
+                        "ref": "pending",
+                        "url": "",
+                        "confidence": "medium",
+                        "created_at": created_at,
+                    }
+
+            # gh pr comment N --repo OWNER/REPO
+            if ev is None:
+                m = re.search(r"gh\s+pr\s+comment\s+(\d+)\s+.*?--repo\s+(\S+)", command)
+                if m:
+                    ev = {
+                        "event_type": "pr_comment",
+                        "repo": m.group(2),
+                        "ref": m.group(1),
+                        "url": "",
+                        "confidence": "high",
+                        "created_at": created_at,
+                    }
+
+            # git push (best effort: extract branch if present)
+            if ev is None and re.search(r"\bgit\s+push\b", command):
+                # Try to extract remote branch from e.g. "git push origin my-branch"
+                branch_ref = ""
+                m = re.search(r"git\s+push\s+\S+\s+(\S+)", command)
+                if m:
+                    branch_ref = m.group(1)
+                ev = {
+                    "event_type": "git_push",
+                    "repo": "",
+                    "ref": branch_ref,
+                    "url": "",
+                    "confidence": "medium",
+                    "created_at": created_at,
+                }
+
+            if ev is not None:
+                if ev["ref"] == "pending" and tool_use_id:
+                    pending_creates[tool_use_id] = ev
+                else:
+                    events.append(ev)
+
+        elif btype == "tool_result":
+            # Try to upgrade pending create events using stdout from the result
+            tool_use_id = block.get("tool_use_id", "")
+            if tool_use_id and tool_use_id in pending_creates:
+                ev = pending_creates.pop(tool_use_id)
+                result_content = block.get("content", "")
+                if isinstance(result_content, list):
+                    result_text = " ".join(
+                        c.get("text", "") if isinstance(c, dict) else str(c)
+                        for c in result_content
+                    )
+                else:
+                    result_text = str(result_content) if result_content else ""
+
+                # Look for https://github.com/OWNER/REPO/issues/N
+                m = re.search(
+                    r"https://github\.com/([\w.\-]+/[\w.\-]+)/issues/(\d+)",
+                    result_text,
+                )
+                if m:
+                    ev["ref"] = m.group(2)
+                    ev["url"] = m.group(0)
+                    ev["confidence"] = "high"
+                else:
+                    # Look for https://github.com/OWNER/REPO/pull/N
+                    m = re.search(
+                        r"https://github\.com/([\w.\-]+/[\w.\-]+)/pull/(\d+)",
+                        result_text,
+                    )
+                    if m:
+                        ev["ref"] = m.group(2)
+                        ev["url"] = m.group(0)
+                        ev["confidence"] = "high"
+                events.append(ev)
+
+    # Any pending creates that had no corresponding tool_result in this entry
+    for ev in pending_creates.values():
+        events.append(ev)
+
+    return events
+
+
 def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
     """Parse a Claude Code JSONL session file into a SessionRecord.
 
@@ -141,6 +302,7 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
     cache_creation_tokens = 0
     cache_read_tokens = 0
     fast_mode_turns = 0
+    gh_events_list: List[Dict[str, Any]] = []
 
     try:
         with open(filepath, "r", encoding="utf-8") as f:
@@ -216,6 +378,11 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
                             if block.get("is_error"):
                                 tool_failure_count += 1
 
+                # Extract GitHub/git events from this entry
+                gh_events_list.extend(
+                    _extract_gh_events(entry, working_directory)
+                )
+
                 # Accumulate token usage from assistant messages
                 if entry_type == "assistant":
                     usage = msg.get("usage", {})
@@ -272,6 +439,15 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
 
     raw_content_json = json.dumps(raw_content_turns, ensure_ascii=False)
 
+    # De-duplicate gh_events by (event_type, repo, ref)
+    seen_gh_keys: set = set()
+    deduped_gh_events: List[Dict[str, Any]] = []
+    for ev in gh_events_list:
+        key = (ev["event_type"], ev["repo"], ev["ref"])
+        if key not in seen_gh_keys:
+            seen_gh_keys.add(key)
+            deduped_gh_events.append(ev)
+
     return SessionRecord(
         session_uuid=session_uuid,
         turn_count=turn_count,
@@ -290,6 +466,7 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
         fast_mode_turns=fast_mode_turns,
         session_started_at=session_started_at,
         session_ended_at=session_ended_at,
+        gh_events=deduped_gh_events,
     )
 
 
@@ -412,10 +589,11 @@ def run_batch(config_path: Optional[str] = None) -> None:
     inter_delay = config.session.limiter.inter_file_delay_seconds
 
     # Ensure DB exists
-    from am_i_shipping.db import init_sessions_db
+    from am_i_shipping.db import init_github_db, init_sessions_db
 
     data_dir.mkdir(parents=True, exist_ok=True)
     init_sessions_db(db_path)
+    init_github_db(data_dir / "github.db")
 
     # Discover files
     session_files = _discover_session_files(config.session.projects_path)

@@ -425,3 +425,312 @@ class TestBuildGraphFixture:
         assert counts.get("pr") == 3
         assert counts.get("commit") == 3
         assert counts.get("session") == 3
+
+
+# ---------------------------------------------------------------------------
+# Issue #66 — session_refs_issue / session_refs_pr edges from session_gh_events
+# ---------------------------------------------------------------------------
+
+
+def _make_gh_db(tmp_path: Path) -> Path:
+    """Create a fresh github.db (all tables, no rows) in tmp_path."""
+    from am_i_shipping.db import init_github_db
+
+    path = tmp_path / "github.db"
+    init_github_db(path)
+    return path
+
+
+def _make_sess_db(tmp_path: Path) -> Path:
+    """Create a fresh sessions.db (all tables, no rows) in tmp_path."""
+    from am_i_shipping.db import init_sessions_db
+
+    path = tmp_path / "sessions.db"
+    init_sessions_db(path)
+    return path
+
+
+def _seed_session(conn: sqlite3.Connection, uuid: str, started_at: str) -> None:
+    """Insert a minimal sessions row."""
+    conn.execute(
+        "INSERT OR IGNORE INTO sessions "
+        "(session_uuid, turn_count, tool_call_count, tool_failure_count, "
+        " reprompt_count, bail_out, session_duration_seconds, "
+        " working_directory, git_branch, raw_content_json, "
+        " input_tokens, output_tokens, cache_creation_tokens, "
+        " cache_read_tokens, fast_mode_turns, "
+        " session_started_at, session_ended_at) "
+        "VALUES (?, 1, 0, 0, 0, 0, 60.0, '/tmp', 'main', '[]', "
+        " 0, 0, 0, 0, 0, ?, ?)",
+        (uuid, started_at, started_at),
+    )
+
+
+def _seed_issue(conn: sqlite3.Connection, repo: str, number: int) -> None:
+    """Insert a minimal issues row."""
+    conn.execute(
+        "INSERT OR IGNORE INTO issues "
+        "(repo, issue_number, title, type_label, state, body, comments_json, "
+        " created_at, closed_at, updated_at) "
+        "VALUES (?, ?, 'Test issue', 'feature', 'open', '', '[]', "
+        " '2025-01-10T09:00:00Z', NULL, '2025-01-10T09:00:00Z')",
+        (repo, number),
+    )
+
+
+def _seed_pr(conn: sqlite3.Connection, repo: str, number: int) -> None:
+    """Insert a minimal pull_requests row."""
+    conn.execute(
+        "INSERT OR IGNORE INTO pull_requests "
+        "(repo, pr_number, head_ref, title, body, comments_json, "
+        " review_comments_json, review_comment_count, push_count, "
+        " created_at, merged_at, updated_at) "
+        "VALUES (?, ?, 'fix/test', 'Test PR', '', '[]', '[]', 0, 0, "
+        " '2025-01-10T09:00:00Z', NULL, '2025-01-10T09:00:00Z')",
+        (repo, number),
+    )
+
+
+def _seed_session_gh_event(
+    conn: sqlite3.Connection,
+    session_uuid: str,
+    event_type: str,
+    repo: str,
+    ref: str,
+) -> None:
+    """Insert a session_gh_events row."""
+    conn.execute(
+        "INSERT OR IGNORE INTO session_gh_events "
+        "(session_uuid, event_type, repo, ref, url, confidence, created_at) "
+        "VALUES (?, ?, ?, ?, '', 'high', '2025-01-10T10:00:00Z')",
+        (session_uuid, event_type, repo, ref),
+    )
+
+
+SESSION_UUID = "s1s1s1s1-0000-0000-0000-000000000001"
+REPO = "owner/repo"
+WEEK = "2025-01-06"
+
+
+class TestSessionRefsIssueEdge:
+    """build_graph emits session_refs_issue edges from session_gh_events."""
+
+    def test_session_refs_issue_edge_emitted(self, tmp_path):
+        """An issue_comment event pointing to an existing issue creates an edge."""
+        gh_db = _make_gh_db(tmp_path)
+        sess_db = _make_sess_db(tmp_path)
+
+        gh_conn = sqlite3.connect(str(gh_db))
+        sess_conn = sqlite3.connect(str(sess_db))
+        try:
+            _seed_issue(gh_conn, REPO, 42)
+            _seed_session_gh_event(
+                gh_conn, SESSION_UUID, "issue_comment", REPO, "42"
+            )
+            gh_conn.commit()
+
+            _seed_session(sess_conn, SESSION_UUID, "2025-01-10T10:00:00Z")
+            sess_conn.commit()
+        finally:
+            gh_conn.close()
+            sess_conn.close()
+
+        build_graph(sess_db, gh_db)
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            edges = {
+                (src, dst, etype)
+                for _week, src, dst, etype in conn.execute(
+                    "SELECT week_start, src_node_id, dst_node_id, edge_type "
+                    "FROM graph_edges"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+
+        expected_src = f"session:{SESSION_UUID}"
+        expected_dst = f"issue:{REPO}#42"
+        assert (expected_src, expected_dst, "session_refs_issue") in edges, (
+            f"Expected session_refs_issue edge not found. Edges present: {edges}"
+        )
+
+    def test_session_refs_issue_skipped_when_issue_missing(self, tmp_path):
+        """No edge is emitted when the target issue node does not exist."""
+        gh_db = _make_gh_db(tmp_path)
+        sess_db = _make_sess_db(tmp_path)
+
+        gh_conn = sqlite3.connect(str(gh_db))
+        sess_conn = sqlite3.connect(str(sess_db))
+        try:
+            # No issues row — only the session_gh_events event
+            _seed_session_gh_event(
+                gh_conn, SESSION_UUID, "issue_comment", REPO, "42"
+            )
+            gh_conn.commit()
+
+            _seed_session(sess_conn, SESSION_UUID, "2025-01-10T10:00:00Z")
+            sess_conn.commit()
+        finally:
+            gh_conn.close()
+            sess_conn.close()
+
+        build_graph(sess_db, gh_db)
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            edges = [
+                (src, dst, etype)
+                for _week, src, dst, etype in conn.execute(
+                    "SELECT week_start, src_node_id, dst_node_id, edge_type "
+                    "FROM graph_edges"
+                ).fetchall()
+            ]
+            nodes = [
+                nid
+                for _week, nid, *_ in conn.execute(
+                    "SELECT week_start, node_id, node_type, node_ref, created_at "
+                    "FROM graph_nodes"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
+        # No session_refs_issue edge should exist
+        refs_issue_edges = [
+            e for e in edges if e[2] == "session_refs_issue"
+        ]
+        assert refs_issue_edges == [], (
+            f"Expected no session_refs_issue edge, got: {refs_issue_edges}"
+        )
+
+        # No stub node for the missing issue
+        issue_node = f"issue:{REPO}#42"
+        assert issue_node not in nodes, (
+            f"Stub node {issue_node!r} must not be created when issue is missing"
+        )
+
+    def test_git_push_does_not_emit_edge(self, tmp_path):
+        """git_push events in session_gh_events do not produce any session_refs edge."""
+        gh_db = _make_gh_db(tmp_path)
+        sess_db = _make_sess_db(tmp_path)
+
+        gh_conn = sqlite3.connect(str(gh_db))
+        sess_conn = sqlite3.connect(str(sess_db))
+        try:
+            # Add an issue so the session *could* link (but shouldn't via git_push)
+            _seed_issue(gh_conn, REPO, 42)
+            _seed_session_gh_event(
+                gh_conn, SESSION_UUID, "git_push", REPO, "feature-x"
+            )
+            gh_conn.commit()
+
+            _seed_session(sess_conn, SESSION_UUID, "2025-01-10T10:00:00Z")
+            sess_conn.commit()
+        finally:
+            gh_conn.close()
+            sess_conn.close()
+
+        build_graph(sess_db, gh_db)
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            edges = [
+                (src, dst, etype)
+                for _week, src, dst, etype in conn.execute(
+                    "SELECT week_start, src_node_id, dst_node_id, edge_type "
+                    "FROM graph_edges"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
+        # No session_refs_* edge should come from the git_push event
+        session_refs_edges = [
+            e for e in edges
+            if e[0].startswith(f"session:{SESSION_UUID}")
+            and e[2].startswith("session_refs")
+        ]
+        assert session_refs_edges == [], (
+            f"git_push must not emit session_refs edge, got: {session_refs_edges}"
+        )
+
+    def test_session_refs_pr_edge_emitted(self, tmp_path):
+        """A pr_comment event pointing to an existing PR creates a session_refs_pr edge."""
+        gh_db = _make_gh_db(tmp_path)
+        sess_db = _make_sess_db(tmp_path)
+
+        gh_conn = sqlite3.connect(str(gh_db))
+        sess_conn = sqlite3.connect(str(sess_db))
+        try:
+            _seed_pr(gh_conn, REPO, 99)
+            _seed_session_gh_event(
+                gh_conn, SESSION_UUID, "pr_comment", REPO, "99"
+            )
+            gh_conn.commit()
+
+            _seed_session(sess_conn, SESSION_UUID, "2025-01-10T10:00:00Z")
+            sess_conn.commit()
+        finally:
+            gh_conn.close()
+            sess_conn.close()
+
+        build_graph(sess_db, gh_db)
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            edges = {
+                (src, dst, etype)
+                for _week, src, dst, etype in conn.execute(
+                    "SELECT week_start, src_node_id, dst_node_id, edge_type "
+                    "FROM graph_edges"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+
+        expected_src = f"session:{SESSION_UUID}"
+        expected_dst = f"pr:{REPO}#99"
+        assert (expected_src, expected_dst, "session_refs_pr") in edges, (
+            f"Expected session_refs_pr edge not found. Edges present: {edges}"
+        )
+
+    def test_pending_ref_skipped(self, tmp_path):
+        """A session_gh_events row with ref='pending' is not turned into an edge."""
+        gh_db = _make_gh_db(tmp_path)
+        sess_db = _make_sess_db(tmp_path)
+
+        gh_conn = sqlite3.connect(str(gh_db))
+        sess_conn = sqlite3.connect(str(sess_db))
+        try:
+            _seed_issue(gh_conn, REPO, 1)
+            # Seed with ref="pending" — should be ignored by graph builder
+            _seed_session_gh_event(
+                gh_conn, SESSION_UUID, "issue_create", REPO, "pending"
+            )
+            gh_conn.commit()
+
+            _seed_session(sess_conn, SESSION_UUID, "2025-01-10T10:00:00Z")
+            sess_conn.commit()
+        finally:
+            gh_conn.close()
+            sess_conn.close()
+
+        build_graph(sess_db, gh_db)
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            refs_issue_edges = [
+                (src, dst, etype)
+                for _week, src, dst, etype in conn.execute(
+                    "SELECT week_start, src_node_id, dst_node_id, edge_type "
+                    "FROM graph_edges"
+                ).fetchall()
+                if etype == "session_refs_issue"
+            ]
+        finally:
+            conn.close()
+
+        assert refs_issue_edges == [], (
+            f"ref='pending' must not produce an edge, got: {refs_issue_edges}"
+        )

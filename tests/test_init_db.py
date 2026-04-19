@@ -339,9 +339,97 @@ class TestGoldenFixture:
             }
         finally:
             conn.close()
-        # Three distinct unit topologies: multi, abandoned, singleton.
-        assert len(unit_ids) == 3, f"expected 3 distinct unit_ids, got {unit_ids}"
+        # Two issue-anchored units (multi, abandoned). The session-only component
+        # is intentionally absent per #66: components lacking an issue/PR node
+        # are not written to units.
+        assert len(unit_ids) == 2, f"expected 2 distinct unit_ids, got {unit_ids}"
 
     def test_golden_fixture_schema_matches_live_db(self, tmp_path):
         """Every expected github.db table is present in the fixture."""
         assert_schema(self.FIXTURE, EXPECTED_GITHUB_TABLES)
+
+
+# ---------------------------------------------------------------------------
+# Issue #66 — session_gh_events table
+# ---------------------------------------------------------------------------
+
+
+class TestSessionGhEventsTable:
+    """session_gh_events is created by init_github_db with the correct schema."""
+
+    def test_session_gh_events_table_created(self, tmp_path):
+        """init_github_db creates the session_gh_events table."""
+        from am_i_shipping.db import init_github_db
+
+        db_path = tmp_path / "github.db"
+        init_github_db(str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            tables = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
+        assert "session_gh_events" in tables
+
+    def test_session_gh_events_columns(self, tmp_path):
+        """session_gh_events has the required columns."""
+        from am_i_shipping.db import init_github_db
+
+        db_path = tmp_path / "github.db"
+        init_github_db(str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            cols = {
+                r[1]
+                for r in conn.execute(
+                    "PRAGMA table_info(session_gh_events)"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+
+        assert cols >= {
+            "session_uuid",
+            "event_type",
+            "repo",
+            "ref",
+            "url",
+            "confidence",
+            "created_at",
+        }
+
+    def test_session_gh_events_primary_key(self, tmp_path):
+        """session_gh_events enforces (session_uuid, event_type, repo, ref) PK."""
+        from am_i_shipping.db import init_github_db
+
+        db_path = tmp_path / "github.db"
+        init_github_db(str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            # First insert
+            conn.execute(
+                "INSERT INTO session_gh_events "
+                "(session_uuid, event_type, repo, ref, url, confidence, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("uuid-1", "issue_comment", "a/b", "5", "", "high", "2025-01-10T10:00:00Z"),
+            )
+            conn.commit()
+
+            # Duplicate should raise IntegrityError (not INSERT OR IGNORE semantics here)
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO session_gh_events "
+                    "(session_uuid, event_type, repo, ref, url, confidence, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("uuid-1", "issue_comment", "a/b", "5", "", "high", "2025-01-10T10:00:00Z"),
+                )
+        finally:
+            conn.close()

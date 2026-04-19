@@ -4,17 +4,6 @@
   "now": "2025-01-13T00:00:00",
   "units": [
     {
-      "unit_id": "0e5eb65932c9f5f7",
-      "nodes": ["n-u3-sess"],
-      "root_node_type": "session",
-      "root_node_id": "n-u3-sess",
-      "elapsed_days": 0.013888888888888888,
-      "dark_time_pct": 0.0,
-      "total_reprompts": 0,
-      "review_cycles": 0,
-      "status": "closed"
-    },
-    {
       "unit_id": "52c2800675966c48",
       "nodes": ["n-u2-issue", "n-u2-pr"],
       "root_node_type": "issue",
