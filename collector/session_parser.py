@@ -186,7 +186,7 @@ def _extract_gh_events(entry: dict, working_directory: Optional[str]) -> list:
                         "created_at": created_at,
                     }
 
-            # gh pr comment N --repo OWNER/REPO
+            # gh pr comment N --repo OWNER/REPO  or  gh pr comment --repo OWNER/REPO N
             if ev is None:
                 m = re.search(r"gh\s+pr\s+comment\s+(\d+)\s+.*?--repo\s+(\S+)", command)
                 if m:
@@ -195,6 +195,49 @@ def _extract_gh_events(entry: dict, working_directory: Optional[str]) -> list:
                         "repo": m.group(2),
                         "ref": m.group(1),
                         "url": "",
+                        "confidence": "high",
+                        "created_at": created_at,
+                    }
+            if ev is None:
+                m = re.search(r"gh\s+pr\s+comment\s+--repo\s+(\S+)\s+(\d+)", command)
+                if m:
+                    ev = {
+                        "event_type": "pr_comment",
+                        "repo": m.group(1),
+                        "ref": m.group(2),
+                        "url": "",
+                        "confidence": "high",
+                        "created_at": created_at,
+                    }
+
+            # gh issue comment https://github.com/OWNER/REPO/issues/N  (URL form)
+            if ev is None:
+                m = re.search(
+                    r"gh\s+issue\s+comment\s+https://github\.com/([\w.\-]+/[\w.\-]+)/issues/(\d+)",
+                    command,
+                )
+                if m:
+                    ev = {
+                        "event_type": "issue_comment",
+                        "repo": m.group(1),
+                        "ref": m.group(2),
+                        "url": f"https://github.com/{m.group(1)}/issues/{m.group(2)}",
+                        "confidence": "high",
+                        "created_at": created_at,
+                    }
+
+            # gh pr comment https://github.com/OWNER/REPO/pull/N  (URL form)
+            if ev is None:
+                m = re.search(
+                    r"gh\s+pr\s+comment\s+https://github\.com/([\w.\-]+/[\w.\-]+)/pull/(\d+)",
+                    command,
+                )
+                if m:
+                    ev = {
+                        "event_type": "pr_comment",
+                        "repo": m.group(1),
+                        "ref": m.group(2),
+                        "url": f"https://github.com/{m.group(1)}/pull/{m.group(2)}",
                         "confidence": "high",
                         "created_at": created_at,
                     }
