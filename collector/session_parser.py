@@ -244,11 +244,28 @@ def _extract_gh_events(entry: dict, working_directory: Optional[str]) -> list:
 
             # git push (best effort: extract branch if present)
             if ev is None and re.search(r"\bgit\s+push\b", command):
-                # Try to extract remote branch from e.g. "git push origin my-branch"
+                # Robust branch extraction:
+                # 1. Strip flags like -u/--set-upstream before parsing
+                # 2. Handle "git push origin HEAD:refs/heads/branch" refspecs
+                # 3. Handle "git push origin branch"
                 branch_ref = ""
-                m = re.search(r"git\s+push\s+\S+\s+(\S+)", command)
-                if m:
-                    branch_ref = m.group(1)
+                tokens = command.split()
+                try:
+                    push_idx = next(i for i, t in enumerate(tokens) if t == "push")
+                except StopIteration:
+                    push_idx = None
+                if push_idx is not None:
+                    rest = [t for t in tokens[push_idx + 1:] if not t.startswith("-")]
+                    # rest[0] is the remote (if present), rest[1] is the refspec/branch
+                    if len(rest) >= 2:
+                        raw = rest[1]
+                        # Handle refspecs like HEAD:refs/heads/branch or src:dest
+                        if ":" in raw:
+                            raw = raw.split(":")[-1]
+                        # Strip refs/heads/ prefix
+                        if raw.startswith("refs/heads/"):
+                            raw = raw[len("refs/heads/"):]
+                        branch_ref = raw
                 ev = {
                     "event_type": "git_push",
                     "repo": "",
