@@ -14,9 +14,10 @@ Key invariants
   ``(week_start, unit_id)``. Re-running for the same ``week_start`` is a
   no-op — historical rows are preserved even if the underlying graph
   rotated.
-* **Singleton friendly.** Nodes with no incident edges produce
-  single-node units. Each still gets a deterministic ID, metrics, and
-  status derived from its lone node.
+* **Issue/PR anchor required.** Components that contain neither an
+  ``issue`` nor a ``pr`` node are dropped as noise and do not produce
+  ``units`` rows. Session-only components (e.g. sessions with no linked
+  issue or PR) are silently skipped.
 * **Root pick is stable.** Priority ``issue > pr > commit > session``.
   Ties broken by sorting ``node_id`` — never depends on insertion order.
 
@@ -392,6 +393,17 @@ def identify_units(
         # --- write one row per component -----------------------------
         inserted = 0
         for comp in components:
+            # Drop components that have no issue or PR anchor — they are
+            # pure session noise and do not constitute a meaningful unit.
+            # Session-only components still retain their graph_nodes /
+            # graph_edges rows (the graph builder wrote them), but they
+            # are intentionally excluded from ``units`` because there is
+            # no issue or PR anchor to attribute the work to.  See
+            # issue #66 for the design rationale.
+            comp_types = {node_info[nid][0] for nid in comp}
+            if "issue" not in comp_types and "pr" not in comp_types:
+                continue
+
             unit_id = _unit_id_from_nodes(comp)
             nodes_in_unit = [(nid, *node_info[nid]) for nid in comp]
             root_type, root_id = _pick_root(nodes_in_unit)

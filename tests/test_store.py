@@ -179,3 +179,111 @@ class TestSessionTimestampsColumns:
             "2024-06-01T00:00:00+00:00",
             "2024-06-01T02:00:00+00:00",
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #66 — gh_events written to session_gh_events in github.db
+# ---------------------------------------------------------------------------
+
+
+def _make_record_with_events(**overrides) -> SessionRecord:
+    """Build a SessionRecord carrying gh_events."""
+    defaults = {
+        "session_uuid": "gh-events-uuid",
+        "turn_count": 2,
+        "tool_call_count": 1,
+        "tool_failure_count": 0,
+        "reprompt_count": 0,
+        "bail_out": False,
+        "session_duration_seconds": 60.0,
+        "working_directory": "/tmp/test",
+        "git_branch": "main",
+        "raw_content_json": "[]",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
+        "fast_mode_turns": 0,
+        "gh_events": [
+            {
+                "event_type": "issue_comment",
+                "repo": "a/b",
+                "ref": "1",
+                "url": "",
+                "confidence": "high",
+                "created_at": "2025-01-10T10:00:00Z",
+            }
+        ],
+    }
+    defaults.update(overrides)
+    return SessionRecord(**defaults)
+
+
+class TestUpsertSessionGhEvents:
+    """upsert_session writes gh_events to session_gh_events in github.db."""
+
+    def test_upsert_session_writes_gh_events(self, tmp_path):
+        """upsert_session persists gh_events rows in session_gh_events."""
+        from am_i_shipping.db import init_github_db
+
+        db_path = tmp_path / "sessions.db"
+        gh_db_path = tmp_path / "github.db"
+        init_github_db(gh_db_path)
+
+        record = _make_record_with_events()
+        upsert_session(record, db_path=db_path, data_dir=tmp_path)
+
+        conn = sqlite3.connect(str(gh_db_path))
+        try:
+            rows = conn.execute(
+                "SELECT session_uuid, event_type, repo, ref, url, confidence "
+                "FROM session_gh_events"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert len(rows) == 1
+        assert rows[0] == ("gh-events-uuid", "issue_comment", "a/b", "1", "", "high")
+
+    def test_upsert_session_gh_events_idempotent(self, tmp_path):
+        """Calling upsert_session twice produces exactly one row (INSERT OR IGNORE)."""
+        from am_i_shipping.db import init_github_db
+
+        db_path = tmp_path / "sessions.db"
+        gh_db_path = tmp_path / "github.db"
+        init_github_db(gh_db_path)
+
+        record = _make_record_with_events()
+        upsert_session(record, db_path=db_path, data_dir=tmp_path)
+        upsert_session(record, db_path=db_path, data_dir=tmp_path)
+
+        conn = sqlite3.connect(str(gh_db_path))
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM session_gh_events"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert count == 1, f"Expected 1 row after double-upsert, got {count}"
+
+    def test_upsert_session_empty_gh_events_writes_nothing(self, tmp_path):
+        """upsert_session with empty gh_events does not write rows to session_gh_events."""
+        from am_i_shipping.db import init_github_db
+
+        db_path = tmp_path / "sessions.db"
+        gh_db_path = tmp_path / "github.db"
+        init_github_db(gh_db_path)
+
+        record = _make_record_with_events(gh_events=[])
+        upsert_session(record, db_path=db_path, data_dir=tmp_path)
+
+        conn = sqlite3.connect(str(gh_db_path))
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM session_gh_events"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert count == 0

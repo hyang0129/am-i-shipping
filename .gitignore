@@ -24,3 +24,6 @@ Thumbs.db
 
 # Claude work directory
 .claude-work/
+
+# Synthesis dry-run artifacts
+retrospectives/.dry-run/

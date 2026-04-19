@@ -340,7 +340,7 @@ class TestDryRun:
         assert "=== USER" in content
         # The per-unit block should render something recognisable from
         # the fixture — at least one of the unit IDs.
-        assert "unit-0001-multi" in content or "unit-0003-singleton" in content
+        assert "unit-0001-multi" in content or "unit-0002-abandoned" in content
 
 
 class TestNoUnitsForWeek:

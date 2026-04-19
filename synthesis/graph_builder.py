@@ -25,6 +25,12 @@ Edge types (src → dst)
 * ``commit_refs_issue`` — ``#N`` scan of commit messages.
 * ``timeline_ref``    — ``cross-referenced`` / ``referenced`` events link the
   originating issue to the referenced issue or PR.
+* ``session_refs_issue`` — a session row in ``session_gh_events`` with
+  ``event_type`` in ``("issue_create", "issue_comment")`` links the session
+  to the referenced issue (only when the issue node already exists).
+* ``session_refs_pr``    — a session row in ``session_gh_events`` with
+  ``event_type`` in ``("pr_create", "pr_comment")`` links the session to the
+  referenced PR (only when the PR node already exists).
 
 Determinism
 -----------
@@ -50,10 +56,13 @@ attaching twice.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 from pathlib import Path
 from typing import Iterable, Optional, Union
+
+logger = logging.getLogger(__name__)
 
 from collector.github_poller.link_resolver import resolve_link
 
@@ -147,6 +156,47 @@ def _read_timeline(conn: sqlite3.Connection) -> list[tuple]:
         "SELECT repo, issue_number, event_id, event_type, payload_json, created_at "
         "FROM timeline_events ORDER BY repo, issue_number, event_id"
     ).fetchall()
+
+
+def _read_session_gh_events(
+    conn: sqlite3.Connection,
+    session_uuids: Optional[Iterable[str]] = None,
+) -> list[tuple]:
+    """Return session_gh_events rows as (session_uuid, event_type, repo, ref).
+
+    Parameters
+    ----------
+    session_uuids:
+        Optional collection of session UUID strings to filter by. When
+        provided and non-empty, only rows whose ``session_uuid`` is in the
+        collection are returned (using a SQL ``WHERE … IN (…)`` clause so
+        the database can short-circuit large tables). When ``None`` or
+        empty, all rows are returned for backward compatibility.
+    """
+    uuids_list = list(session_uuids) if session_uuids is not None else []
+    try:
+        if uuids_list:
+            placeholders = ",".join("?" * len(uuids_list))
+            rows = conn.execute(
+                f"SELECT session_uuid, event_type, repo, ref "
+                f"FROM session_gh_events "
+                f"WHERE session_uuid IN ({placeholders}) "
+                f"ORDER BY session_uuid, event_type, repo, ref",
+                uuids_list,
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT session_uuid, event_type, repo, ref "
+                "FROM session_gh_events ORDER BY session_uuid, event_type, repo, ref"
+            ).fetchall()
+    except sqlite3.OperationalError as exc:
+        logger.warning(
+            "session_gh_events table missing (%s); skipping session-GH edges"
+            " — run the db initialiser to create it",
+            exc,
+        )
+        return []
+    return [(r[0], r[1], r[2], r[3]) for r in rows]
 
 
 def _read_sessions(
@@ -300,6 +350,13 @@ def build_graph(
                     (uuid, workdir or "")
                 )
 
+        # Extract in-window session UUIDs so _read_session_gh_events can
+        # scope its SQL query to only the rows we care about (F-17 perf fix).
+        in_window_session_uuids = [
+            nid[len("session:"):] for nid in nodes if nid.startswith("session:")
+        ]
+        session_gh_events = _read_session_gh_events(gh, in_window_session_uuids)
+
         # --- edges -----------------------------------------------------
         # (src_node_id, dst_node_id, edge_type) — set-dedup, then sorted.
         edges: set[tuple[str, str, str]] = set()
@@ -413,10 +470,52 @@ def build_graph(
                 continue
             edges.add((src_nid, dst_nid, "timeline_ref"))
 
+        # session_refs_issue / session_refs_pr (from session_gh_events)
+        for session_uuid, event_type, repo, ref in session_gh_events:
+            # Skip pending or empty refs, and non-numeric refs.
+            if not ref or ref == "pending":
+                continue
+            try:
+                ref_int = int(ref)
+            except (ValueError, TypeError):
+                logger.debug(
+                    "skipping session_gh_events row with non-numeric ref=%r (session=%s)",
+                    ref,
+                    session_uuid,
+                )
+                continue
+            sess_nid = _session_node(session_uuid)
+            if sess_nid not in nodes:
+                continue
+            if event_type in ("issue_create", "issue_comment"):
+                dst = _issue_node(repo, ref_int)
+                etype = "session_refs_issue"
+            elif event_type in ("pr_create", "pr_comment"):
+                dst = _pr_node(repo, ref_int)
+                etype = "session_refs_pr"
+            else:
+                # git_push and other event types have no target node.
+                continue
+            # For *_create events (session directly created the issue/PR), bootstrap
+            # a stub node if the GitHub poller hasn't populated it yet. For *_comment
+            # events, require the node to pre-exist to avoid dangling edges from
+            # ambiguous references.
+            if dst not in nodes:
+                if event_type not in ("issue_create", "pr_create"):
+                    continue
+                node_type = "issue" if event_type == "issue_create" else "pr"
+                node_ref = f"{repo}#{ref_int}"
+                nodes[dst] = (node_type, node_ref, "")
+            edges.add((sess_nid, dst, etype))
+
         # --- write -----------------------------------------------------
         sorted_nodes = sorted(nodes.items(), key=lambda kv: (kv[1][0], kv[0]))
         sorted_edges = sorted(edges)
 
+        gh.execute(
+            "DELETE FROM graph_nodes WHERE week_start = ? AND created_at = '' AND node_type IN ('issue', 'pr')",
+            (partition,),
+        )
         for node_id, (node_type, node_ref, created_at) in sorted_nodes:
             gh.execute(
                 "INSERT OR IGNORE INTO graph_nodes "
@@ -424,6 +523,18 @@ def build_graph(
                 "VALUES (?, ?, ?, ?, ?)",
                 (partition, node_id, node_type, node_ref, created_at),
             )
+        # Remove edges whose src or dst node was deleted and not re-inserted.
+        # This runs after all node inserts so legitimate nodes are present
+        # before we evaluate orphan status.
+        gh.execute(
+            "DELETE FROM graph_edges "
+            "WHERE week_start = ? "
+            "  AND ("
+            "    src_node_id NOT IN (SELECT node_id FROM graph_nodes WHERE week_start = ?)"
+            "    OR dst_node_id NOT IN (SELECT node_id FROM graph_nodes WHERE week_start = ?)"
+            "  )",
+            (partition, partition, partition),
+        )
         for src, dst, etype in sorted_edges:
             gh.execute(
                 "INSERT OR IGNORE INTO graph_edges "

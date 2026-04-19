@@ -200,6 +200,38 @@ am-i-shipping/
 
 ---
 
+## Reprocessing after #66
+
+If you upgraded from before issue #66, the `units` table definition changed:
+session-only connected components (sessions with no linked issue or PR) are no
+longer materialised as units. Expect your `units` row count to **drop** after
+reprocessing — this is correct, not data loss.
+
+Run these three steps in order:
+
+1. **Create the new table:**
+   ```
+   python -m am_i_shipping.db
+   ```
+   This adds the `session_gh_events` table to `data/github.db`.
+
+2. **Re-extract GH events from historical sessions:**
+   ```
+   python -m collector.session_parser --mode batch
+   ```
+   Existing sessions are skipped by UUID, so only new sessions are parsed.
+   To force a full backfill, delete `data/sessions.db` first (this re-parses
+   all transcripts — safe but slow).
+
+3. **Re-run synthesis:**
+   ```
+   am-synthesize
+   ```
+   Or: `python -m synthesis.cli`. The graph and units tables are rebuilt under
+   the new definition.
+
+---
+
 ## Further Reading
 
 - [setup.md](setup.md) — Detailed platform-specific setup instructions, hook configuration, and troubleshooting

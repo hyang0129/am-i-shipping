@@ -418,10 +418,6 @@ def test_cache_control_block_shape_live(tmp_path: Path):
     class _FakeSDKClient:
         messages = _FakeMessages()
 
-    # Patch anthropic.Anthropic so AnthropicAdapter uses our capturing client.
-    with mock.patch("synthesis.llm_adapter.AnthropicAdapter.call", autospec=True) as _mock:
-        pass  # just verify import
-
     # Call AnthropicAdapter.call() directly with a patched anthropic module.
     import synthesis.llm_adapter as llm_adapter_module
 
