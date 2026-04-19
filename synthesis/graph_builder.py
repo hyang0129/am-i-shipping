@@ -480,10 +480,16 @@ def build_graph(
             else:
                 # git_push and other event types have no target node.
                 continue
-            # Never create stub nodes — only add the edge when the target
-            # already exists in the graph.
+            # For *_create events (session directly created the issue/PR), bootstrap
+            # a stub node if the GitHub poller hasn't populated it yet. For *_comment
+            # events, require the node to pre-exist to avoid dangling edges from
+            # ambiguous references.
             if dst not in nodes:
-                continue
+                if event_type not in ("issue_create", "pr_create"):
+                    continue
+                node_type = "issue" if event_type == "issue_create" else "pr"
+                node_ref = f"{repo}#{ref_int}"
+                nodes[dst] = (node_type, node_ref, "")
             edges.add((sess_nid, dst, etype))
 
         # --- write -----------------------------------------------------
