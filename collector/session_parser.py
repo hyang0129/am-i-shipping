@@ -538,10 +538,17 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
 
     raw_content_json = json.dumps(raw_content_turns, ensure_ascii=False)
 
-    # De-duplicate gh_events by (event_type, repo, ref)
+    # De-duplicate gh_events by (event_type, repo, ref).
+    # Unresolved creates (ref == "pending") are kept as-is — each represents a
+    # distinct tool_use attempt identified by its own tool_use_id, so collapsing
+    # them would silently drop audit signal that two create attempts were made.
     seen_gh_keys: set = set()
     deduped_gh_events: List[Dict[str, Any]] = []
     for ev in gh_events_list:
+        if ev["ref"] == "pending":
+            # Keep all unresolved creates — each represents a distinct tool_use attempt.
+            deduped_gh_events.append(ev)
+            continue
         key = (ev["event_type"], ev["repo"], ev["ref"])
         if key not in seen_gh_keys:
             seen_gh_keys.add(key)

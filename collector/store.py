@@ -124,6 +124,9 @@ def upsert_session(
         if not skip_init:
             from am_i_shipping.db import init_github_db
 
+            # Hook mode (skip_init=False) pays ~10 CREATE TABLE IF NOT EXISTS
+            # statements per session here. Batch/bulk callers should pass
+            # skip_init=True and call init_github_db() once before the loop.
             init_github_db(github_db_path)
         gh_conn = sqlite3.connect(str(github_db_path))
         try:

@@ -160,33 +160,30 @@ def _read_timeline(conn: sqlite3.Connection) -> list[tuple]:
 
 def _read_session_gh_events(
     conn: sqlite3.Connection,
-    week_start: Optional[str] = None,
+    week_start: Optional[str] = None,  # kept for API compatibility; no longer used for filtering
 ) -> list[tuple]:
-    """Return session_gh_events rows, optionally filtered to a week window.
+    """Return all session_gh_events rows as (session_uuid, event_type, repo, ref).
 
-    When ``week_start`` is provided (YYYY-MM-DD), only rows whose
-    ``created_at`` falls in ``[week_start, week_start + 7 days)`` are
-    returned, symmetric to the ``_read_sessions`` date-window pattern.
+    The ``week_start`` parameter is accepted but ignored — filtering by
+    ``created_at`` was removed because it silently dropped edges when a GH
+    event's ``created_at`` fell in a different week than the session it
+    belonged to.  Correct week-scoping is handled by the
+    ``if sess_nid not in nodes: continue`` guard in ``build_graph``, which
+    already limits edges to sessions returned by ``_read_sessions``.
     """
     try:
         rows = conn.execute(
-            "SELECT session_uuid, event_type, repo, ref, created_at "
+            "SELECT session_uuid, event_type, repo, ref "
             "FROM session_gh_events ORDER BY session_uuid, event_type, repo, ref"
         ).fetchall()
-    except sqlite3.OperationalError:
-        return []  # table may not exist on older installs
-    if not week_start:
-        # Drop the extra created_at column to keep the return shape consistent
-        # with what callers expect: (session_uuid, event_type, repo, ref).
-        return [(r[0], r[1], r[2], r[3]) for r in rows]
-    week_end = _add_days(week_start, 7)
-    filtered: list[tuple] = []
-    for session_uuid, event_type, repo, ref, created_at in rows:
-        if not created_at:
-            continue
-        if week_start <= created_at < week_end:
-            filtered.append((session_uuid, event_type, repo, ref))
-    return filtered
+    except sqlite3.OperationalError as exc:
+        logger.warning(
+            "session_gh_events table missing (%s); skipping session-GH edges"
+            " — run the db initialiser to create it",
+            exc,
+        )
+        return []
+    return [(r[0], r[1], r[2], r[3]) for r in rows]
 
 
 def _read_sessions(
@@ -496,6 +493,10 @@ def build_graph(
         sorted_nodes = sorted(nodes.items(), key=lambda kv: (kv[1][0], kv[0]))
         sorted_edges = sorted(edges)
 
+        gh.execute(
+            "DELETE FROM graph_nodes WHERE week_start = ? AND created_at = ''",
+            (partition,),
+        )
         for node_id, (node_type, node_ref, created_at) in sorted_nodes:
             gh.execute(
                 "INSERT OR IGNORE INTO graph_nodes "
