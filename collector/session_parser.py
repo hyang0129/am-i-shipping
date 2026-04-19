@@ -138,7 +138,7 @@ def _extract_gh_events(entry: dict, working_directory: Optional[str]) -> list:
             ev = None
 
             # gh issue create --repo OWNER/REPO
-            m = re.search(r"gh\s+issue\s+create\b.*?--repo\s+(\S+)", command)
+            m = re.search(r"gh\s+issue\s+create\b.*?--repo\s+(\S+)", command, re.DOTALL)
             if m:
                 ev = {
                     "event_type": "issue_create",
@@ -151,7 +151,7 @@ def _extract_gh_events(entry: dict, working_directory: Optional[str]) -> list:
 
             # gh issue comment N --repo OWNER/REPO  or  gh issue comment --repo OWNER/REPO N
             if ev is None:
-                m = re.search(r"gh\s+issue\s+comment\s+(\d+)\s+.*?--repo\s+(\S+)", command)
+                m = re.search(r"gh\s+issue\s+comment\s+(\d+)\s+.*?--repo\s+(\S+)", command, re.DOTALL)
                 if m:
                     ev = {
                         "event_type": "issue_comment",
@@ -162,7 +162,7 @@ def _extract_gh_events(entry: dict, working_directory: Optional[str]) -> list:
                         "created_at": created_at,
                     }
             if ev is None:
-                m = re.search(r"gh\s+issue\s+comment\s+--repo\s+(\S+)\s+(\d+)", command)
+                m = re.search(r"gh\s+issue\s+comment\s+--repo\s+(\S+)\s+(\d+)", command, re.DOTALL)
                 if m:
                     ev = {
                         "event_type": "issue_comment",
@@ -175,7 +175,7 @@ def _extract_gh_events(entry: dict, working_directory: Optional[str]) -> list:
 
             # gh pr create --repo OWNER/REPO
             if ev is None:
-                m = re.search(r"gh\s+pr\s+create\b.*?--repo\s+(\S+)", command)
+                m = re.search(r"gh\s+pr\s+create\b.*?--repo\s+(\S+)", command, re.DOTALL)
                 if m:
                     ev = {
                         "event_type": "pr_create",
@@ -188,7 +188,7 @@ def _extract_gh_events(entry: dict, working_directory: Optional[str]) -> list:
 
             # gh pr comment N --repo OWNER/REPO  or  gh pr comment --repo OWNER/REPO N
             if ev is None:
-                m = re.search(r"gh\s+pr\s+comment\s+(\d+)\s+.*?--repo\s+(\S+)", command)
+                m = re.search(r"gh\s+pr\s+comment\s+(\d+)\s+.*?--repo\s+(\S+)", command, re.DOTALL)
                 if m:
                     ev = {
                         "event_type": "pr_comment",
@@ -199,7 +199,7 @@ def _extract_gh_events(entry: dict, working_directory: Optional[str]) -> list:
                         "created_at": created_at,
                     }
             if ev is None:
-                m = re.search(r"gh\s+pr\s+comment\s+--repo\s+(\S+)\s+(\d+)", command)
+                m = re.search(r"gh\s+pr\s+comment\s+--repo\s+(\S+)\s+(\d+)", command, re.DOTALL)
                 if m:
                     ev = {
                         "event_type": "pr_comment",
@@ -215,6 +215,7 @@ def _extract_gh_events(entry: dict, working_directory: Optional[str]) -> list:
                 m = re.search(
                     r"gh\s+issue\s+comment\s+https://github\.com/([\w.\-]+/[\w.\-]+)/issues/(\d+)",
                     command,
+                    re.DOTALL,
                 )
                 if m:
                     ev = {
@@ -231,6 +232,7 @@ def _extract_gh_events(entry: dict, working_directory: Optional[str]) -> list:
                 m = re.search(
                     r"gh\s+pr\s+comment\s+https://github\.com/([\w.\-]+/[\w.\-]+)/pull/(\d+)",
                     command,
+                    re.DOTALL,
                 )
                 if m:
                     ev = {
@@ -243,7 +245,7 @@ def _extract_gh_events(entry: dict, working_directory: Optional[str]) -> list:
                     }
 
             # git push (best effort: extract branch if present)
-            if ev is None and re.search(r"\bgit\s+push\b", command):
+            if ev is None and re.search(r"\bgit\s+push\b", command, re.DOTALL):
                 # Robust branch extraction:
                 # 1. Strip flags like -u/--set-upstream before parsing
                 # 2. Handle "git push origin HEAD:refs/heads/branch" refspecs
@@ -299,6 +301,7 @@ def _extract_gh_events(entry: dict, working_directory: Optional[str]) -> list:
                 m = re.search(
                     r"https://github\.com/([\w.\-]+/[\w.\-]+)/issues/(\d+)",
                     result_text,
+                    re.DOTALL,
                 )
                 if m:
                     ev["ref"] = m.group(2)
@@ -309,6 +312,7 @@ def _extract_gh_events(entry: dict, working_directory: Optional[str]) -> list:
                     m = re.search(
                         r"https://github\.com/([\w.\-]+/[\w.\-]+)/pull/(\d+)",
                         result_text,
+                        re.DOTALL,
                     )
                     if m:
                         ev["ref"] = m.group(2)
