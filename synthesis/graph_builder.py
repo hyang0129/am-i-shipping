@@ -160,22 +160,35 @@ def _read_timeline(conn: sqlite3.Connection) -> list[tuple]:
 
 def _read_session_gh_events(
     conn: sqlite3.Connection,
-    week_start: Optional[str] = None,  # kept for API compatibility; no longer used for filtering
+    session_uuids: Optional[Iterable[str]] = None,
 ) -> list[tuple]:
-    """Return all session_gh_events rows as (session_uuid, event_type, repo, ref).
+    """Return session_gh_events rows as (session_uuid, event_type, repo, ref).
 
-    The ``week_start`` parameter is accepted but ignored — filtering by
-    ``created_at`` was removed because it silently dropped edges when a GH
-    event's ``created_at`` fell in a different week than the session it
-    belonged to.  Correct week-scoping is handled by the
-    ``if sess_nid not in nodes: continue`` guard in ``build_graph``, which
-    already limits edges to sessions returned by ``_read_sessions``.
+    Parameters
+    ----------
+    session_uuids:
+        Optional collection of session UUID strings to filter by. When
+        provided and non-empty, only rows whose ``session_uuid`` is in the
+        collection are returned (using a SQL ``WHERE … IN (…)`` clause so
+        the database can short-circuit large tables). When ``None`` or
+        empty, all rows are returned for backward compatibility.
     """
+    uuids_list = list(session_uuids) if session_uuids is not None else []
     try:
-        rows = conn.execute(
-            "SELECT session_uuid, event_type, repo, ref "
-            "FROM session_gh_events ORDER BY session_uuid, event_type, repo, ref"
-        ).fetchall()
+        if uuids_list:
+            placeholders = ",".join("?" * len(uuids_list))
+            rows = conn.execute(
+                f"SELECT session_uuid, event_type, repo, ref "
+                f"FROM session_gh_events "
+                f"WHERE session_uuid IN ({placeholders}) "
+                f"ORDER BY session_uuid, event_type, repo, ref",
+                uuids_list,
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT session_uuid, event_type, repo, ref "
+                "FROM session_gh_events ORDER BY session_uuid, event_type, repo, ref"
+            ).fetchall()
     except sqlite3.OperationalError as exc:
         logger.warning(
             "session_gh_events table missing (%s); skipping session-GH edges"
@@ -299,7 +312,6 @@ def build_graph(
         pr_sessions = _read_pr_sessions(gh)
         commits = _read_commits(gh)
         timeline = _read_timeline(gh)
-        session_gh_events = _read_session_gh_events(gh, week_start)
         sessions = _read_sessions(sess, week_start)
 
         nodes: dict[str, tuple[str, str, str]] = {}
@@ -337,6 +349,13 @@ def build_graph(
                 sessions_by_branch.setdefault(branch, []).append(
                     (uuid, workdir or "")
                 )
+
+        # Extract in-window session UUIDs so _read_session_gh_events can
+        # scope its SQL query to only the rows we care about (F-17 perf fix).
+        in_window_session_uuids = [
+            nid[len("session:"):] for nid in nodes if nid.startswith("session:")
+        ]
+        session_gh_events = _read_session_gh_events(gh, in_window_session_uuids)
 
         # --- edges -----------------------------------------------------
         # (src_node_id, dst_node_id, edge_type) — set-dedup, then sorted.
@@ -494,7 +513,7 @@ def build_graph(
         sorted_edges = sorted(edges)
 
         gh.execute(
-            "DELETE FROM graph_nodes WHERE week_start = ? AND created_at = ''",
+            "DELETE FROM graph_nodes WHERE week_start = ? AND created_at = '' AND node_type IN ('issue', 'pr')",
             (partition,),
         )
         for node_id, (node_type, node_ref, created_at) in sorted_nodes:
@@ -504,6 +523,18 @@ def build_graph(
                 "VALUES (?, ?, ?, ?, ?)",
                 (partition, node_id, node_type, node_ref, created_at),
             )
+        # Remove edges whose src or dst node was deleted and not re-inserted.
+        # This runs after all node inserts so legitimate nodes are present
+        # before we evaluate orphan status.
+        gh.execute(
+            "DELETE FROM graph_edges "
+            "WHERE week_start = ? "
+            "  AND ("
+            "    src_node_id NOT IN (SELECT node_id FROM graph_nodes WHERE week_start = ?)"
+            "    OR dst_node_id NOT IN (SELECT node_id FROM graph_nodes WHERE week_start = ?)"
+            "  )",
+            (partition, partition, partition),
+        )
         for src, dst, etype in sorted_edges:
             gh.execute(
                 "INSERT OR IGNORE INTO graph_edges "
