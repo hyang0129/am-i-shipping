@@ -487,3 +487,325 @@ class TestUnitFilterByIssueOrPr:
         assert inserted == 0, (
             f"All session-only components must be dropped; expected 0, got {inserted}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #68 — AS-2, AS-3, AS-4, AS-5, AS-8
+# Two-issue and issue-only fixture tests.
+# ---------------------------------------------------------------------------
+
+from datetime import datetime as _datetime
+
+TWO_ISSUE_FIXTURE = Path(__file__).parent / "fixtures" / "two_issue_session.jsonl"
+ISSUE_ONLY_FIXTURE = Path(__file__).parent / "fixtures" / "issue_only_session.jsonl"
+
+TWO_ISSUE_SESSION_UUID = "f2000000-0000-0000-0000-000000000002"
+ISSUE_ONLY_SESSION_UUID = "f3000000-0000-0000-0000-000000000003"
+TWO_ISSUE_REPO = "hyang0129/video_agent_long"
+TWO_ISSUE_WEEK = "2026-03-23"
+ISSUE_ONLY_WEEK = "2026-03-30"
+
+# Pinned "now" well after both fixtures so no abandonment edge cases.
+PINNED_NOW_68 = _datetime(2026, 4, 19, 0, 0, 0)
+
+
+def _ingest_fixture(tmp_path: Path, fixture_path: Path) -> tuple:
+    """Parse and upsert a JSONL fixture; return (sess_db, gh_db).
+
+    Both DBs land in *tmp_path* so that ``upsert_session`` finds
+    ``github.db`` next to ``sessions.db`` automatically.
+    """
+    from am_i_shipping.db import init_github_db, init_sessions_db
+    from collector.session_parser import parse_session
+    from collector.store import upsert_session
+    from synthesis.graph_builder import build_graph
+
+    sess_db = tmp_path / "sessions.db"
+    gh_db = tmp_path / "github.db"
+    init_sessions_db(sess_db)
+    init_github_db(gh_db)
+
+    record = parse_session(fixture_path)
+    upsert_session(record, db_path=sess_db, data_dir=tmp_path, skip_health=True)
+    return sess_db, gh_db
+
+
+class TestIssue68TwoIssueFixture:
+    """AS-2, AS-3, AS-5 against the canonical two-issue session fixture."""
+
+    def test_identify_units_yields_two_units(self, tmp_path):
+        """AS-2: identify_units on the two-issue fixture writes exactly 2 units."""
+        from synthesis.graph_builder import build_graph
+
+        sess_db, gh_db = _ingest_fixture(tmp_path, TWO_ISSUE_FIXTURE)
+        build_graph(sess_db, gh_db, week_start=TWO_ISSUE_WEEK)
+
+        inserted = identify_units(gh_db, sess_db, TWO_ISSUE_WEEK, now=PINNED_NOW_68)
+        assert inserted == 2, (
+            f"Expected exactly 2 units for the two-issue fixture (AS-2), got {inserted}"
+        )
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            rows = conn.execute(
+                "SELECT root_node_id FROM units WHERE week_start = ?",
+                (TWO_ISSUE_WEEK,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        root_ids = {r[0] for r in rows}
+        assert f"issue:{TWO_ISSUE_REPO}#305" in root_ids, (
+            f"Expected issue:{TWO_ISSUE_REPO}#305 as a unit root, got: {root_ids}"
+        )
+        assert f"issue:{TWO_ISSUE_REPO}#312" in root_ids, (
+            f"Expected issue:{TWO_ISSUE_REPO}#312 as a unit root, got: {root_ids}"
+        )
+
+    def test_session_refs_pr_bridges_session_to_prs(self, tmp_path):
+        """AS-3: session_refs_pr / session_on_pr edges keep the session in
+        the same component as both PRs #306 and #313."""
+        from synthesis.graph_builder import build_graph
+
+        sess_db, gh_db = _ingest_fixture(tmp_path, TWO_ISSUE_FIXTURE)
+        build_graph(sess_db, gh_db, week_start=TWO_ISSUE_WEEK)
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            pr_edges = conn.execute(
+                "SELECT src_node_id, dst_node_id, edge_type FROM graph_edges "
+                "WHERE edge_type IN ('session_refs_pr', 'session_on_pr') "
+                "AND week_start = ?",
+                (TWO_ISSUE_WEEK,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        pr_dsts = {dst for _, dst, _ in pr_edges}
+        assert f"pr:{TWO_ISSUE_REPO}#306" in pr_dsts or any(
+            src == f"session:{TWO_ISSUE_SESSION_UUID}" for src, _, _ in pr_edges
+        ), (
+            "Expected session↔PR edges bridging the session to PR #306 (AS-3). "
+            f"PR edges found: {pr_edges}"
+        )
+
+    def test_fractional_attribution_half_for_two_issue_session(self, tmp_path):
+        """AS-5: session_issue_attribution rows for the two-issue fixture each
+        have fraction == 0.5 (one session touching 2 issues → 1/2)."""
+        from synthesis.graph_builder import build_graph
+
+        sess_db, gh_db = _ingest_fixture(tmp_path, TWO_ISSUE_FIXTURE)
+        build_graph(sess_db, gh_db, week_start=TWO_ISSUE_WEEK)
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            rows = conn.execute(
+                "SELECT issue_number, fraction FROM session_issue_attribution "
+                "WHERE session_uuid = ? AND week_start = ?",
+                (TWO_ISSUE_SESSION_UUID, TWO_ISSUE_WEEK),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert len(rows) == 2, (
+            f"Expected 2 session_issue_attribution rows for the two-issue session "
+            f"(AS-5), got {len(rows)}: {rows}"
+        )
+        for issue_number, fraction in rows:
+            assert abs(fraction - 0.5) < 1e-9, (
+                f"Expected fraction=0.5 for issue #{issue_number} (AS-5), "
+                f"got {fraction}"
+            )
+
+    def test_phase_planning_for_issue_create_events(self, tmp_path):
+        """AS-8 (planning branch): issues created inside the session carry
+        phase='planning' in session_issue_attribution."""
+        from synthesis.graph_builder import build_graph
+
+        sess_db, gh_db = _ingest_fixture(tmp_path, TWO_ISSUE_FIXTURE)
+        build_graph(sess_db, gh_db, week_start=TWO_ISSUE_WEEK)
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            phases = conn.execute(
+                "SELECT issue_number, phase FROM session_issue_attribution "
+                "WHERE session_uuid = ? AND week_start = ?",
+                (TWO_ISSUE_SESSION_UUID, TWO_ISSUE_WEEK),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert len(phases) == 2, (
+            f"Expected 2 attribution rows; got {len(phases)}"
+        )
+        for issue_number, phase in phases:
+            assert phase == "planning", (
+                f"Issue #{issue_number} was created in-session (issue_create event) "
+                f"so phase must be 'planning' (AS-8), got {phase!r}"
+            )
+
+
+class TestIssue68IssueOnlyFixture:
+    """AS-4, AS-8 (execution branch) against the issue-only session fixture."""
+
+    def test_issue_only_fixture_yields_one_unit(self, tmp_path):
+        """AS-4: issue-only fixture (one issue_create, no PRs) yields exactly
+        1 unit anchored on the stub issue node."""
+        from synthesis.graph_builder import build_graph
+
+        sess_db, gh_db = _ingest_fixture(tmp_path, ISSUE_ONLY_FIXTURE)
+        build_graph(sess_db, gh_db, week_start=ISSUE_ONLY_WEEK)
+
+        inserted = identify_units(gh_db, sess_db, ISSUE_ONLY_WEEK, now=PINNED_NOW_68)
+        assert inserted == 1, (
+            f"Expected exactly 1 unit for the issue-only fixture (AS-4), got {inserted}"
+        )
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            rows = conn.execute(
+                "SELECT root_node_type, root_node_id FROM units "
+                "WHERE week_start = ?",
+                (ISSUE_ONLY_WEEK,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert len(rows) == 1, f"Expected 1 units row, got {rows}"
+        root_type, root_id = rows[0]
+        assert root_type == "issue", (
+            f"Root node type must be 'issue' for issue-only fixture, got {root_type!r}"
+        )
+        assert root_id == f"issue:{TWO_ISSUE_REPO}#400", (
+            f"Root node id must be 'issue:{TWO_ISSUE_REPO}#400', got {root_id!r}"
+        )
+
+    def test_issue_only_attribution_fraction_one(self, tmp_path):
+        """AS-4/AS-5: issue-only fixture yields fraction=1.0 in attribution table."""
+        from synthesis.graph_builder import build_graph
+
+        sess_db, gh_db = _ingest_fixture(tmp_path, ISSUE_ONLY_FIXTURE)
+        build_graph(sess_db, gh_db, week_start=ISSUE_ONLY_WEEK)
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            rows = conn.execute(
+                "SELECT fraction FROM session_issue_attribution "
+                "WHERE session_uuid = ? AND week_start = ?",
+                (ISSUE_ONLY_SESSION_UUID, ISSUE_ONLY_WEEK),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert len(rows) == 1, (
+            f"Expected 1 attribution row for issue-only session (AS-4), got {rows}"
+        )
+        assert abs(rows[0][0] - 1.0) < 1e-9, (
+            f"Expected fraction=1.0 for single-issue session, got {rows[0][0]}"
+        )
+
+    def test_issue_only_attribution_phase_planning(self, tmp_path):
+        """AS-8 (planning branch): issue created in-session → phase='planning'."""
+        from synthesis.graph_builder import build_graph
+
+        sess_db, gh_db = _ingest_fixture(tmp_path, ISSUE_ONLY_FIXTURE)
+        build_graph(sess_db, gh_db, week_start=ISSUE_ONLY_WEEK)
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            rows = conn.execute(
+                "SELECT phase FROM session_issue_attribution "
+                "WHERE session_uuid = ? AND week_start = ?",
+                (ISSUE_ONLY_SESSION_UUID, ISSUE_ONLY_WEEK),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert len(rows) == 1
+        assert rows[0][0] == "planning", (
+            f"Issue created in-session must have phase='planning' (AS-8), "
+            f"got {rows[0][0]!r}"
+        )
+
+
+class TestIssue68PhaseExecutionBranch:
+    """AS-8 (execution branch): a session that only comments on a pre-existing
+    issue (no issue_create event) must receive phase='execution'."""
+
+    def test_execution_phase_for_comment_only_session(self, tmp_path):
+        """AS-8 execution branch: session with issue_comment (no issue_create)
+        → phase='execution' in session_issue_attribution."""
+        from am_i_shipping.db import init_github_db, init_sessions_db
+        from synthesis.graph_builder import build_graph
+
+        gh_path = tmp_path / "github.db"
+        sess_path = tmp_path / "sessions.db"
+        init_github_db(gh_path)
+        init_sessions_db(sess_path)
+
+        # A session that only comments on a pre-existing issue (no issue_create).
+        week = "2026-04-13"
+        session_uuid = "e0000000-0000-0000-0000-000000000008"
+        repo = "owner/repo"
+        issue_number = 77
+
+        # Seed session node
+        sess_conn = sqlite3.connect(str(sess_path))
+        try:
+            sess_conn.execute(
+                "INSERT OR IGNORE INTO sessions "
+                "(session_uuid, turn_count, tool_call_count, tool_failure_count, "
+                " reprompt_count, bail_out, session_duration_seconds, "
+                " working_directory, git_branch, raw_content_json, "
+                " input_tokens, output_tokens, cache_creation_tokens, "
+                " cache_read_tokens, fast_mode_turns, "
+                " session_started_at, session_ended_at) "
+                "VALUES (?, 2, 1, 0, 0, 0, 120.0, '/tmp', 'main', '[]', "
+                "        0, 0, 0, 0, 0, ?, ?)",
+                (session_uuid, "2026-04-13T09:00:00Z", "2026-04-13T09:02:00Z"),
+            )
+            sess_conn.commit()
+        finally:
+            sess_conn.close()
+
+        # Seed github DB: existing issue + issue_comment event (no issue_create)
+        gh_conn = sqlite3.connect(str(gh_path))
+        try:
+            gh_conn.execute(
+                "INSERT OR IGNORE INTO issues "
+                "(repo, issue_number, title, type_label, state, body, "
+                " comments_json, created_at, closed_at, updated_at) "
+                "VALUES (?, ?, 'Pre-existing issue', 'feature', 'open', '', '[]', "
+                " '2026-04-10T08:00:00Z', NULL, '2026-04-10T08:00:00Z')",
+                (repo, issue_number),
+            )
+            # issue_comment, NOT issue_create — phase must be 'execution'
+            gh_conn.execute(
+                "INSERT OR IGNORE INTO session_gh_events "
+                "(session_uuid, event_type, repo, ref, url, confidence, created_at) "
+                "VALUES (?, ?, ?, ?, '', 'high', '2026-04-13T09:01:00Z')",
+                (session_uuid, "issue_comment", repo, str(issue_number)),
+            )
+            gh_conn.commit()
+        finally:
+            gh_conn.close()
+
+        build_graph(sess_path, gh_path, week_start=week)
+
+        conn = sqlite3.connect(str(gh_path))
+        try:
+            rows = conn.execute(
+                "SELECT phase FROM session_issue_attribution "
+                "WHERE session_uuid = ? AND week_start = ?",
+                (session_uuid, week),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert len(rows) == 1, (
+            f"Expected 1 attribution row for comment-only session (AS-8), got {rows}"
+        )
+        assert rows[0][0] == "execution", (
+            f"issue_comment (no issue_create) must yield phase='execution' (AS-8), "
+            f"got {rows[0][0]!r}"
+        )

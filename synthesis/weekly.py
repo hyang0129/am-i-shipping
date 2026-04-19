@@ -334,6 +334,46 @@ def _load_unit_summaries(
     return {row[0]: row[1] for row in rows}
 
 
+def _load_issue_attribution(
+    gh_conn: sqlite3.Connection,
+    week_start: str,
+    repo: str,
+    issue_number: int,
+    session_uuids: List[str],
+) -> dict:
+    """Return ``{session_uuid: {"fraction": float, "phase": str}}`` for the given sessions.
+
+    Reads from ``session_issue_attribution`` for the anchor ``(repo, issue_number)``.
+    Falls back to ``fraction=1.0, phase="execution"`` for rows that are missing
+    (e.g. old weeks before the table existed, or sessions not tracked there).
+    Only called for issue-rooted units; PR/session-rooted units skip this.
+    """
+    if not session_uuids:
+        return {}
+
+    # Check whether the table exists — degrade gracefully on old DBs.
+    try:
+        placeholders = ",".join("?" * len(session_uuids))
+        rows = gh_conn.execute(
+            f"SELECT session_uuid, fraction, phase "
+            f"FROM session_issue_attribution "
+            f"WHERE week_start = ? AND repo = ? AND issue_number = ? "
+            f"AND session_uuid IN ({placeholders})",
+            [week_start, repo, issue_number] + list(session_uuids),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Table does not exist yet (old schema) — degrade gracefully.
+        rows = []
+
+    result = {uid: {"fraction": 1.0, "phase": "execution"} for uid in session_uuids}
+    for session_uuid, fraction, phase in rows:
+        result[session_uuid] = {
+            "fraction": fraction if fraction is not None else 1.0,
+            "phase": phase if phase is not None else "execution",
+        }
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Prompt assembly
 # ---------------------------------------------------------------------------
@@ -392,7 +432,11 @@ Thresholds
 """
 
 
-def _format_unit_block(unit: dict, transcript: str) -> str:
+def _format_unit_block(
+    unit: dict,
+    transcript: str,
+    session_attribution: Optional[dict] = None,
+) -> str:
     """Render one unit's dynamic block for the prompt.
 
     Includes the metrics, flags, and (potentially truncated) transcript.
@@ -403,6 +447,13 @@ def _format_unit_block(unit: dict, transcript: str) -> str:
     to be present — ``_load_units`` always populates them — so the
     explicit ``is None`` check handles the NULL case only, not a
     missing key (which would be a programming error elsewhere).
+
+    For issue-rooted units, *session_attribution* is a dict mapping
+    ``session_uuid -> {"fraction": float, "phase": str}`` (loaded from
+    ``session_issue_attribution``).  When provided, each session's
+    fraction and phase are rendered as sub-bullets under the summary
+    block.  PR-rooted and session-rooted units pass ``None`` here and
+    omit the attribution lines.
     """
     flags = unit["outlier_flags"] if unit["outlier_flags"] is not None else "[]"
     abandoned = unit["abandonment_flag"]
@@ -417,6 +468,20 @@ def _format_unit_block(unit: dict, transcript: str) -> str:
         f"- status: {unit['status']}",
         f"- outlier_flags: {flags}",
         f"- abandonment_flag: {abandoned_str}",
+    ]
+
+    # Render per-session attribution for issue-rooted units (AS-7).
+    if session_attribution:
+        lines.append("")
+        lines.append("#### session attribution")
+        for session_uuid, attrs in sorted(session_attribution.items()):
+            fraction = attrs.get("fraction", 1.0)
+            phase = attrs.get("phase", "execution")
+            lines.append(
+                f"- session {session_uuid}: session_fraction={fraction}, phase={phase}"
+            )
+
+    lines += [
         "",
         "#### summary",
         "```",
@@ -432,6 +497,7 @@ def _assemble_prompt(
     unit_transcripts: dict,
     unit_timelines: dict,
     week_start: str,
+    unit_attributions: Optional[dict] = None,
 ) -> Tuple[str, List[dict]]:
     """Return (system_prompt, user_messages) for the synthesis call.
 
@@ -439,7 +505,15 @@ def _assemble_prompt(
     the list of ``{"role": "user", "content": ...}`` dicts the SDK
     consumes — a single user message that concatenates the week anchor
     with the per-unit dynamic blocks.
+
+    *unit_attributions* is an optional ``{unit_id: {session_uuid: {...}}}``
+    dict produced by ``_load_issue_attribution`` for issue-rooted units.
+    Non-issue units are absent from this dict; their blocks render without
+    attribution lines.
     """
+    if unit_attributions is None:
+        unit_attributions = {}
+
     body_parts = [
         f"# Week starting {week_start}",
         "",
@@ -447,9 +521,13 @@ def _assemble_prompt(
         "",
     ]
     for unit in units:
-        body_parts.append(_format_unit_block(unit, unit_transcripts.get(unit["unit_id"], "")))
+        uid = unit["unit_id"]
+        attribution = unit_attributions.get(uid)  # None for non-issue units
+        body_parts.append(
+            _format_unit_block(unit, unit_transcripts.get(uid, ""), attribution)
+        )
         # Timeline is a compact Markdown list — one line per event.
-        timeline = unit_timelines.get(unit["unit_id"], [])
+        timeline = unit_timelines.get(uid, [])
         if timeline:
             body_parts.append("#### timeline")
             for ev in timeline:
@@ -620,8 +698,52 @@ def run_synthesis(
                 unit_components[uid], gh_conn, sess_conn
             )
 
+        # For issue-rooted units, load session_issue_attribution rows so
+        # _format_unit_block can render session_fraction + phase (AS-7).
+        # PR-rooted and session-rooted units are skipped; their blocks
+        # render without attribution lines.
+        unit_attributions: dict = {}
+        for u in units:
+            if u.get("root_node_type") == "issue":
+                uid = u["unit_id"]
+                root_node_id = u.get("root_node_id", "")
+                # root_node_id format: "issue:<repo>#<number>"
+                try:
+                    # Parse "issue:<repo>#<number>"
+                    without_prefix = root_node_id[len("issue:"):]
+                    repo_part, issue_part = without_prefix.rsplit("#", 1)
+                    issue_number = int(issue_part)
+                except (ValueError, IndexError):
+                    # Malformed root_node_id — skip attribution for this unit.
+                    continue
+                # Collect session UUIDs from the unit's component first.
+                session_uuids = [
+                    nid
+                    for nid, ntype, _ in unit_components.get(uid, [])
+                    if ntype == "session"
+                ]
+                # Shape A (session_refs_issue removed from graph_edges): the
+                # issue-rooted component contains only the issue node — session
+                # nodes are in their own PR-component which was suppressed.
+                # Fall back to querying session_issue_attribution directly.
+                if not session_uuids:
+                    try:
+                        rows = gh_conn.execute(
+                            "SELECT DISTINCT session_uuid "
+                            "FROM session_issue_attribution "
+                            "WHERE week_start = ? AND repo = ? AND issue_number = ?",
+                            (week_start, repo_part, issue_number),
+                        ).fetchall()
+                        session_uuids = [r[0] for r in rows]
+                    except Exception:
+                        pass
+                if session_uuids:
+                    unit_attributions[uid] = _load_issue_attribution(
+                        gh_conn, week_start, repo_part, issue_number, session_uuids
+                    )
+
         system_prompt, messages = _assemble_prompt(
-            units, unit_transcripts, unit_timelines, week_start
+            units, unit_transcripts, unit_timelines, week_start, unit_attributions
         )
 
         # --- Issue #54 P-2: prompt-size guard -------------------------
