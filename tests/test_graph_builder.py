@@ -513,10 +513,18 @@ WEEK = "2025-01-06"
 
 
 class TestSessionRefsIssueEdge:
-    """build_graph emits session_refs_issue edges from session_gh_events."""
+    """Issue #68 (AS-1, Shape A): build_graph must NOT write session_refs_issue
+    rows to graph_edges; attribution lives in session_issue_attribution instead.
 
-    def test_session_refs_issue_edge_emitted(self, tmp_path):
-        """An issue_comment event pointing to an existing issue creates an edge."""
+    The former test ``test_session_refs_issue_edge_emitted`` asserted the
+    presence of those rows — that assertion is flipped here per the ACCEPTED
+    ADR (Shape A).  The session↔issue relationship is still captured; it just
+    lives in the ``session_issue_attribution`` table, not ``graph_edges``.
+    """
+
+    def test_session_refs_issue_edge_absent_from_graph_edges(self, tmp_path):
+        """AS-1 (Shape A): issue_comment event must NOT create a
+        session_refs_issue row in graph_edges."""
         gh_db = _make_gh_db(tmp_path)
         sess_db = _make_sess_db(tmp_path)
 
@@ -539,20 +547,59 @@ class TestSessionRefsIssueEdge:
 
         conn = sqlite3.connect(str(gh_db))
         try:
-            edges = {
+            refs_issue_edges = [
                 (src, dst, etype)
                 for _week, src, dst, etype in conn.execute(
                     "SELECT week_start, src_node_id, dst_node_id, edge_type "
                     "FROM graph_edges"
                 ).fetchall()
-            }
+                if etype == "session_refs_issue"
+            ]
         finally:
             conn.close()
 
-        expected_src = f"session:{SESSION_UUID}"
-        expected_dst = f"issue:{REPO}#42"
-        assert (expected_src, expected_dst, "session_refs_issue") in edges, (
-            f"Expected session_refs_issue edge not found. Edges present: {edges}"
+        assert refs_issue_edges == [], (
+            f"AS-1 (Shape A): session_refs_issue rows must not exist in graph_edges. "
+            f"Found: {refs_issue_edges}"
+        )
+
+    def test_session_issue_attribution_row_written_instead(self, tmp_path):
+        """AS-1 (Shape A): issue_comment event writes a row to
+        session_issue_attribution, not graph_edges."""
+        gh_db = _make_gh_db(tmp_path)
+        sess_db = _make_sess_db(tmp_path)
+
+        gh_conn = sqlite3.connect(str(gh_db))
+        sess_conn = sqlite3.connect(str(sess_db))
+        try:
+            _seed_issue(gh_conn, REPO, 42)
+            _seed_session_gh_event(
+                gh_conn, SESSION_UUID, "issue_comment", REPO, "42"
+            )
+            gh_conn.commit()
+
+            _seed_session(sess_conn, SESSION_UUID, "2025-01-10T10:00:00Z")
+            sess_conn.commit()
+        finally:
+            gh_conn.close()
+            sess_conn.close()
+
+        build_graph(sess_db, gh_db)
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            rows = conn.execute(
+                "SELECT session_uuid, repo, issue_number, fraction, phase "
+                "FROM session_issue_attribution "
+                "WHERE session_uuid = ? AND repo = ? AND issue_number = ?",
+                (SESSION_UUID, REPO, 42),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert len(rows) == 1, (
+            f"AS-1 (Shape A): expected 1 session_issue_attribution row for "
+            f"session={SESSION_UUID}, issue={REPO}#42; got {len(rows)}: {rows}"
         )
 
     def test_session_refs_issue_skipped_when_issue_missing(self, tmp_path):
@@ -733,4 +780,136 @@ class TestSessionRefsIssueEdge:
 
         assert refs_issue_edges == [], (
             f"ref='pending' must not produce an edge, got: {refs_issue_edges}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Issue #68 — AS-1: session_refs_issue rows absent from graph_edges (Shape A)
+# ---------------------------------------------------------------------------
+
+
+TWO_ISSUE_FIXTURE = Path(__file__).parent / "fixtures" / "two_issue_session.jsonl"
+TWO_ISSUE_SESSION_UUID = "f2000000-0000-0000-0000-000000000002"
+TWO_ISSUE_REPO = "hyang0129/video_agent_long"
+TWO_ISSUE_WEEK = "2026-03-23"
+
+
+def _ingest_two_issue_fixture(tmp_path: Path) -> tuple:
+    """Parse and upsert the two-issue fixture; return (sess_db, gh_db).
+
+    Both DBs land in *tmp_path* so that ``upsert_session`` finds
+    ``github.db`` next to ``sessions.db`` automatically.
+    """
+    from am_i_shipping.db import init_github_db, init_sessions_db
+    from collector.session_parser import parse_session
+    from collector.store import upsert_session
+
+    sess_db = tmp_path / "sessions.db"
+    gh_db = tmp_path / "github.db"
+    init_sessions_db(sess_db)
+    init_github_db(gh_db)
+
+    record = parse_session(TWO_ISSUE_FIXTURE)
+    upsert_session(record, db_path=sess_db, data_dir=tmp_path, skip_health=True)
+    return sess_db, gh_db
+
+
+class TestIssue68NoSessionRefsIssueInGraphEdges:
+    """AS-1: build_graph must not write session_refs_issue rows to graph_edges.
+
+    Under Shape A (ACCEPTED), session->issue attribution is stored in the
+    ``session_issue_attribution`` table instead; ``graph_edges`` is a pure
+    topology table with no session↔issue rows.
+    """
+
+    def test_no_session_refs_issue_rows_in_graph_edges(self, tmp_path):
+        """After build_graph on the two-issue fixture, graph_edges has 0
+        session_refs_issue rows (AS-1, Shape A)."""
+        sess_db, gh_db = _ingest_two_issue_fixture(tmp_path)
+        build_graph(sess_db, gh_db, week_start=TWO_ISSUE_WEEK)
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM graph_edges "
+                "WHERE edge_type = 'session_refs_issue'",
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert count == 0, (
+            f"Expected 0 session_refs_issue rows in graph_edges (Shape A), "
+            f"got {count}"
+        )
+
+    def test_session_refs_pr_rows_still_present(self, tmp_path):
+        """session_refs_pr edges must still exist in graph_edges (AS-3)."""
+        sess_db, gh_db = _ingest_two_issue_fixture(tmp_path)
+        build_graph(sess_db, gh_db, week_start=TWO_ISSUE_WEEK)
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            pr_edge_count = conn.execute(
+                "SELECT COUNT(*) FROM graph_edges "
+                "WHERE edge_type IN ('session_refs_pr', 'session_on_pr')",
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert pr_edge_count > 0, (
+            "session_refs_pr / session_on_pr edges must remain in graph_edges "
+            "for PR bridging (AS-3)"
+        )
+
+
+class TestIssue68FractionDenominatorInflation:
+    """Critical fix: a session that emits both issue_create AND issue_comment
+    for the same (repo, issue) pair must count as ONE distinct issue, not two,
+    so fraction=1.0 and phase='planning' (create wins over comment).
+    """
+
+    def test_create_and_comment_same_issue_fraction_one(self, tmp_path):
+        """issue_create + issue_comment on the same issue → fraction=1.0 (not 0.5)
+        and phase='planning' (create wins) in session_issue_attribution."""
+        gh_db = _make_gh_db(tmp_path)
+        sess_db = _make_sess_db(tmp_path)
+
+        gh_conn = sqlite3.connect(str(gh_db))
+        sess_conn = sqlite3.connect(str(sess_db))
+        try:
+            _seed_issue(gh_conn, REPO, 99)
+            # Both issue_create AND issue_comment for the same issue in one session.
+            _seed_session_gh_event(gh_conn, SESSION_UUID, "issue_create", REPO, "99")
+            _seed_session_gh_event(gh_conn, SESSION_UUID, "issue_comment", REPO, "99")
+            gh_conn.commit()
+
+            _seed_session(sess_conn, SESSION_UUID, "2025-01-10T10:00:00Z")
+            sess_conn.commit()
+        finally:
+            gh_conn.close()
+            sess_conn.close()
+
+        build_graph(sess_db, gh_db)
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            rows = conn.execute(
+                "SELECT fraction, phase FROM session_issue_attribution "
+                "WHERE session_uuid = ? AND repo = ? AND issue_number = ?",
+                (SESSION_UUID, REPO, 99),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert len(rows) == 1, (
+            f"Expected exactly 1 attribution row for same (session, repo, issue) "
+            f"regardless of how many event types were emitted; got {len(rows)}: {rows}"
+        )
+        fraction, phase = rows[0]
+        assert abs(fraction - 1.0) < 1e-9, (
+            f"Expected fraction=1.0 for single distinct issue (not inflated by "
+            f"multiple event types), got fraction={fraction}"
+        )
+        assert phase == "planning", (
+            f"issue_create + issue_comment → planning must win, got phase={phase!r}"
         )

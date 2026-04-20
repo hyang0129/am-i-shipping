@@ -982,6 +982,134 @@ def test_unit_cap_preserves_priority_order(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Issue #68 — AS-7: weekly prompt emits 2 unit blocks for the two-issue fixture
+# ---------------------------------------------------------------------------
+
+TWO_ISSUE_FIXTURE_68 = Path(__file__).parent / "fixtures" / "two_issue_session.jsonl"
+TWO_ISSUE_WEEK_68 = "2026-03-23"
+TWO_ISSUE_SESSION_UUID_68 = "f2000000-0000-0000-0000-000000000002"
+
+
+def _ingest_and_build_two_issue(tmp_path: Path) -> Path:
+    """Parse and upsert the two-issue fixture, build graph, identify units.
+
+    Returns the github.db path (which also holds units + graph tables).
+    """
+    from am_i_shipping.db import init_github_db, init_sessions_db
+    from collector.session_parser import parse_session
+    from collector.store import upsert_session
+    from synthesis.graph_builder import build_graph
+    from synthesis.unit_identifier import identify_units
+    from datetime import datetime
+
+    sess_db = tmp_path / "sessions.db"
+    gh_db = tmp_path / "github.db"
+    init_sessions_db(sess_db)
+    init_github_db(gh_db)
+
+    record = parse_session(TWO_ISSUE_FIXTURE_68)
+    upsert_session(record, db_path=sess_db, data_dir=tmp_path, skip_health=True)
+    build_graph(sess_db, gh_db, week_start=TWO_ISSUE_WEEK_68)
+    identify_units(
+        gh_db, sess_db, TWO_ISSUE_WEEK_68, now=datetime(2026, 4, 19, 0, 0, 0)
+    )
+    return gh_db
+
+
+class TestIssue68WeeklyPromptTwoUnitBlocks:
+    """AS-7: weekly prompt must emit exactly 2 per-unit blocks for the two-issue
+    fixture, and each block must carry session_fraction and phase labels."""
+
+    def test_prompt_emits_two_unit_blocks(self, tmp_path: Path):
+        """AS-7: assembled prompt contains exactly 2 '### unit' blocks."""
+        import re
+
+        gh_db = _ingest_and_build_two_issue(tmp_path)
+
+        # Seed unit_summaries so run_synthesis passes the fail-loud guard.
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            unit_ids = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT unit_id FROM units WHERE week_start = ?",
+                    (TWO_ISSUE_WEEK_68,),
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
+        assert len(unit_ids) == 2, (
+            f"Precondition: expected 2 units in DB, got {len(unit_ids)}"
+        )
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            _insert_unit_summaries(
+                conn,
+                TWO_ISSUE_WEEK_68,
+                {uid: f"Summary for {uid}." for uid in unit_ids},
+            )
+        finally:
+            conn.close()
+
+        out = tmp_path / "retrospectives"
+        cfg = _make_config(tmp_path, out)
+
+        result = run_synthesis(
+            cfg, gh_db, tmp_path / "sessions.db", TWO_ISSUE_WEEK_68, dry_run=True
+        )
+        assert result is not None, "dry-run must produce a prompt artefact"
+
+        prompt_text = result.read_text(encoding="utf-8")
+        unit_block_count = len(re.findall(r"^### unit ", prompt_text, re.MULTILINE))
+        assert unit_block_count == 2, (
+            f"Expected exactly 2 '### unit' blocks in the assembled prompt (AS-7), "
+            f"got {unit_block_count}"
+        )
+
+    def test_prompt_blocks_contain_session_fraction_and_phase(self, tmp_path: Path):
+        """AS-7: each unit block in the prompt includes session_fraction and phase."""
+        gh_db = _ingest_and_build_two_issue(tmp_path)
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            unit_ids = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT unit_id FROM units WHERE week_start = ?",
+                    (TWO_ISSUE_WEEK_68,),
+                ).fetchall()
+            ]
+            _insert_unit_summaries(
+                conn,
+                TWO_ISSUE_WEEK_68,
+                {uid: f"Summary for {uid}." for uid in unit_ids},
+            )
+        finally:
+            conn.close()
+
+        out = tmp_path / "retrospectives"
+        cfg = _make_config(tmp_path, out)
+
+        result = run_synthesis(
+            cfg, gh_db, tmp_path / "sessions.db", TWO_ISSUE_WEEK_68, dry_run=True
+        )
+        assert result is not None
+        prompt_text = result.read_text(encoding="utf-8")
+
+        # Both session_fraction and phase must appear in the prompt (AS-7).
+        assert "session_fraction" in prompt_text, (
+            "Assembled prompt must contain 'session_fraction' label for issue-rooted "
+            "units (AS-7)"
+        )
+        assert "phase" in prompt_text, (
+            "Assembled prompt must contain 'phase' label for issue-rooted "
+            "units (AS-7)"
+        )
+
+
 def test_run_synthesis_raises_when_summary_missing(tmp_path: Path) -> None:
     """``run_synthesis`` must raise ``RuntimeError`` when a unit has no summary row.
 

@@ -265,6 +265,18 @@ CREATE TABLE IF NOT EXISTS session_gh_events (
 );
 """
 
+SYNTHESIS_SESSION_ISSUE_ATTRIBUTION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS session_issue_attribution (
+    week_start    TEXT NOT NULL,
+    session_uuid  TEXT NOT NULL,
+    repo          TEXT NOT NULL,
+    issue_number  INTEGER NOT NULL,
+    fraction      REAL NOT NULL,
+    phase         TEXT NOT NULL,
+    PRIMARY KEY (week_start, session_uuid, repo, issue_number)
+);
+"""
+
 # Columns added to existing tables after initial schema — migrated on init
 _GITHUB_MIGRATIONS = [
     "ALTER TABLE issues ADD COLUMN updated_at TEXT",
@@ -439,6 +451,14 @@ EXPECTED_GITHUB_TABLES: dict[str, set[str]] = {
         "confidence",
         "created_at",
     },
+    "session_issue_attribution": {
+        "week_start",
+        "session_uuid",
+        "repo",
+        "issue_number",
+        "fraction",
+        "phase",
+    },
 }
 
 EXPECTED_APPSWITCH_TABLES: dict[str, set[str]] = {
@@ -566,6 +586,16 @@ def init_github_db(db_path: Path) -> None:
         conn.execute(SYNTHESIS_UNITS_SCHEMA)
         conn.execute(SYNTHESIS_UNIT_SUMMARIES_SCHEMA)
         conn.execute(SYNTHESIS_SESSION_GH_EVENTS_SCHEMA)
+        conn.execute(SYNTHESIS_SESSION_ISSUE_ATTRIBUTION_SCHEMA)
+        # Purge stale bridging edges from prior runs so they don't leak into
+        # component computations. graph_edges may not exist on very first init
+        # (all CREATE TABLEs above run first, so this is safe after them).
+        try:
+            conn.execute(
+                "DELETE FROM graph_edges WHERE edge_type='session_refs_issue'"
+            )
+        except Exception:
+            pass  # table absent — nothing to purge
         for migration in _GITHUB_MIGRATIONS:
             try:
                 conn.execute(migration)

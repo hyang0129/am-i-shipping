@@ -186,11 +186,18 @@ def _summarise_unit(
     sessions_conn: sqlite3.Connection,
     abandonment_days: int,
     now: datetime,
+    week_start: Optional[str] = None,
 ) -> dict:
     """Collect metric + status inputs for one unit into one dict.
 
     Returning a dict rather than a 7-tuple keeps the caller's row
     assembly readable (``row[5]`` vs ``row["dark_time_pct"]``).
+
+    When the unit's anchor is an issue, session contributions to
+    ``elapsed_days``, ``dark_time_pct``, ``total_reprompts``, and
+    ``review_cycles`` are scaled by the session's ``fraction`` from
+    ``session_issue_attribution`` (AS-5).  Sessions that have no
+    attribution row (e.g. PR-rooted units) use fraction=1.0.
     """
     # --- gather per-type membership -----------------------------------
     session_uuids: list[str] = []
@@ -212,14 +219,18 @@ def _summarise_unit(
     # --- pull source rows --------------------------------------------
     session_rows: list[tuple[Optional[str], Optional[str], int]] = []
     # (session_started_at, session_ended_at, reprompt_count)
+    # Also keep a per-uuid reprompt map for correct fractional scaling.
+    session_reprompt_map: dict[str, int] = {}  # uuid -> reprompt_count
     if session_uuids:
         placeholders = ",".join("?" * len(session_uuids))
         cur = sessions_conn.execute(
-            f"SELECT session_started_at, session_ended_at, reprompt_count "
+            f"SELECT session_uuid, session_started_at, session_ended_at, reprompt_count "
             f"FROM sessions WHERE session_uuid IN ({placeholders})",
             session_uuids,
         )
-        session_rows = list(cur.fetchall())
+        for uuid, started, ended, rc in cur.fetchall():
+            session_rows.append((started, ended, rc))
+            session_reprompt_map[uuid] = int(rc or 0)
 
     issue_rows: list[tuple[str, Optional[str], Optional[str], Optional[str]]] = []
     # (state, created_at, closed_at, updated_at)
@@ -245,6 +256,30 @@ def _summarise_unit(
         if row is not None:
             pr_rows.append(row)
 
+    # --- fractional attribution lookup (AS-5) -------------------------
+    # Build a per-session fraction map keyed by session_uuid.
+    # When the unit is issue-rooted, look up session_issue_attribution for
+    # the unit's anchor issue(s).  For non-issue-rooted units (PR-only),
+    # default to 1.0 so behaviour is unchanged.
+    session_fractions: dict[str, float] = {uuid: 1.0 for uuid in session_uuids}
+    if issue_refs and session_uuids and week_start:
+        # Use the first (highest-priority) issue ref as the anchor.
+        anchor_repo, anchor_issue = issue_refs[0]
+        try:
+            placeholders = ",".join("?" * len(session_uuids))
+            attr_rows = github_conn.execute(
+                f"SELECT session_uuid, fraction "
+                f"FROM session_issue_attribution "
+                f"WHERE week_start = ? AND repo = ? AND issue_number = ? "
+                f"  AND session_uuid IN ({placeholders})",
+                [week_start, anchor_repo, anchor_issue] + list(session_uuids),
+            ).fetchall()
+            for uuid, frac in attr_rows:
+                session_fractions[uuid] = frac
+        except sqlite3.OperationalError:
+            # Table not yet migrated — fall back to fraction=1.0.
+            pass
+
     # --- metrics ------------------------------------------------------
     all_timestamps: list[Optional[str]] = []
     for started, ended, _rc in session_rows:
@@ -259,8 +294,48 @@ def _summarise_unit(
     dark = metrics.dark_time_pct(
         [(s, e) for s, e, _ in session_rows]
     )
-    reprompts = metrics.total_reprompts(session_uuids, sessions_conn)
     cycles = metrics.review_cycles(pr_refs, github_conn)
+
+    # Apply fractional scaling (AS-5): scale session-derived metrics correctly
+    # when sessions have different fractions.
+    #
+    # total_reprompts: weighted sum — each session's reprompt_count scaled by
+    # its own fraction then summed.  This is exact regardless of whether
+    # fractions differ across sessions.
+    #
+    # elapsed_days / dark_time_pct: computed from the union of all sessions'
+    # timestamps, so per-session decomposition is lossy.  We apply avg_fraction
+    # as an approximation; a code comment documents this.  When all fractions
+    # agree the result is exact; in mixed-fraction cases it is a reasonable
+    # approximation (proportional to the average attribution share).
+    #
+    # review_cycles: PR-level metric, not per-session — scale by avg_fraction
+    # as an approximation (same reasoning as elapsed_days).
+    if session_uuids:
+        # Per-session weighted reprompts (exact).
+        reprompts = round(
+            sum(
+                session_reprompt_map.get(u, 0) * session_fractions.get(u, 1.0)
+                for u in session_uuids
+            )
+        )
+
+        avg_fraction = (
+            sum(session_fractions.get(u, 1.0) for u in session_uuids)
+            / len(session_uuids)
+        )
+        # elapsed_days and dark_time_pct are union-of-sessions aggregates;
+        # scaling by avg_fraction is an approximation (exact when all
+        # fractions are equal, proportional otherwise).
+        if avg_fraction < 1.0:
+            if elapsed is not None:
+                elapsed = elapsed * avg_fraction
+            if dark is not None:
+                dark = dark * avg_fraction
+            if cycles is not None:
+                cycles = round(cycles * avg_fraction)
+    else:
+        reprompts = 0
 
     # --- status -------------------------------------------------------
     has_open = False
@@ -390,6 +465,42 @@ def identify_units(
         node_info = {nid: (nt, nr) for nid, nt, nr in node_rows}
         components = uf.components()
 
+        # Build a map of (session_uuid, issue_node_id) → True for every
+        # session_issue_attribution row in this week.  Used below to detect
+        # PR-only components whose sessions are fully accounted for by
+        # issue-rooted components (AS-2, Shape A).
+        # Key: session_uuid → set of issue node ids ("issue:<repo>#<N>")
+        session_issue_nodes: dict[str, set[str]] = {}
+        if week_start:
+            try:
+                for (uuid, repo_val, issue_num) in gh.execute(
+                    "SELECT session_uuid, repo, issue_number "
+                    "FROM session_issue_attribution "
+                    "WHERE week_start = ?",
+                    (week_start,),
+                ).fetchall():
+                    session_issue_nodes.setdefault(uuid, set()).add(
+                        f"issue:{repo_val}#{issue_num}"
+                    )
+            except Exception:
+                # Table absent (first-run or test DB without schema) — fall
+                # back to empty dict; no components will be suppressed.
+                pass
+
+        # Pre-compute the set of issue node IDs that anchor their own
+        # issue-rooted component.  A PR-only component is only dropped when
+        # EVERY session in it is attributed exclusively to issues that are
+        # already anchors of issue-rooted components (i.e. components that
+        # contain at least one issue node).  This prevents erroneously
+        # dropping a PR component when the session was attributed to a
+        # *different* issue and the PR represents independent work.
+        issue_anchor_nodes: set[str] = set()
+        for comp in components:
+            if any(node_info[nid][0] == "issue" for nid in comp):
+                for nid in comp:
+                    if node_info[nid][0] == "issue":
+                        issue_anchor_nodes.add(nid)
+
         # --- write one row per component -----------------------------
         inserted = 0
         for comp in components:
@@ -404,6 +515,32 @@ def identify_units(
             if "issue" not in comp_types and "pr" not in comp_types:
                 continue
 
+            # Drop PR-only components (no issue anchor) when every session
+            # in the component is attributed *only* to issues that are
+            # already anchors of issue-rooted components this week.
+            # This prevents double-counting while retaining PR components
+            # that represent independent work for issues not yet linked by
+            # the poller (e.g. session attributed to issue #A but PR is for
+            # unrelated issue #B with no pr_closes_issue edge yet).
+            if "issue" not in comp_types and session_issue_nodes:
+                session_nids_in_comp = {
+                    nid for nid in comp if node_info[nid][0] == "session"
+                }
+                if session_nids_in_comp:
+                    comp_session_uuids = {
+                        node_info[nid][1] for nid in session_nids_in_comp
+                    }
+                    # Each session in the component must have at least one
+                    # attribution row, AND all attributed issues must be
+                    # anchors of issue-rooted components for this week.
+                    all_attributed_to_anchors = all(
+                        uuid in session_issue_nodes
+                        and session_issue_nodes[uuid].issubset(issue_anchor_nodes)
+                        for uuid in comp_session_uuids
+                    )
+                    if all_attributed_to_anchors:
+                        continue
+
             unit_id = _unit_id_from_nodes(comp)
             nodes_in_unit = [(nid, *node_info[nid]) for nid in comp]
             root_type, root_id = _pick_root(nodes_in_unit)
@@ -413,6 +550,7 @@ def identify_units(
                 sessions_conn=sess,
                 abandonment_days=abandonment_days,
                 now=now,
+                week_start=week_start,
             )
             cur = gh.execute(
                 "INSERT OR IGNORE INTO units "

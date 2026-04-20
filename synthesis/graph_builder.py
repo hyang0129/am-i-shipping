@@ -25,12 +25,21 @@ Edge types (src → dst)
 * ``commit_refs_issue`` — ``#N`` scan of commit messages.
 * ``timeline_ref``    — ``cross-referenced`` / ``referenced`` events link the
   originating issue to the referenced issue or PR.
-* ``session_refs_issue`` — a session row in ``session_gh_events`` with
-  ``event_type`` in ``("issue_create", "issue_comment")`` links the session
-  to the referenced issue (only when the issue node already exists).
 * ``session_refs_pr``    — a session row in ``session_gh_events`` with
   ``event_type`` in ``("pr_create", "pr_comment")`` links the session to the
   referenced PR (only when the PR node already exists).
+
+Attribution (separate from graph topology)
+------------------------------------------
+Session → issue linkage is **not** stored in ``graph_edges`` and therefore
+does not participate in union-find / connected-components.  Instead, each
+(session, repo, issue) pair is written to the ``session_issue_attribution``
+table with a ``fraction = 1/N`` (where N is the number of distinct issues
+touched by that session) and a ``phase`` field (``"planning"`` when an
+``issue_create`` event exists for the pair; ``"execution"`` otherwise).
+Stub issue nodes bootstrapped from ``issue_create`` events are still written
+to ``graph_nodes`` so downstream consumers that traverse node lists still
+find them, but the session→issue edge is absent from ``graph_edges``.
 
 Determinism
 -----------
@@ -470,7 +479,26 @@ def build_graph(
                 continue
             edges.add((src_nid, dst_nid, "timeline_ref"))
 
-        # session_refs_issue / session_refs_pr (from session_gh_events)
+        # session_refs_pr / session_issue_attribution (from session_gh_events)
+        #
+        # session→PR edges still go into graph_edges so they bridge session
+        # nodes into PR-rooted components via union-find (AS-3).
+        #
+        # session→issue linkage is intentionally NOT added to graph_edges.
+        # Instead we collect (session_uuid, repo, issue_number) pairs per
+        # session and write them to session_issue_attribution below (AS-1).
+        # Stub issue nodes from issue_create events are still bootstrapped
+        # into graph_nodes (AS-4).
+        #
+        # attribution_map: session_uuid -> set of (repo, issue_number)
+        # phase_map: (session_uuid, repo, issue_number) -> phase
+        # Phase rule (ADR): "planning" if any issue_create event exists for the
+        # (session, repo, issue) pair; else "execution". Keying on
+        # (repo, issue_number) only ensures one distinct issue creates exactly
+        # one attribution row regardless of how many event types are emitted
+        # (e.g. issue_create + issue_comment for the same issue in one session).
+        attribution_map: dict[str, set[tuple[str, int]]] = {}
+        phase_map: dict[tuple[str, str, int], str] = {}
         for session_uuid, event_type, repo, ref in session_gh_events:
             # Skip pending or empty refs, and non-numeric refs.
             if not ref or ref == "pending":
@@ -489,24 +517,48 @@ def build_graph(
                 continue
             if event_type in ("issue_create", "issue_comment"):
                 dst = _issue_node(repo, ref_int)
-                etype = "session_refs_issue"
+                # Bootstrap stub node for issue_create events (AS-4).
+                if dst not in nodes:
+                    if event_type != "issue_create":
+                        continue
+                    nodes[dst] = ("issue", f"{repo}#{ref_int}", "")
+                # Collect for attribution table — do NOT add to edges.
+                attribution_map.setdefault(session_uuid, set()).add(
+                    (repo, ref_int)
+                )
+                # "planning" wins over "execution" if both event types appear
+                # for the same (session, repo, issue) pair.
+                key = (session_uuid, repo, ref_int)
+                if event_type == "issue_create" or key not in phase_map:
+                    phase_map[key] = (
+                        "planning" if event_type == "issue_create" else "execution"
+                    )
             elif event_type in ("pr_create", "pr_comment"):
                 dst = _pr_node(repo, ref_int)
-                etype = "session_refs_pr"
+                # Bootstrap stub PR node for pr_create events.
+                if dst not in nodes:
+                    if event_type != "pr_create":
+                        continue
+                    nodes[dst] = ("pr", f"{repo}#{ref_int}", "")
+                # session_refs_pr still participates in graph_edges / union-find.
+                edges.add((sess_nid, dst, "session_refs_pr"))
             else:
                 # git_push and other event types have no target node.
                 continue
-            # For *_create events (session directly created the issue/PR), bootstrap
-            # a stub node if the GitHub poller hasn't populated it yet. For *_comment
-            # events, require the node to pre-exist to avoid dangling edges from
-            # ambiguous references.
-            if dst not in nodes:
-                if event_type not in ("issue_create", "pr_create"):
-                    continue
-                node_type = "issue" if event_type == "issue_create" else "pr"
-                node_ref = f"{repo}#{ref_int}"
-                nodes[dst] = (node_type, node_ref, "")
-            edges.add((sess_nid, dst, etype))
+
+        # --- build session_issue_attribution rows (AS-5, AS-8) ----------
+        # fraction = 1/N where N = distinct issues touched by this session.
+        # phase determined per (session, issue): "planning" if issue_create
+        # event exists for this pair, else "execution".
+        attribution_rows: list[tuple[str, str, str, int, float, str]] = []
+        for session_uuid, issue_set in attribution_map.items():
+            n = len(issue_set)
+            fraction = 1.0 / n if n > 0 else 1.0
+            for repo, issue_number in sorted(issue_set):
+                phase = phase_map.get((session_uuid, repo, issue_number), "execution")
+                attribution_rows.append(
+                    (partition, session_uuid, repo, issue_number, fraction, phase)
+                )
 
         # --- write -----------------------------------------------------
         sorted_nodes = sorted(nodes.items(), key=lambda kv: (kv[1][0], kv[0]))
@@ -541,6 +593,16 @@ def build_graph(
                 "(week_start, src_node_id, dst_node_id, edge_type) "
                 "VALUES (?, ?, ?, ?)",
                 (partition, src, dst, etype),
+            )
+        # Write session_issue_attribution rows (AS-5, AS-8).
+        # INSERT OR REPLACE so re-runs recalculate fraction correctly if the
+        # session's issue-set changes between runs.
+        for row in sorted(attribution_rows):
+            gh.execute(
+                "INSERT OR REPLACE INTO session_issue_attribution "
+                "(week_start, session_uuid, repo, issue_number, fraction, phase) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                row,
             )
         gh.commit()
     finally:

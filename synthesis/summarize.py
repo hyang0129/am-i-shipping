@@ -201,6 +201,41 @@ def _build_unit_input(
                 if body:
                     parts.append(f"**Body**:\n{body}")
 
+    # Resolve the anchor issue (repo, issue_number) for attribution lookups.
+    # Only issue-rooted units have attribution rows; for all others fraction
+    # defaults to 1.0 and phase is omitted.
+    anchor_repo: Optional[str] = None
+    anchor_issue: Optional[int] = None
+    if unit_row and unit_row[1] == "issue":
+        ref = (unit_row[2] or "").removeprefix("issue:")
+        if "#" in ref:
+            _repo, _, _num = ref.rpartition("#")
+            try:
+                anchor_repo = _repo
+                anchor_issue = int(_num)
+            except ValueError:
+                pass
+
+    def _get_attribution(session_uuid: str) -> tuple[float, Optional[str]]:
+        """Return (fraction, phase) for a session contributing to this unit.
+
+        Looks up ``session_issue_attribution`` keyed on
+        ``(week_start, session_uuid, repo, issue_number)``. Falls back to
+        ``(1.0, None)`` when the unit has no issue anchor or when no row
+        is found (e.g. older weeks pre-dating this schema addition).
+        """
+        if anchor_repo is None or anchor_issue is None:
+            return 1.0, None
+        row = gh_conn.execute(
+            "SELECT fraction, phase FROM session_issue_attribution "
+            "WHERE week_start = ? AND session_uuid = ? "
+            "  AND repo = ? AND issue_number = ?",
+            (week_start, session_uuid, anchor_repo, anchor_issue),
+        ).fetchone()
+        if row is None:
+            return 1.0, None
+        return float(row[0]), row[1]
+
     # Fetch session transcripts.
     transcripts = _load_session_transcripts(sessions_conn, session_uuids)
     non_empty = [(uid, content) for uid, content in transcripts if content]
@@ -210,7 +245,11 @@ def _build_unit_input(
     else:
         parts.append("\n### Session Transcripts")
         for uid, content in non_empty:
+            fraction, phase = _get_attribution(uid)
             parts.append(f"\n#### Session {uid}")
+            parts.append(f"- session_fraction: {fraction}")
+            if phase is not None:
+                parts.append(f"- phase: {phase}")
             parts.append(content)
 
     assembled = "\n".join(parts)
