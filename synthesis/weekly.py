@@ -403,15 +403,22 @@ Required Markdown sections (exact headings, in order)
    Do not prescribe follow-up; surface the signal.
 5. `## Dark Time`                 — fraction of each unit's wall-clock
    span during which no session was active. Highlight the top-2.
-6. `## Clarifying Questions`      — at most TWO total, numbered `1.`
-   and `2.`. Each question should be answerable from the user's memory
-   of the week — no research required.
-7. `## Expectation Gaps`          — units whose expected vs. actual gap
+6. `## Expectation Gaps`          — units whose expected vs. actual gap
    was `major` or `critical`. Each item names the unit, the direction
    of the gap (`under`/`over`/`match`/`ambiguous`), and the idealized-
    workflow step (`phase_0_setup` / `step_1_intent` / ...) that was the
    root-cause precondition. Omit the section body when no major or
    critical gaps exist; keep the heading.
+7. `## Expectation Revisions`     — units with mid-stream expectation
+   shifts (reprompts, scope-change turns, or session breaks > 24 h
+   anchored after the commitment point). Each item names the unit, the
+   trigger type, the facet that shifted (`scope`/`effort`/`outcome`),
+   and the before/after summary. Low-confidence revisions (< 0.5) are
+   annotated as such, not omitted. Omit the section body when no
+   revisions exist; keep the heading.
+8. `## Clarifying Questions`      — at most TWO total, numbered `1.`
+   and `2.`. Each question should be answerable from the user's memory
+   of the week — no research required.
 
 Constraints
 -----------
@@ -527,6 +534,45 @@ def _render_gap_block(gap_rows: List[dict]) -> List[str]:
     return lines
 
 
+def _render_revision_block(revision_rows: List[dict]) -> List[str]:
+    """Render the ``## Expectation Revisions`` Markdown block.
+
+    Groups rows by unit, names each revision's trigger + facet, and
+    annotates low-confidence (<0.5) rows with ``[low confidence]`` so
+    they are surfaced rather than silently dropped (AS-6).
+    """
+    if not revision_rows:
+        return []
+    lines: List[str] = ["", "## Expectation Revisions (from X-3 revision detection)", ""]
+    # Group by unit, preserving the order (rows are already sorted by
+    # unit_id + revision_index upstream).
+    current_unit: Optional[str] = None
+    for row in revision_rows:
+        unit_id = row.get("unit_id")
+        if unit_id != current_unit:
+            lines.append(f"- unit {unit_id}:")
+            current_unit = unit_id
+        trigger = row.get("revision_trigger") or ""
+        facet = row.get("facet") or ""
+        confidence = row.get("confidence")
+        conf_marker = ""
+        if isinstance(confidence, (int, float)) and confidence < 0.5:
+            conf_marker = " [low confidence]"
+        turn = row.get("revision_turn")
+        lines.append(
+            f"    - revision at turn {turn}: trigger={trigger}, "
+            f"facet={facet}{conf_marker}"
+        )
+        before = row.get("before_text")
+        after = row.get("after_text")
+        if before:
+            lines.append(f"        - before: {before}")
+        if after:
+            lines.append(f"        - after: {after}")
+    lines.append("")
+    return lines
+
+
 def _assemble_prompt(
     units: List[dict],
     unit_transcripts: dict,
@@ -534,6 +580,7 @@ def _assemble_prompt(
     week_start: str,
     unit_attributions: Optional[dict] = None,
     gap_rows: Optional[List[dict]] = None,
+    revision_rows: Optional[List[dict]] = None,
 ) -> Tuple[str, List[dict]]:
     """Return (system_prompt, user_messages) for the synthesis call.
 
@@ -577,6 +624,11 @@ def _assemble_prompt(
     # minor/none stay in the DB for X-5 calibration.
     if gap_rows:
         body_parts.extend(_render_gap_block(gap_rows))
+
+    # Epic #27 — X-3 (#74): inject revision rows. All revisions are
+    # surfaced (low-confidence ones are annotated, not dropped).
+    if revision_rows:
+        body_parts.extend(_render_revision_block(revision_rows))
 
     user_content = "\n".join(body_parts)
     return _STATIC_SYSTEM_PROMPT, [{"role": "user", "content": user_content}]
@@ -785,11 +837,13 @@ def run_synthesis(
                         gh_conn, week_start, repo_part, issue_number, session_uuids
                     )
 
-        # Epic #27 — X-2 (#73): run the gap pass before prompt assembly so
-        # gap rows are available to inject into the user message. Silent
-        # no-op when expectations_db is None (operator has not wired X-1
-        # yet) or the DB has no expectations rows for this week.
+        # Epic #27 — X-2 (#73) + X-3 (#74): run the gap + revision passes
+        # before prompt assembly so their rows are available to inject
+        # into the user message. Silent no-op when expectations_db is
+        # None (operator has not wired X-1 yet) or the DB has no
+        # expectations rows for this week.
         gap_rows: List[dict] = []
+        revision_rows: List[dict] = []
         if expectations_db is not None:
             from synthesis import gap_analysis
 
@@ -821,6 +875,36 @@ def run_synthesis(
                     week_start, exc,
                 )
 
+            # X-3 revision detection — parallel to the gap pass. Each
+            # side reads X-1's ``expectations`` rows and writes its own
+            # sibling table, so the two can run in either order.
+            from synthesis import revision_detector
+
+            try:
+                revision_detector.run(
+                    week_start,
+                    github_db=str(gh_path),
+                    sessions_db=str(sess_path),
+                    expectations_db=str(expectations_db),
+                    config=config,
+                )
+                revision_rows = revision_detector.load_revision_rows(
+                    str(expectations_db), week_start
+                )
+            except sqlite3.OperationalError as exc:
+                logger.warning(
+                    "Revision detection skipped for week=%s: %s. Run "
+                    "'am-init-db' and 'am-extract-expectations' first.",
+                    week_start, exc,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Revision detection failed for week=%s: %s. "
+                    "Retrospective will be written without the "
+                    "Expectation Revisions section.",
+                    week_start, exc,
+                )
+
         system_prompt, messages = _assemble_prompt(
             units,
             unit_transcripts,
@@ -828,6 +912,7 @@ def run_synthesis(
             week_start,
             unit_attributions,
             gap_rows=gap_rows,
+            revision_rows=revision_rows,
         )
 
         # --- Issue #54 P-2: prompt-size guard -------------------------

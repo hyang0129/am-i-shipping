@@ -319,6 +319,41 @@ _EXPECTATIONS_MIGRATIONS = [
     "ALTER TABLE expectation_gaps ADD COLUMN auto_confirmed INTEGER DEFAULT 0",
 ]
 
+# Epic #27 — X-3 (#74): expectation_revisions schema.
+#
+# Written by ``synthesis.revision_detector.run`` during ``am-synthesize``.
+# Every row is a sibling-history record of a mid-unit expectation shift
+# detected from a structural trigger (reprompt, session break >24h, or
+# scope-change turn). The committed ``expectations`` row from X-1 is
+# NEVER mutated — revisions accumulate alongside as a parallel history.
+#
+# IRREVERSIBLE column names (per the epic ADR, mirroring X-1/X-2's lock):
+# ``revision_index``, ``revision_turn``, ``revision_trigger``, ``facet``,
+# ``before_text``, ``after_text``. X-4 user corrections and X-5 calibration
+# will key off these names; renaming after X-4 ships is expensive.
+#
+# * ``revision_trigger`` — one of {``reprompt``, ``scope_change_turn``,
+#                          ``session_break``}.
+# * ``facet``            — one of {``scope``, ``effort``, ``outcome``}.
+# * ``confidence``       — LLM self-reported confidence in [0.0, 1.0].
+#                          Low-confidence rows (<0.5) are surfaced in the
+#                          retrospective with a marker, NOT dropped.
+SYNTHESIS_EXPECTATION_REVISIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS expectation_revisions (
+    week_start       TEXT NOT NULL,
+    unit_id          TEXT NOT NULL,
+    revision_index   INTEGER NOT NULL,
+    revision_turn    INTEGER,
+    revision_trigger TEXT,
+    facet            TEXT,
+    before_text      TEXT,
+    after_text       TEXT,
+    confidence       REAL,
+    detected_at      TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (week_start, unit_id, revision_index)
+);
+"""
+
 EXPECTED_EXPECTATIONS_TABLES: dict[str, set[str]] = {
     "expectations": {
         "week_start",
@@ -345,6 +380,18 @@ EXPECTED_EXPECTATIONS_TABLES: dict[str, set[str]] = {
         "failure_precondition",
         "computed_at",
         "auto_confirmed",
+    },
+    "expectation_revisions": {
+        "week_start",
+        "unit_id",
+        "revision_index",
+        "revision_turn",
+        "revision_trigger",
+        "facet",
+        "before_text",
+        "after_text",
+        "confidence",
+        "detected_at",
     },
 }
 
@@ -731,6 +778,8 @@ def init_expectations_db(db_path: Path) -> None:
         conn.execute(SYNTHESIS_EXPECTATIONS_SCHEMA)
         # Epic #27 — X-2 (#73): expectation_gaps lives in the same DB.
         conn.execute(SYNTHESIS_EXPECTATION_GAPS_SCHEMA)
+        # Epic #27 — X-3 (#74): expectation_revisions lives in the same DB.
+        conn.execute(SYNTHESIS_EXPECTATION_REVISIONS_SCHEMA)
         for migration in _EXPECTATIONS_MIGRATIONS:
             try:
                 conn.execute(migration)
