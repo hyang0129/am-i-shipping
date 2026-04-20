@@ -457,8 +457,12 @@ def collect_coverage(
                 _bump(report.per_unit, ref.bucket_key(), fill)
 
         # ---- "[]" classification ----
-        if fill == _FILL_EMPTY:
-            if jsonl_rec is not None and _get_has_text(jsonl_rec.path):
+        # Only classify when the JSONL is on disk — a missing JSONL is
+        # already surfaced via ``orphan_db_rows`` and calling such a row
+        # "truly empty" would be an unsupported claim (we can't read the
+        # source to verify).
+        if fill == _FILL_EMPTY and jsonl_rec is not None:
+            if _get_has_text(jsonl_rec.path):
                 report.empty_but_jsonl_has_text.append(session_uuid)
             else:
                 report.empty_and_jsonl_truly_empty.append(session_uuid)
