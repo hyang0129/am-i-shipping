@@ -252,6 +252,45 @@ CREATE TABLE IF NOT EXISTS unit_summaries (
 );
 """
 
+# Epic #27 — X-1 (#72): expectations.db schema.
+# Standalone SQLite file under ``config.data_path``. Later slices in the epic
+# (X-2 through X-5) will add their own tables to the same DB but must NOT
+# rename the columns this slice writes — X-4 user corrections accumulate
+# against these column names and renaming is expensive.
+SYNTHESIS_EXPECTATIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS expectations (
+    week_start       TEXT NOT NULL,
+    unit_id          TEXT NOT NULL,
+    commitment_point TEXT,
+    expected_scope   TEXT,
+    expected_effort  TEXT,
+    expected_outcome TEXT,
+    confidence       REAL,
+    model            TEXT,
+    input_bytes      INTEGER,
+    extracted_at     TEXT DEFAULT (datetime('now')),
+    skip_reason      TEXT,
+    PRIMARY KEY (week_start, unit_id)
+);
+"""
+
+EXPECTED_EXPECTATIONS_TABLES: dict[str, set[str]] = {
+    "expectations": {
+        "week_start",
+        "unit_id",
+        "commitment_point",
+        "expected_scope",
+        "expected_effort",
+        "expected_outcome",
+        "confidence",
+        "model",
+        "input_bytes",
+        "extracted_at",
+        "skip_reason",
+    },
+}
+
+
 SYNTHESIS_SESSION_GH_EVENTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS session_gh_events (
     session_uuid  TEXT NOT NULL,
@@ -622,14 +661,33 @@ def init_appswitch_db(db_path: Path) -> None:
         conn.close()
 
 
+def init_expectations_db(db_path: Path) -> None:
+    """Create ``expectations.db`` with the expectations table (Epic #27, X-1).
+
+    Idempotent (``CREATE TABLE IF NOT EXISTS``). Later slices of Epic #27
+    (X-2 through X-5) are expected to add additional tables to the same
+    DB file via their own ``init_*`` functions.
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(SYNTHESIS_EXPECTATIONS_SCHEMA)
+        conn.commit()
+        # Assert on the same connection we just wrote to (for ':memory:'
+        # databases; see init_sessions_db for the rationale).
+        assert_schema(conn, EXPECTED_EXPECTATIONS_TABLES)
+    finally:
+        conn.close()
+
+
 def init_all(config: Config) -> None:
-    """Initialize all three databases under the configured data directory."""
+    """Initialize all four databases under the configured data directory."""
     data_dir = config.data_path
     data_dir.mkdir(parents=True, exist_ok=True)
 
     init_sessions_db(data_dir / "sessions.db")
     init_github_db(data_dir / "github.db")
     init_appswitch_db(data_dir / "appswitch.db")
+    init_expectations_db(data_dir / "expectations.db")
 
     print(f"Databases initialized in {data_dir}")
 
