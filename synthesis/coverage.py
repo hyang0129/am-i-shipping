@@ -628,12 +628,23 @@ def backfill_full(
     *,
     data_dir: Optional[Path] = None,
 ) -> BackfillSummary:
-    """Delete every DB row whose JSONL is on disk and re-ingest from scratch.
+    """Re-ingest every JSONL on disk, overwriting every column of the matching
+    DB row.
 
     Orphan rows (DB row present, JSONL absent) are LEFT IN PLACE and surfaced
     in ``summary.orphans_preserved`` — never silently dropped. Requires an
     explicit ``--full`` flag at the CLI layer; this function assumes the
     caller has already asserted that.
+
+    Implementation note: we rely on ``upsert_session``'s
+    ``INSERT ... ON CONFLICT(session_uuid) DO UPDATE SET ...`` clause (see
+    ``collector/store.py``) to overwrite every column. An earlier
+    implementation issued a ``DELETE`` before the upsert, but that opened a
+    destructive window: if ``parse_session`` raised mid-loop (malformed
+    JSONL, truncated file) the row was already gone from the DB with no
+    rollback path, even when the pre-rebuild DB value was the only surviving
+    copy. The upsert-only path is atomic per-session and preserves the DB
+    row on parse failure.
     """
     summary = BackfillSummary()
     if not sessions_db.exists():
@@ -641,7 +652,7 @@ def backfill_full(
 
     index = _build_uuid_index(projects_path)
 
-    # Determine orphans BEFORE deletions (so they survive the loop below).
+    # Determine orphans BEFORE the loop (so counting is independent of order).
     conn = sqlite3.connect(str(sessions_db))
     try:
         cursor = conn.execute("SELECT session_uuid FROM sessions")
@@ -652,16 +663,6 @@ def backfill_full(
     summary.orphans_preserved = sum(1 for u in db_uuids if u not in index)
 
     for session_uuid, jsonl in index.items():
-        # Delete the existing row (if any). Orphans (JSONL only) are a no-op DELETE.
-        conn = sqlite3.connect(str(sessions_db))
-        try:
-            conn.execute(
-                "DELETE FROM sessions WHERE session_uuid = ?",
-                (session_uuid,),
-            )
-            conn.commit()
-        finally:
-            conn.close()
         try:
             record = parse_session(jsonl)
             upsert_session(

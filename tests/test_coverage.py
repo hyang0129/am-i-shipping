@@ -359,6 +359,49 @@ class TestFullBackfill:
         assert rows["uuid-orphan"] == "[]"
 
 
+class TestFullBackfillParseFailurePreservesRow:
+    """Regression (F-2): a parse_session failure mid-rebuild must not destroy
+    the pre-existing DB row. Earlier implementation issued DELETE + commit
+    before re-ingest, so a raised parse_session dropped the row permanently.
+    """
+
+    def test_parse_failure_preserves_existing_row(self, db_and_projects):
+        db, projects = db_and_projects
+
+        # Row with a valid pre-existing raw_content_json value — this is the
+        # "last good copy" scenario the regression is about.
+        _insert_session(
+            db,
+            "uuid-valuable",
+            '[{"role":"user","content":"irreplaceable"}]',
+            "2026-04-15T10:00:00Z",
+        )
+        # Write a JSONL that has the right sessionId (so it's picked up) but
+        # malformed JSON on a later line so parse_session raises
+        # SessionParseError.
+        path = projects / "proj" / "malformed.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"sessionId": "uuid-valuable", "type": "summary"})
+            + "\n{not valid json\n"
+        )
+
+        summary = backfill_full(db, projects)
+        assert summary.errored == 1
+        assert summary.deleted_and_reingested == 0
+
+        # Critical invariant: the pre-existing row is still there, unchanged.
+        conn = sqlite3.connect(str(db))
+        try:
+            rows = dict(conn.execute(
+                "SELECT session_uuid, raw_content_json FROM sessions"
+            ).fetchall())
+        finally:
+            conn.close()
+        assert "uuid-valuable" in rows
+        assert rows["uuid-valuable"] == '[{"role":"user","content":"irreplaceable"}]'
+
+
 class TestTwoWayDiff:
     """Scenario: unprocessed JSONLs and orphan DB rows appear in distinct lists."""
 
