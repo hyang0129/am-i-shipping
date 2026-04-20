@@ -590,6 +590,7 @@ def _assemble_prompt(
     gap_rows: Optional[List[dict]] = None,
     revision_rows: Optional[List[dict]] = None,
     calibration_trends: Optional[dict] = None,
+    calibration_unit_count: Optional[int] = None,
 ) -> Tuple[str, List[dict]]:
     """Return (system_prompt, user_messages) for the synthesis call.
 
@@ -641,10 +642,17 @@ def _assemble_prompt(
 
     # Epic #27 — X-5 (#76): calibration trends. Empty dict below the
     # ≥20-correction threshold — block is omitted entirely.
+    # AC-9 gate: also pass processed_unit_count so render_calibration_block
+    # can enforce the ≥30-unit floor alongside the correction threshold.
     if calibration_trends:
         from synthesis.calibration import render_calibration_block
 
-        body_parts.extend(render_calibration_block(calibration_trends))
+        body_parts.extend(
+            render_calibration_block(
+                calibration_trends,
+                processed_unit_count=calibration_unit_count,
+            )
+        )
 
     user_content = "\n".join(body_parts)
     return _STATIC_SYSTEM_PROMPT, [{"role": "user", "content": user_content}]
@@ -941,6 +949,7 @@ def run_synthesis(
         # the ≥20 user-correction threshold this is a strict no-op and
         # returns an empty dict — the retrospective omits the section.
         calibration_trends: dict = {}
+        calibration_unit_count: Optional[int] = None
         if expectations_db is not None:
             from synthesis import calibration
 
@@ -950,6 +959,18 @@ def run_synthesis(
                     github_db=str(gh_path),
                     expectations_db=str(expectations_db),
                 )
+                # AC-9: also count total processed units (expectation_gaps
+                # rows across all weeks) so render_calibration_block can
+                # enforce the ≥30-unit floor (the second gate).
+                _exp_conn = sqlite3.connect(str(expectations_db))
+                try:
+                    calibration_unit_count = calibration._count_processed_units(
+                        _exp_conn
+                    )
+                except Exception:  # noqa: BLE001
+                    calibration_unit_count = None
+                finally:
+                    _exp_conn.close()
             except sqlite3.OperationalError as exc:
                 logger.warning(
                     "Calibration pass skipped for week=%s: %s. Run "
@@ -973,6 +994,7 @@ def run_synthesis(
             gap_rows=gap_rows,
             revision_rows=revision_rows,
             calibration_trends=calibration_trends,
+            calibration_unit_count=calibration_unit_count,
         )
 
         # --- Issue #54 P-2: prompt-size guard -------------------------

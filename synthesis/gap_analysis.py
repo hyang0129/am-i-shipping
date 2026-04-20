@@ -63,7 +63,7 @@ FAILURE_PRECONDITION_ENUM: tuple[str, ...] = (
     "step_5_plan_confirmed",
 )
 
-SEVERITY_ENUM: tuple[str, ...] = ("none", "minor", "major", "critical")
+SEVERITY_ENUM: tuple[str, ...] = ("none", "minor", "significant", "major", "critical")
 DIRECTION_ENUM: tuple[str, ...] = ("under", "over", "match", "ambiguous")
 
 
@@ -84,13 +84,15 @@ commitment point), the actual outcome metrics (elapsed_days, \
 total_reprompts, review_cycles, status), and the unit summary text. \
 Decide:
 
-1. severity: one of none | minor | major | critical.
+1. severity: one of none | minor | significant | major | critical.
    Rubric (apply within the LLM, not externally):
-   * none     — actual matched expected across all three facets.
-   * minor    — one facet deviated but the unit completed as expected.
-   * major    — two+ facets deviated OR one facet deviated significantly \
-(>2x expected effort, scope doubled, outcome partially missed).
-   * critical — outcome missed entirely OR unit abandoned.
+   * none        — actual matched expected across all three facets.
+   * minor       — one facet deviated but the unit completed as expected.
+   * significant — actual exceeded 2x expected effort (>2x expected effort),
+                   or scope doubled with outcome still met.
+   * major       — two+ facets deviated OR significant effort overrun AND
+                   scope also changed, outcome partially missed.
+   * critical    — outcome missed entirely OR unit abandoned.
 2. direction: one of under | over | match | ambiguous.
 3. failure_precondition: which idealized-workflow step was the root cause.
    Must be one of phase_0_setup, step_1_intent, step_2_motivation, \
@@ -156,6 +158,11 @@ def compute_severity_direction(
 
     if reprompts >= 10 or reviews >= 5:
         return "major", "over"
+    # "significant" — actual exceeded 2x expected effort (AC criterion 4):
+    # moderate-to-high reprompt load that indicates a clear 2x effort overrun
+    # without reaching the full multi-facet threshold of "major".
+    if reprompts >= 6 or reviews >= 3:
+        return "significant", "over"
     if reprompts >= 4 or reviews >= 2:
         return "minor", "over"
     return "none", "match"
@@ -339,6 +346,7 @@ def _insert_gap_row(
     commitment_point: Optional[str],
     scope_gap: Optional[str],
     effort_gap: Optional[str],
+    effort_gap_ratio: Optional[float],
     outcome_gap: Optional[str],
     severity: str,
     direction: str,
@@ -347,15 +355,16 @@ def _insert_gap_row(
     exp_conn.execute(
         "INSERT OR REPLACE INTO expectation_gaps "
         "(week_start, unit_id, commitment_point, scope_gap, effort_gap, "
-        " outcome_gap, severity, direction, failure_precondition, "
-        " computed_at, auto_confirmed) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), 0)",
+        " effort_gap_ratio, outcome_gap, severity, direction, "
+        " failure_precondition, computed_at, auto_confirmed) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), 0)",
         (
             week_start,
             unit_id,
             commitment_point,
             scope_gap,
             effort_gap,
+            effort_gap_ratio,
             outcome_gap,
             severity,
             direction,
@@ -493,6 +502,13 @@ def run(
             outcome_gap_text: Optional[str] = None
             failure_precondition: Optional[str] = None
 
+            # Compute the numeric effort ratio unconditionally — it is a
+            # pure function of the units row and the expectation, independent
+            # of whether the LLM is available.
+            effort_gap_ratio: Optional[float] = _compute_effort_gap_ratio(
+                unit, exp
+            )
+
             if adapter is not None:
                 user_text = _build_unit_input(exp, unit, summary)
                 try:
@@ -551,6 +567,7 @@ def run(
                 commitment_point=exp.get("commitment_point"),
                 scope_gap=scope_gap_text,
                 effort_gap=effort_gap_text,
+                effort_gap_ratio=effort_gap_ratio,
                 outcome_gap=outcome_gap_text,
                 severity=severity,
                 direction=direction,
@@ -572,6 +589,52 @@ def run(
     finally:
         exp_conn.close()
         gh_conn.close()
+
+
+def _compute_effort_gap_ratio(
+    unit: Dict[str, Any],
+    expectation: Dict[str, Any],
+) -> Optional[float]:
+    """Return the numeric ratio of actual to expected effort sessions.
+
+    The ratio is ``actual_sessions / expected_sessions`` where:
+
+    * ``actual_sessions`` = ``total_reprompts + 1`` (each reprompt starts a
+      new effective "session attempt"; the +1 accounts for the initial session).
+    * ``expected_sessions`` = 1 when ``expected_effort`` is NULL or does not
+      contain an explicit session count, which is the typical case where the
+      user's expectation was "one session". This keeps the ratio meaningful
+      even when the expectation is qualitative text.
+
+    Returns ``None`` when the unit has no ``total_reprompts`` value (i.e. the
+    unit row is missing from ``github.db``), or when ``expected_sessions``
+    cannot be determined as a positive number.
+
+    A ratio of 1.0 means actual == expected; >1.0 means over-effort;
+    <1.0 means under-effort (rare for effort, but possible if the unit
+    was simpler than anticipated).
+    """
+    reprompts = unit.get("total_reprompts")
+    if reprompts is None:
+        return None
+    actual_sessions = int(reprompts) + 1
+
+    # Try to parse an explicit session count from the expected_effort text
+    # (e.g. "two sessions", "3 sessions"). Fall back to 1 (one session) —
+    # the most common qualitative expectation in the corpus.
+    import re as _re
+
+    expected_effort_text = (expectation.get("expected_effort") or "").lower()
+    expected_sessions: float = 1.0
+    m = _re.search(r"(\d+)\s*session", expected_effort_text)
+    if m:
+        parsed = int(m.group(1))
+        if parsed > 0:
+            expected_sessions = float(parsed)
+
+    if expected_sessions <= 0:
+        return None
+    return round(actual_sessions / expected_sessions, 4)
 
 
 def _heuristic_failure_precondition(
@@ -619,7 +682,7 @@ def load_gap_rows(
         if min_severity is None:
             rows = conn.execute(
                 "SELECT unit_id, commitment_point, scope_gap, effort_gap, "
-                "       outcome_gap, severity, direction, "
+                "       effort_gap_ratio, outcome_gap, severity, direction, "
                 "       failure_precondition "
                 "FROM expectation_gaps WHERE week_start = ? "
                 "ORDER BY unit_id",
@@ -629,7 +692,7 @@ def load_gap_rows(
             placeholders = ",".join("?" * len(min_severity))
             rows = conn.execute(
                 f"SELECT unit_id, commitment_point, scope_gap, effort_gap, "
-                f"       outcome_gap, severity, direction, "
+                f"       effort_gap_ratio, outcome_gap, severity, direction, "
                 f"       failure_precondition "
                 f"FROM expectation_gaps "
                 f"WHERE week_start = ? AND severity IN ({placeholders}) "
@@ -642,10 +705,11 @@ def load_gap_rows(
                 "commitment_point": r[1],
                 "scope_gap": r[2],
                 "effort_gap": r[3],
-                "outcome_gap": r[4],
-                "severity": r[5],
-                "direction": r[6],
-                "failure_precondition": r[7],
+                "effort_gap_ratio": r[4],
+                "outcome_gap": r[5],
+                "severity": r[6],
+                "direction": r[7],
+                "failure_precondition": r[8],
             }
             for r in rows
         ]
@@ -660,4 +724,5 @@ __all__ = [
     "compute_severity_direction",
     "load_gap_rows",
     "run",
+    "_compute_effort_gap_ratio",
 ]

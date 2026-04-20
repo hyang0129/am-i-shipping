@@ -55,6 +55,11 @@ logger = logging.getLogger(__name__)
 # if the first calibration pass produces noisy output.
 CALIBRATION_MIN_CORRECTIONS = 20
 
+# Epic #27 AC-9: work-type accuracy breakdown requires ≥30 units processed
+# in ``expectation_gaps`` before the retrospective section is rendered.
+# This is a separate gate from the correction threshold — both must be met.
+CALIBRATION_MIN_UNITS = 30
+
 # X5-OQ-1 resolved: five examples is 25% of the 20-row floor — large
 # enough to signal, small enough to avoid bloating every per-unit call.
 FEW_SHOT_SAMPLE_SIZE = 5
@@ -86,6 +91,23 @@ def _count_user_corrections(exp_conn: sqlite3.Connection) -> int:
     except sqlite3.OperationalError:
         # Table missing (expectations.db not initialised yet). Treat as
         # "below threshold".
+        return 0
+    return int(row[0]) if row else 0
+
+
+def _count_processed_units(exp_conn: sqlite3.Connection) -> int:
+    """Return the total number of rows in ``expectation_gaps`` (all weeks).
+
+    This is the "units processed" count used to gate the work-type accuracy
+    breakdown in the retrospective (AC-9: ≥30 units required). The count is
+    cumulative across all weeks so that a project with many small weeks still
+    unlocks the section once the corpus is large enough.
+    """
+    try:
+        row = exp_conn.execute(
+            "SELECT COUNT(*) FROM expectation_gaps"
+        ).fetchone()
+    except sqlite3.OperationalError:
         return 0
     return int(row[0]) if row else 0
 
@@ -460,14 +482,34 @@ def load_trends(
 
 
 def render_calibration_block(
-    trends: Dict[str, Dict[str, Any]], *, top_n: int = 3
+    trends: Dict[str, Dict[str, Any]],
+    *,
+    top_n: int = 3,
+    processed_unit_count: Optional[int] = None,
 ) -> List[str]:
     """Render the ``## Calibration Trends`` Markdown block.
 
     Returns a list of lines; empty list when ``trends`` is empty (caller
     omits the section entirely — AS-1 / below-threshold scenario).
+
+    *processed_unit_count* is the total number of units in
+    ``expectation_gaps`` across all weeks. When provided and below
+    ``CALIBRATION_MIN_UNITS`` (30), the block is suppressed even if the
+    correction threshold is met (AC-9: work-type accuracy breakdown
+    requires both ≥20 corrections AND ≥30 processed units).
     """
     if not trends:
+        return []
+    if (
+        processed_unit_count is not None
+        and processed_unit_count < CALIBRATION_MIN_UNITS
+    ):
+        logger.info(
+            "Calibration block suppressed: processed_unit_count=%d < "
+            "CALIBRATION_MIN_UNITS=%d (AC-9: 30-unit gate)",
+            processed_unit_count,
+            CALIBRATION_MIN_UNITS,
+        )
         return []
     # Rank by the most pronounced correction rate across scope/effort/
     # outcome — higher average means the user changed the value more
@@ -504,6 +546,7 @@ def render_calibration_block(
 
 __all__ = [
     "CALIBRATION_MIN_CORRECTIONS",
+    "CALIBRATION_MIN_UNITS",
     "FEW_SHOT_SAMPLE_SIZE",
     "FEW_SHOT_BLOCK_MARKER",
     "TREND_FACETS",

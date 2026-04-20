@@ -299,6 +299,7 @@ CREATE TABLE IF NOT EXISTS expectation_gaps (
     commitment_point     TEXT,
     scope_gap            TEXT,
     effort_gap           TEXT,
+    effort_gap_ratio     REAL,
     outcome_gap          TEXT,
     severity             TEXT,
     direction            TEXT,
@@ -317,6 +318,10 @@ _EXPECTATIONS_MIGRATIONS = [
     # already includes the column on fresh DBs; the migration handles DBs
     # that shipped X-2 with an earlier column set.
     "ALTER TABLE expectation_gaps ADD COLUMN auto_confirmed INTEGER DEFAULT 0",
+    # Epic #27 AC fix: added ``effort_gap_ratio`` (REAL) — numeric ratio of
+    # actual to expected effort sessions. The CREATE above already includes
+    # the column on fresh DBs; the migration handles older DBs.
+    "ALTER TABLE expectation_gaps ADD COLUMN effort_gap_ratio REAL",
 ]
 
 # Epic #27 — X-3 (#74): expectation_revisions schema.
@@ -448,6 +453,7 @@ EXPECTED_EXPECTATIONS_TABLES: dict[str, set[str]] = {
         "commitment_point",
         "scope_gap",
         "effort_gap",
+        "effort_gap_ratio",
         "outcome_gap",
         "severity",
         "direction",

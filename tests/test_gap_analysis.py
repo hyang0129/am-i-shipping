@@ -163,6 +163,7 @@ class TestExpectationGapsSchema:
             "commitment_point",
             "scope_gap",
             "effort_gap",
+            "effort_gap_ratio",
             "outcome_gap",
             "severity",
             "direction",
