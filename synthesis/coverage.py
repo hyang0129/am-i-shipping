@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sqlite3
 import sys
@@ -49,6 +50,8 @@ from collector.session_parser import (
     parse_session,
 )
 from collector.store import upsert_session
+
+_logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +619,14 @@ def backfill_partial(
                 skip_health=True,
             )
             summary.updated += 1
-        except Exception:  # noqa: BLE001 — surface count, keep the loop going
+        except Exception as exc:  # noqa: BLE001 — surface count, keep the loop going
+            # Log so operators can investigate. A bare errored=N count with no
+            # trail defeats the whole "surface sessions needing attention"
+            # purpose of the diagnostic.
+            _logger.warning(
+                "backfill_partial: parse/upsert failed for session_uuid=%s jsonl=%s: %s",
+                session_uuid, jsonl, exc,
+            )
             summary.errored += 1
 
     return summary
@@ -673,7 +683,11 @@ def backfill_full(
                 skip_health=True,
             )
             summary.deleted_and_reingested += 1
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "backfill_full: parse/upsert failed for session_uuid=%s jsonl=%s: %s",
+                session_uuid, jsonl, exc,
+            )
             summary.errored += 1
 
     return summary

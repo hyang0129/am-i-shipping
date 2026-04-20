@@ -359,6 +359,41 @@ class TestFullBackfill:
         assert rows["uuid-orphan"] == "[]"
 
 
+class TestBackfillLogging:
+    """F-3: exception swallowing must emit a logging.warning with uuid + path
+    so the operator has a trail beyond the opaque summary.errored count.
+    """
+
+    def test_partial_backfill_logs_on_failure(self, db_and_projects, caplog):
+        import logging as _logging
+        db, projects = db_and_projects
+        _insert_session(db, "uuid-bad", None, None)
+        path = projects / "proj" / "bad.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"sessionId": "uuid-bad", "type": "summary"})
+            + "\n{not json\n"
+        )
+        with caplog.at_level(_logging.WARNING, logger="synthesis.coverage"):
+            summary = backfill_partial(db, projects)
+        assert summary.errored == 1
+        assert any("uuid-bad" in rec.message for rec in caplog.records)
+
+    def test_full_backfill_logs_on_failure(self, db_and_projects, caplog):
+        import logging as _logging
+        db, projects = db_and_projects
+        path = projects / "proj" / "bad.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"sessionId": "uuid-bad", "type": "summary"})
+            + "\n{not json\n"
+        )
+        with caplog.at_level(_logging.WARNING, logger="synthesis.coverage"):
+            summary = backfill_full(db, projects)
+        assert summary.errored == 1
+        assert any("uuid-bad" in rec.message for rec in caplog.records)
+
+
 class TestFullBackfillParseFailurePreservesRow:
     """Regression (F-2): a parse_session failure mid-rebuild must not destroy
     the pre-existing DB row. Earlier implementation issued DELETE + commit
