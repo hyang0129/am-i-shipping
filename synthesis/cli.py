@@ -72,7 +72,36 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="subcommand")
     add_coverage_subparser(subparsers)
+    _add_correct_subparser(subparsers)
     return parser
+
+
+def _add_correct_subparser(subparsers) -> None:
+    """Register the ``am-synthesize correct`` subcommand (Epic #27 X-4)."""
+    correct = subparsers.add_parser(
+        "correct",
+        help=(
+            "Interactive agentic correction loop for the week's major/"
+            "critical expectation gaps. Persists corrections into "
+            "expectations.db; does NOT rewrite retrospective .md files."
+        ),
+    )
+    correct.add_argument(
+        "--week",
+        default=None,
+        help=(
+            "Week start date (YYYY-MM-DD). Default: most recent week that "
+            "has gap rows in expectations.db."
+        ),
+    )
+    correct.add_argument(
+        "--unit",
+        default=None,
+        help=(
+            "Restrict the correction loop to a single unit_id. Default: "
+            "iterate over every major/critical gap in the week."
+        ),
+    )
 
 
 def _run_weekly(args: argparse.Namespace) -> int:
@@ -126,6 +155,62 @@ def _run_weekly(args: argparse.Namespace) -> int:
     return 0
 
 
+def _latest_week_with_gaps(expectations_db: Path) -> Optional[str]:
+    """Return the most recent ``week_start`` that has any gap rows."""
+    import sqlite3
+
+    if not expectations_db.exists():
+        return None
+    conn = sqlite3.connect(str(expectations_db))
+    try:
+        try:
+            row = conn.execute(
+                "SELECT week_start FROM expectation_gaps "
+                "ORDER BY week_start DESC LIMIT 1"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def _run_correct(args: argparse.Namespace) -> int:
+    """``am-synthesize correct`` — X-4 interactive correction loop."""
+    config = load_config(args.config)
+    data_dir: Path = config.data_path
+    expectations_db = data_dir / "expectations.db"
+
+    week = args.week or _latest_week_with_gaps(expectations_db)
+    if not week:
+        print(
+            "am-synthesize correct: no week specified and no gap rows found "
+            "in expectations.db. Run 'am-synthesize --week YYYY-MM-DD' first.",
+            file=sys.stderr,
+        )
+        return 2
+
+    synthesis_cfg = config.synthesis
+    output_dir = config.synthesis_output_path
+    resolved_cfg = replace(synthesis_cfg, output_dir=str(output_dir))
+
+    try:
+        from synthesis.correction import run_correction_session
+
+        written = run_correction_session(
+            week,
+            expectations_db=str(expectations_db),
+            config=resolved_cfg,
+            unit_id=args.unit,
+        )
+    except Exception:  # noqa: BLE001 — CLI is top of stack
+        logging.exception("Correction session failed")
+        return 2
+
+    print(f"Correction session complete: {written} rows written for week={week}")
+    return 0
+
+
 def _run_coverage(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     data_dir: Path = config.data_path
@@ -161,6 +246,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.subcommand == "coverage":
         return _run_coverage(args)
+    if args.subcommand == "correct":
+        return _run_correct(args)
     return _run_weekly(args)
 
 

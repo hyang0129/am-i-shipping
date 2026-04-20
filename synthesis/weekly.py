@@ -859,6 +859,20 @@ def run_synthesis(
                     week_start,
                     min_severity=("major", "critical"),
                 )
+                # Epic #27 — X-4 (#75): auto-confirm sweep fires on every
+                # ``am-synthesize --week`` invocation (AS-6). Any gap row
+                # older than 14 days without a user correction gets
+                # ``corrected_by='auto_confirm'`` rows written. Non-fatal
+                # if the corrections table is missing — log + proceed.
+                from synthesis.correction import auto_confirm_sweep
+
+                try:
+                    auto_confirm_sweep(str(expectations_db))
+                except sqlite3.OperationalError as exc:
+                    logger.warning(
+                        "Auto-confirm sweep skipped for week=%s: %s",
+                        week_start, exc,
+                    )
             except sqlite3.OperationalError as exc:
                 # Most likely: expectations.db not initialised yet (X-1
                 # hasn't been run). Log a warning and proceed without the
