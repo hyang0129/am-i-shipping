@@ -162,6 +162,37 @@ collectors still run unconditionally — only the synthesis step is gated
 on weekly cadence. See [setup.md](setup.md) for the weekly schedule
 step.
 
+### Coverage diagnostic (pre-synthesis health check)
+
+Before synthesis can be trusted, every session in `sessions.db` needs a
+recoverable transcript in `raw_content_json` — otherwise the expectation
+extractor (Epic #27) reads empty strings and emits plausible-looking
+output with no signal. Run the coverage diagnostic at any time to see the
+fill state and surface sessions needing attention:
+
+```bash
+am-synthesize coverage              # human-readable report
+am-synthesize coverage --json       # machine-readable (for scripts)
+am-synthesize coverage --backfill   # populate NULL rows from JSONL (idempotent)
+am-synthesize coverage --backfill --full   # delete and re-ingest every session
+```
+
+The report gives total / NULL / `"[]"` / non-empty counts bucketed
+per-week, per-project, and per-unit (where "unit" is a mechanical GitHub
+reference parse from the raw JSONL, independent of the synthesis unit
+identifier). Four diagnostic lists surface sessions that need human
+attention: unprocessed JSONLs, orphan DB rows, `"[]"` rows whose JSONL
+has text turns (parser-bug candidates), and `"[]"` rows whose JSONL is
+genuinely empty (degenerate candidates).
+
+**Coverage gate (qualitative).** The gate for trusting expectation
+extraction is not a percentage threshold: *every session should have a
+transcript OR be on a documented exclusion list with a reason*. Use
+`coverage` to find the exceptions; use `--backfill` (partial) to recover
+what the filesystem still has; use `--backfill --full` only when you
+know the DB has drifted from the JSONLs (e.g. a prior parser bug that
+needs a clean re-ingest).
+
 ---
 
 ## Project Structure
