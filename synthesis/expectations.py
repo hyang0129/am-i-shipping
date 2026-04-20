@@ -469,6 +469,22 @@ def run_extraction(
 
     adapter = _get_adapter(config)
 
+    # Epic #27 — X-5 (#76): few-shot calibration block. Assembled once
+    # per run and prepended to every classifier user message when the
+    # ≥20 user-correction threshold is crossed. Below threshold this is
+    # an empty string (no-op — identical to X-1..X-4 baseline).
+    from synthesis.calibration import build_few_shot_block
+
+    try:
+        few_shot_block = build_few_shot_block(expectations_db)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Few-shot calibration block assembly failed (%s); "
+            "proceeding without calibration examples.",
+            exc,
+        )
+        few_shot_block = ""
+
     gh_conn = sqlite3.connect(github_db)
     exp_conn = sqlite3.connect(expectations_db)
     sessions_conn = None
@@ -539,10 +555,15 @@ def run_extraction(
 
             # Live call — we have a structural candidate and non-empty input.
             structural_count += 1
+            # X-5: prepend few-shot calibration block when active. Empty
+            # string below threshold means no-op string concatenation.
+            classifier_input = (
+                f"{few_shot_block}\n{unit_input}" if few_shot_block else unit_input
+            )
             try:
                 result = adapter.call(
                     _EXPECTATIONS_SYSTEM_PROMPT,
-                    unit_input,
+                    classifier_input,
                     config.model,
                     _MAX_OUTPUT_TOKENS,
                 )
