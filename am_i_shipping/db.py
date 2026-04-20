@@ -391,6 +391,43 @@ CREATE TABLE IF NOT EXISTS expectation_corrections (
 );
 """
 
+# Epic #27 — X-5 (#76): expectation_calibration_trends schema.
+#
+# Written by ``synthesis.calibration.run`` during ``am-synthesize`` once
+# ≥20 user corrections have accumulated in ``expectation_corrections``.
+# Each row captures the per-work-type calibration delta for a given
+# week. The shipped retrospective ``.md`` is immutable (Epic #17
+# Decision 2); this trend table is live data and may be recomputed on
+# re-runs via UPSERT semantics.
+#
+# Primary key: ``(work_type, week_start)`` — the intent document flagged
+# this choice as implementer-owned. UPSERT-by-PK keeps re-runs cheap and
+# consistent with the "trend table is live, .md is frozen" split.
+#
+# * ``work_type``            — mirror of ``github.db::issues.type_label``
+#                              or the literal ``"unknown"`` when the
+#                              issue's ``type_label`` is NULL / the unit
+#                              has no joined issue row.
+# * ``avg_*_delta``          — average over all user corrections for the
+#                              work-type where the facet actually changed
+#                              (``original_value != corrected_value``).
+#                              NULL when no user corrections for that
+#                              facet in the work-type.
+# * ``sample_count``         — number of ``corrected_by='user'`` rows
+#                              contributing to the group.
+SYNTHESIS_EXPECTATION_CALIBRATION_TRENDS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS expectation_calibration_trends (
+    work_type            TEXT NOT NULL,
+    week_start           TEXT NOT NULL,
+    avg_scope_delta      REAL,
+    avg_effort_delta     REAL,
+    avg_outcome_delta    REAL,
+    sample_count         INTEGER NOT NULL DEFAULT 0,
+    computed_at          TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (work_type, week_start)
+);
+"""
+
 EXPECTED_EXPECTATIONS_TABLES: dict[str, set[str]] = {
     "expectations": {
         "week_start",
@@ -439,6 +476,15 @@ EXPECTED_EXPECTATIONS_TABLES: dict[str, set[str]] = {
         "correction_note",
         "corrected_by",
         "corrected_at",
+    },
+    "expectation_calibration_trends": {
+        "work_type",
+        "week_start",
+        "avg_scope_delta",
+        "avg_effort_delta",
+        "avg_outcome_delta",
+        "sample_count",
+        "computed_at",
     },
 }
 
@@ -829,6 +875,9 @@ def init_expectations_db(db_path: Path) -> None:
         conn.execute(SYNTHESIS_EXPECTATION_REVISIONS_SCHEMA)
         # Epic #27 — X-4 (#75): expectation_corrections lives in the same DB.
         conn.execute(SYNTHESIS_EXPECTATION_CORRECTIONS_SCHEMA)
+        # Epic #27 — X-5 (#76): expectation_calibration_trends lives in the
+        # same DB.
+        conn.execute(SYNTHESIS_EXPECTATION_CALIBRATION_TRENDS_SCHEMA)
         for migration in _EXPECTATIONS_MIGRATIONS:
             try:
                 conn.execute(migration)

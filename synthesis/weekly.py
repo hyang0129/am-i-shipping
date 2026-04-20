@@ -416,7 +416,15 @@ Required Markdown sections (exact headings, in order)
    and the before/after summary. Low-confidence revisions (< 0.5) are
    annotated as such, not omitted. Omit the section body when no
    revisions exist; keep the heading.
-8. `## Clarifying Questions`      — at most TWO total, numbered `1.`
+8. `## Calibration Trends`        — *conditional; present only when
+   ≥20 user corrections have accumulated in `expectation_corrections`
+   (Epic #27 X-5).* Per-work-type calibration deltas grouped by
+   `type_label`. Each bullet names the work type, the correction rate
+   per facet (`scope`/`effort`/`outcome`), and the sample count.
+   The LLM must preserve the supplied bullets verbatim — do not invent
+   new work types or rephrase the numeric deltas. Omit the section
+   entirely when the calibration pass produced no rows.
+9. `## Clarifying Questions`      — at most TWO total, numbered `1.`
    and `2.`. Each question should be answerable from the user's memory
    of the week — no research required.
 
@@ -581,6 +589,7 @@ def _assemble_prompt(
     unit_attributions: Optional[dict] = None,
     gap_rows: Optional[List[dict]] = None,
     revision_rows: Optional[List[dict]] = None,
+    calibration_trends: Optional[dict] = None,
 ) -> Tuple[str, List[dict]]:
     """Return (system_prompt, user_messages) for the synthesis call.
 
@@ -629,6 +638,13 @@ def _assemble_prompt(
     # surfaced (low-confidence ones are annotated, not dropped).
     if revision_rows:
         body_parts.extend(_render_revision_block(revision_rows))
+
+    # Epic #27 — X-5 (#76): calibration trends. Empty dict below the
+    # ≥20-correction threshold — block is omitted entirely.
+    if calibration_trends:
+        from synthesis.calibration import render_calibration_block
+
+        body_parts.extend(render_calibration_block(calibration_trends))
 
     user_content = "\n".join(body_parts)
     return _STATIC_SYSTEM_PROMPT, [{"role": "user", "content": user_content}]
@@ -919,6 +935,35 @@ def run_synthesis(
                     week_start, exc,
                 )
 
+        # Epic #27 — X-5 (#76): calibration trends pass. Runs AFTER the
+        # X-4 auto-confirm sweep (which populates additional correction
+        # rows) so the threshold count reflects the freshest state. Below
+        # the ≥20 user-correction threshold this is a strict no-op and
+        # returns an empty dict — the retrospective omits the section.
+        calibration_trends: dict = {}
+        if expectations_db is not None:
+            from synthesis import calibration
+
+            try:
+                calibration_trends = calibration.run(
+                    week_start,
+                    github_db=str(gh_path),
+                    expectations_db=str(expectations_db),
+                )
+            except sqlite3.OperationalError as exc:
+                logger.warning(
+                    "Calibration pass skipped for week=%s: %s. Run "
+                    "'am-init-db' and 'am-extract-expectations' first.",
+                    week_start, exc,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Calibration pass failed for week=%s: %s. "
+                    "Retrospective will be written without the "
+                    "Calibration Trends section.",
+                    week_start, exc,
+                )
+
         system_prompt, messages = _assemble_prompt(
             units,
             unit_transcripts,
@@ -927,6 +972,7 @@ def run_synthesis(
             unit_attributions,
             gap_rows=gap_rows,
             revision_rows=revision_rows,
+            calibration_trends=calibration_trends,
         )
 
         # --- Issue #54 P-2: prompt-size guard -------------------------
