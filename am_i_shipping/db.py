@@ -354,6 +354,43 @@ CREATE TABLE IF NOT EXISTS expectation_revisions (
 );
 """
 
+# Epic #27 — X-4 (#75): expectation_corrections schema.
+#
+# Written by ``synthesis.correction`` when the user runs
+# ``am-synthesize correct`` (interactive agentic workflow) and by the
+# auto-confirm sweep that runs on every ``am-synthesize --week``
+# invocation.
+#
+# IRREVERSIBLE column names (per the epic ADR): ``week_start``,
+# ``unit_id``, ``facet``, ``original_value``, ``corrected_value``,
+# ``correction_note``, ``corrected_by``. X-5 calibration keys off these
+# names; renaming after corrections accumulate is expensive.
+#
+# * ``facet``          — one of {``commitment_point``, ``scope``,
+#                         ``effort``, ``outcome``, ``severity``,
+#                         ``failure_precondition``}.
+# * ``corrected_by``   — one of {``user``, ``auto_confirm``}.
+# * ``original_value`` — the value that was in the ``expectation_gaps``
+#                         row at the moment the correction was written.
+#                         The gap row itself is NEVER mutated — X-5
+#                         needs the before/after delta.
+# * ``corrected_value``— equal to ``original_value`` when the user
+#                         confirmed without change; different when a
+#                         correction was supplied.
+SYNTHESIS_EXPECTATION_CORRECTIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS expectation_corrections (
+    week_start       TEXT NOT NULL,
+    unit_id          TEXT NOT NULL,
+    facet            TEXT NOT NULL,
+    original_value   TEXT,
+    corrected_value  TEXT,
+    correction_note  TEXT,
+    corrected_by     TEXT NOT NULL,
+    corrected_at     TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (week_start, unit_id, facet)
+);
+"""
+
 EXPECTED_EXPECTATIONS_TABLES: dict[str, set[str]] = {
     "expectations": {
         "week_start",
@@ -392,6 +429,16 @@ EXPECTED_EXPECTATIONS_TABLES: dict[str, set[str]] = {
         "after_text",
         "confidence",
         "detected_at",
+    },
+    "expectation_corrections": {
+        "week_start",
+        "unit_id",
+        "facet",
+        "original_value",
+        "corrected_value",
+        "correction_note",
+        "corrected_by",
+        "corrected_at",
     },
 }
 
@@ -780,6 +827,8 @@ def init_expectations_db(db_path: Path) -> None:
         conn.execute(SYNTHESIS_EXPECTATION_GAPS_SCHEMA)
         # Epic #27 — X-3 (#74): expectation_revisions lives in the same DB.
         conn.execute(SYNTHESIS_EXPECTATION_REVISIONS_SCHEMA)
+        # Epic #27 — X-4 (#75): expectation_corrections lives in the same DB.
+        conn.execute(SYNTHESIS_EXPECTATION_CORRECTIONS_SCHEMA)
         for migration in _EXPECTATIONS_MIGRATIONS:
             try:
                 conn.execute(migration)
