@@ -406,6 +406,12 @@ Required Markdown sections (exact headings, in order)
 6. `## Clarifying Questions`      — at most TWO total, numbered `1.`
    and `2.`. Each question should be answerable from the user's memory
    of the week — no research required.
+7. `## Expectation Gaps`          — units whose expected vs. actual gap
+   was `major` or `critical`. Each item names the unit, the direction
+   of the gap (`under`/`over`/`match`/`ambiguous`), and the idealized-
+   workflow step (`phase_0_setup` / `step_1_intent` / ...) that was the
+   root-cause precondition. Omit the section body when no major or
+   critical gaps exist; keep the heading.
 
 Constraints
 -----------
@@ -492,12 +498,42 @@ def _format_unit_block(
     return "\n".join(lines)
 
 
+def _render_gap_block(gap_rows: List[dict]) -> List[str]:
+    """Render the ``## Expectation Gaps`` Markdown block for the prompt.
+
+    Only major and critical rows are included — minor and none rows live
+    in ``expectation_gaps`` for X-5 calibration but do not appear in the
+    retrospective (signal density). Returns a list of lines; empty list
+    when there is nothing to render (the caller then skips adding the
+    header).
+    """
+    if not gap_rows:
+        return []
+    lines: List[str] = ["", "## Expectation Gaps (from X-2 gap analysis)", ""]
+    for row in gap_rows:
+        unit_id = row.get("unit_id")
+        severity = row.get("severity") or ""
+        direction = row.get("direction") or ""
+        fp = row.get("failure_precondition") or ""
+        lines.append(
+            f"- unit {unit_id}: severity={severity}, direction={direction}, "
+            f"failure_precondition={fp}"
+        )
+        for key in ("scope_gap", "effort_gap", "outcome_gap"):
+            val = row.get(key)
+            if val:
+                lines.append(f"    - {key}: {val}")
+    lines.append("")
+    return lines
+
+
 def _assemble_prompt(
     units: List[dict],
     unit_transcripts: dict,
     unit_timelines: dict,
     week_start: str,
     unit_attributions: Optional[dict] = None,
+    gap_rows: Optional[List[dict]] = None,
 ) -> Tuple[str, List[dict]]:
     """Return (system_prompt, user_messages) for the synthesis call.
 
@@ -536,6 +572,12 @@ def _assemble_prompt(
                 )
             body_parts.append("")
 
+    # Epic #27 — X-2 (#73): inject gap rows into the user message so the
+    # LLM can reason about them. Only major/critical are surfaced here;
+    # minor/none stay in the DB for X-5 calibration.
+    if gap_rows:
+        body_parts.extend(_render_gap_block(gap_rows))
+
     user_content = "\n".join(body_parts)
     return _STATIC_SYSTEM_PROMPT, [{"role": "user", "content": user_content}]
 
@@ -556,6 +598,7 @@ def run_synthesis(
     sessions_db: Union[str, Path],
     week_start: str,
     dry_run: bool = False,
+    expectations_db: Optional[Union[str, Path]] = None,
 ) -> Optional[Path]:
     """End-to-end weekly synthesis for *week_start*.
 
@@ -742,8 +785,49 @@ def run_synthesis(
                         gh_conn, week_start, repo_part, issue_number, session_uuids
                     )
 
+        # Epic #27 — X-2 (#73): run the gap pass before prompt assembly so
+        # gap rows are available to inject into the user message. Silent
+        # no-op when expectations_db is None (operator has not wired X-1
+        # yet) or the DB has no expectations rows for this week.
+        gap_rows: List[dict] = []
+        if expectations_db is not None:
+            from synthesis import gap_analysis
+
+            try:
+                gap_analysis.run(
+                    week_start,
+                    github_db=str(gh_path),
+                    expectations_db=str(expectations_db),
+                    config=config,
+                )
+                gap_rows = gap_analysis.load_gap_rows(
+                    str(expectations_db),
+                    week_start,
+                    min_severity=("major", "critical"),
+                )
+            except sqlite3.OperationalError as exc:
+                # Most likely: expectations.db not initialised yet (X-1
+                # hasn't been run). Log a warning and proceed without the
+                # gap section — degraded operation over a broken pipeline.
+                logger.warning(
+                    "Gap analysis skipped for week=%s: %s. Run "
+                    "'am-init-db' and 'am-extract-expectations' first.",
+                    week_start, exc,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Gap analysis failed for week=%s: %s. Retrospective "
+                    "will be written without the Expectation Gaps section.",
+                    week_start, exc,
+                )
+
         system_prompt, messages = _assemble_prompt(
-            units, unit_transcripts, unit_timelines, week_start, unit_attributions
+            units,
+            unit_transcripts,
+            unit_timelines,
+            week_start,
+            unit_attributions,
+            gap_rows=gap_rows,
         )
 
         # --- Issue #54 P-2: prompt-size guard -------------------------

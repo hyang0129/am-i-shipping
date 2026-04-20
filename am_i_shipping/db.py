@@ -274,6 +274,51 @@ CREATE TABLE IF NOT EXISTS expectations (
 );
 """
 
+# Epic #27 — X-2 (#73): expectation_gaps schema.
+#
+# Written by ``synthesis.gap_analysis.run`` during ``am-synthesize``.
+# Every row is joined to an ``expectations`` row by ``(week_start, unit_id)``.
+#
+# IRREVERSIBLE column names (per the epic ADR): ``commitment_point``,
+# ``scope_gap``, ``effort_gap``, ``outcome_gap``. X-4 user corrections and
+# X-5 calibration both key off these names; renaming after X-4 ships is
+# expensive. Locked here.
+#
+# * ``severity``            — one of {``none``, ``minor``, ``major``, ``critical``}.
+# * ``direction``           — one of {``under``, ``over``, ``match``, ``ambiguous``}.
+# * ``failure_precondition``— constrained enum drawn from ``idealized-workflow.md``
+#                             phase/step identifiers. NULL when ``severity='none'``;
+#                             non-NULL otherwise.
+# * ``auto_confirmed``      — introduced in X-2 for X-4's hook. 0 by default;
+#                             flipped to 1 by the auto-confirm sweep for rows
+#                             older than 14 days without a user correction.
+SYNTHESIS_EXPECTATION_GAPS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS expectation_gaps (
+    week_start           TEXT NOT NULL,
+    unit_id              TEXT NOT NULL,
+    commitment_point     TEXT,
+    scope_gap            TEXT,
+    effort_gap           TEXT,
+    outcome_gap          TEXT,
+    severity             TEXT,
+    direction            TEXT,
+    failure_precondition TEXT,
+    computed_at          TEXT DEFAULT (datetime('now')),
+    auto_confirmed       INTEGER DEFAULT 0,
+    PRIMARY KEY (week_start, unit_id)
+);
+"""
+
+# Columns added after the initial schema — migrated on init. Applied inside
+# ``init_expectations_db`` against an already-open connection so repeated runs
+# are a no-op.
+_EXPECTATIONS_MIGRATIONS = [
+    # X-2 added ``auto_confirmed`` to ``expectation_gaps``. The CREATE above
+    # already includes the column on fresh DBs; the migration handles DBs
+    # that shipped X-2 with an earlier column set.
+    "ALTER TABLE expectation_gaps ADD COLUMN auto_confirmed INTEGER DEFAULT 0",
+]
+
 EXPECTED_EXPECTATIONS_TABLES: dict[str, set[str]] = {
     "expectations": {
         "week_start",
@@ -287,6 +332,19 @@ EXPECTED_EXPECTATIONS_TABLES: dict[str, set[str]] = {
         "input_bytes",
         "extracted_at",
         "skip_reason",
+    },
+    "expectation_gaps": {
+        "week_start",
+        "unit_id",
+        "commitment_point",
+        "scope_gap",
+        "effort_gap",
+        "outcome_gap",
+        "severity",
+        "direction",
+        "failure_precondition",
+        "computed_at",
+        "auto_confirmed",
     },
 }
 
@@ -671,6 +729,13 @@ def init_expectations_db(db_path: Path) -> None:
     conn = sqlite3.connect(str(db_path))
     try:
         conn.execute(SYNTHESIS_EXPECTATIONS_SCHEMA)
+        # Epic #27 — X-2 (#73): expectation_gaps lives in the same DB.
+        conn.execute(SYNTHESIS_EXPECTATION_GAPS_SCHEMA)
+        for migration in _EXPECTATIONS_MIGRATIONS:
+            try:
+                conn.execute(migration)
+            except sqlite3.OperationalError:
+                pass  # column already exists
         conn.commit()
         # Assert on the same connection we just wrote to (for ':memory:'
         # databases; see init_sessions_db for the rationale).

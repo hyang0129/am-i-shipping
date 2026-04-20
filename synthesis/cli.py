@@ -92,6 +92,10 @@ def _run_weekly(args: argparse.Namespace) -> int:
     data_dir: Path = config.data_path
     github_db = data_dir / "github.db"
     sessions_db = data_dir / "sessions.db"
+    # Epic #27 — X-2 (#73): expectations.db hosts both X-1 expectation rows
+    # and the X-2 expectation_gaps table. Path only — existence is not
+    # required; ``run_synthesis`` handles the missing-DB case gracefully.
+    expectations_db = data_dir / "expectations.db"
 
     synthesis_cfg = config.synthesis
     output_dir = config.synthesis_output_path
@@ -104,6 +108,7 @@ def _run_weekly(args: argparse.Namespace) -> int:
             sessions_db,
             args.week,
             dry_run=args.dry_run,
+            expectations_db=expectations_db,
         )
     except Exception:  # noqa: BLE001 — CLI is the top of the stack
         logging.exception("Synthesis failed")
