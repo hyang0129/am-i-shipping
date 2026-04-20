@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from collector.session_parser import (
+    _discover_session_files,
     _strip_content_blocks,
     parse_session,
 )
@@ -60,12 +61,24 @@ _FILL_NONEMPTY = "nonempty"
 
 
 def _classify_fill(raw: Optional[str]) -> str:
-    """Map ``raw_content_json`` column value to a fill-state label."""
+    """Map ``raw_content_json`` column value to a fill-state label.
+
+    ``parse_session`` currently serializes an empty transcript as exactly
+    ``"[]"``; this function additionally accepts any serializer-variant that
+    parses to the empty JSON array (e.g. ``"[ ]"``, ``"[\\n]"``) so a future
+    switch to ``json.dumps(..., indent=2)`` or similar would not silently
+    reclassify empty rows as non-empty and defeat the diagnostic.
+    """
     if raw is None:
         return _FILL_NULL
-    # Preserve the exact literal check from the spec: "[]" is the empty-array
-    # JSON serialization written by parse_session when every turn was stripped.
-    if raw.strip() == "[]":
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        # Malformed JSON counts as nonempty — we still have *something* the
+        # operator needs to see, and misclassifying it as empty would hide it
+        # from the parser-bug diagnostic list.
+        return _FILL_NONEMPTY
+    if parsed == []:
         return _FILL_EMPTY
     return _FILL_NONEMPTY
 
@@ -222,15 +235,12 @@ class JsonlRecord:
 
 
 def _discover_jsonls(projects_path: Path) -> List[Path]:
-    """Replicates ``session_parser._discover_session_files`` (subagent skip)."""
-    if not projects_path.exists():
-        return []
-    out: List[Path] = []
-    for jsonl in projects_path.rglob("*.jsonl"):
-        if "subagents" in jsonl.parts:
-            continue
-        out.append(jsonl)
-    return sorted(out)
+    """Delegate to the canonical discovery helper in ``collector.session_parser``.
+
+    Kept as a thin wrapper so callers within this module don't need to know the
+    origin — and so that the subagent-skip rule has a single source of truth.
+    """
+    return _discover_session_files(projects_path)
 
 
 def _read_jsonl_header(jsonl: Path, projects_path: Path) -> JsonlRecord:
@@ -685,14 +695,6 @@ def run_coverage(
     stdout=None,
     stderr=None,
 ) -> int:
-    # Resolve stdout/stderr at call time so pytest's capsys (which re-binds
-    # sys.stdout per test) captures output correctly. Using defaults like
-    # ``stdout=sys.stdout`` in the signature would bind to the interpreter-
-    # startup stream and bypass the capture.
-    if stdout is None:
-        stdout = sys.stdout
-    if stderr is None:
-        stderr = sys.stderr
     """Dispatch the four coverage modes. Returns a shell-suitable exit code.
 
     Modes (mutually exclusive at the orchestration level, enforced by the CLI):
@@ -701,6 +703,14 @@ def run_coverage(
     * ``do_backfill=True,  full_rebuild=False`` → partial backfill + summary.
     * ``do_backfill=True,  full_rebuild=True``  → delete-rebuild + summary.
     """
+    # Resolve stdout/stderr at call time so pytest's capsys (which re-binds
+    # sys.stdout per test) captures output correctly. Using defaults like
+    # ``stdout=sys.stdout`` in the signature would bind to the interpreter-
+    # startup stream and bypass the capture.
+    if stdout is None:
+        stdout = sys.stdout
+    if stderr is None:
+        stderr = sys.stderr
     if full_rebuild and not do_backfill:
         print("--full requires --backfill", file=stderr)
         return 2

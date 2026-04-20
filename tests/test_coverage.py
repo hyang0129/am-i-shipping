@@ -126,8 +126,19 @@ class TestClassifyFill:
         assert _classify_fill("[]") == "empty"
         assert _classify_fill("  []  ") == "empty"
 
+    def test_empty_array_with_inner_whitespace(self):
+        # A future serializer (e.g. indent=2) could produce these — they must
+        # still classify as empty so the diagnostic isn't silently defeated.
+        assert _classify_fill("[ ]") == "empty"
+        assert _classify_fill("[\n]") == "empty"
+
     def test_nonempty(self):
         assert _classify_fill('[{"role":"user"}]') == "nonempty"
+
+    def test_malformed_json_is_nonempty(self):
+        # Misclassifying malformed JSON as empty would hide it from the
+        # parser-bug diagnostic list.
+        assert _classify_fill("not json") == "nonempty"
 
 
 class TestJsonlHasTextTurns:
@@ -481,3 +492,8 @@ class TestRunCoverageWrapper:
             full_rebuild=True,
         )
         assert rc == 2
+        captured = capsys.readouterr()
+        # Operators hitting this case must see the flag name in the guidance,
+        # not just an opaque exit code. Pin the text so a silent regression
+        # (e.g. dropping "--full") breaks this test instead of breaking users.
+        assert "--full requires --backfill" in captured.err
