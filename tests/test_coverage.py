@@ -342,7 +342,7 @@ class TestFullBackfill:
 
         # --full must repair.
         full = backfill_full(db, projects)
-        assert full.deleted_and_reingested == 1
+        assert full.reingested == 1
         assert full.orphans_preserved == 1
 
         conn = sqlite3.connect(str(db))
@@ -423,7 +423,7 @@ class TestFullBackfillParseFailurePreservesRow:
 
         summary = backfill_full(db, projects)
         assert summary.errored == 1
-        assert summary.deleted_and_reingested == 0
+        assert summary.reingested == 0
 
         # Critical invariant: the pre-existing row is still there, unchanged.
         conn = sqlite3.connect(str(db))

@@ -21,10 +21,13 @@ Two backfill modes repair the DB when the operator opts in:
     ``raw_content_json IS NULL`` whose JSONL is on disk. Rows with
     ``raw_content_json = "[]"`` or non-empty are NOT touched.
 
-``--backfill --full`` (delete-rebuild)
-    For every JSONL on disk, delete the corresponding DB row and re-ingest
-    from scratch via ``parse_session`` + ``upsert_session``. Orphan DB
-    rows (DB row, no JSONL) are surfaced in the summary and preserved.
+``--backfill --full`` (overwrite-in-place)
+    For every JSONL on disk, re-parse via ``parse_session`` and overwrite
+    every column of the matching DB row via ``upsert_session``'s
+    ``INSERT ... ON CONFLICT(session_uuid) DO UPDATE SET ...`` clause.
+    Atomic per session: a ``parse_session`` failure leaves the previous
+    DB row intact. Orphan DB rows (DB row, no JSONL) are surfaced in the
+    summary and preserved.
 
 ``"[]"`` is never a normal state — it is either a parser bug (JSONL has
 text turns but parse produced empty) or a degenerate case (JSONL truly
@@ -551,7 +554,7 @@ class BackfillSummary:
     skipped_missing_jsonl: int = 0
     errored: int = 0
     # --full only
-    deleted_and_reingested: int = 0
+    reingested: int = 0
     orphans_preserved: int = 0
 
 
@@ -682,7 +685,7 @@ def backfill_full(
                 skip_init=True,
                 skip_health=True,
             )
-            summary.deleted_and_reingested += 1
+            summary.reingested += 1
         except Exception as exc:  # noqa: BLE001
             _logger.warning(
                 "backfill_full: parse/upsert failed for session_uuid=%s jsonl=%s: %s",
@@ -734,7 +737,7 @@ def run_coverage(
         summary = backfill_full(sessions_db, projects_path, data_dir=data_dir)
         print(
             f"Backfill (--full) complete: "
-            f"deleted+reingested={summary.deleted_and_reingested}, "
+            f"reingested={summary.reingested}, "
             f"orphans_preserved={summary.orphans_preserved}, "
             f"errored={summary.errored}",
             file=stderr,
@@ -786,8 +789,9 @@ def add_coverage_subparser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--full", action="store_true",
         help=(
-            "With --backfill: delete every session row whose JSONL is on "
-            "disk and re-ingest from scratch. Orphan rows are preserved."
+            "With --backfill: re-parse every JSONL on disk and overwrite "
+            "the matching DB row's columns in place (atomic per session, "
+            "via ON CONFLICT DO UPDATE). Orphan rows are preserved."
         ),
     )
     p.add_argument(
