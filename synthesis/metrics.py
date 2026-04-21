@@ -15,9 +15,12 @@ Metric semantics follow the epic ADR:
 * ``total_reprompts``  — sum of ``sessions.reprompt_count`` across the
   unit's sessions. Missing / NULL values count as ``0``.
 * ``review_cycles``    — per-PR review activity across the unit. Uses
-  ``len(review_comments_json)`` when present, falling back to
-  ``push_count`` when the review comments payload is empty. Missing PR
-  rows count as 0.
+  ``len(review_comments_json)`` when inline review comments are present.
+  When the review comments payload is empty, looks up ``pr_review_fix_events``
+  (Issue #86): a ``/review-fix`` cycle counts as ``1`` regardless of how
+  many fix commits landed. Missing PR rows contribute ``0`` — there is no
+  ``push_count`` fallback (Issue #86 dropped it as rework signal because it
+  conflates author iteration with review cycles).
 
 Design
 ------
@@ -201,23 +204,47 @@ def _count_review_comments(payload: Optional[str]) -> int:
     return 0
 
 
+def _has_review_fix_event(
+    github_conn: sqlite3.Connection, repo: str, pr_number: int
+) -> bool:
+    """Return True when a ``pr_review_fix_events`` row exists for this PR.
+
+    The table may be absent on legacy ``github.db`` files that were
+    initialised before Issue #86 shipped — we catch ``OperationalError``
+    and treat "no table" as "no event", which preserves the pre-#86
+    behaviour for callers who have not yet re-run ``init_github_db``.
+    """
+    try:
+        row = github_conn.execute(
+            "SELECT 1 FROM pr_review_fix_events "
+            "WHERE repo = ? AND pr_number = ? LIMIT 1",
+            (repo, pr_number),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    return row is not None
+
+
 def review_cycles(
     pr_refs: Iterable[tuple[str, int]],
     github_conn: sqlite3.Connection,
 ) -> int:
     """Return total review activity across the unit's PRs.
 
-    *pr_refs* is an iterable of ``(repo, pr_number)`` tuples. For each
-    PR, we prefer the length of ``review_comments_json`` (the raw
-    payload count); if that's empty we fall back to ``push_count`` as a
-    coarse proxy for "how many times the author iterated". Missing rows
-    contribute ``0``.
+    *pr_refs* is an iterable of ``(repo, pr_number)`` tuples. For each PR:
 
-    The two signals are additive within a PR's row but mutually
-    exclusive in practice — ``review_comments_json`` is populated only
-    for PRs with review activity, and ``push_count`` captures the
-    "author-iteration-without-review" case. The fallback avoids double-
-    counting when reviews happened (the richer signal wins).
+    * If the ``review_comments_json`` payload is non-empty, the count is
+      ``len(review_comments_json)`` (one cycle per inline review comment
+      thread — the richest signal wins).
+    * Else if a ``pr_review_fix_events`` row exists, the count is ``1``
+      (Issue #86: one ``/review-fix`` invocation = one review-fix cycle,
+      regardless of how many fix commits were pushed).
+    * Else the contribution is ``0``.
+
+    ``push_count`` is deliberately NOT consulted (Issue #86): treating
+    push-after-first-push as "rework" conflated the ``/review-fix`` workflow
+    (which pushes N fix commits in one cycle) with genuine review-driven
+    iteration. Missing PR rows contribute ``0``.
     """
     pairs = list(pr_refs)
     if not pairs:
@@ -225,16 +252,16 @@ def review_cycles(
     total = 0
     for repo, pr_number in pairs:
         cur = github_conn.execute(
-            "SELECT review_comments_json, push_count FROM pull_requests "
+            "SELECT review_comments_json FROM pull_requests "
             "WHERE repo = ? AND pr_number = ?",
             (repo, pr_number),
         )
         row = cur.fetchone()
         if row is None:
             continue
-        review_comments_json, push_count = row
+        review_comments_json = row[0]
         n = _count_review_comments(review_comments_json)
-        if n == 0:
-            n = int(push_count or 0)
+        if n == 0 and _has_review_fix_event(github_conn, repo, pr_number):
+            n = 1
         total += n
     return total

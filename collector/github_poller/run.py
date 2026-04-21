@@ -55,6 +55,7 @@ from .fetch_timeline import fetch_and_store_issue_timelines
 from .gh_client import BudgetExhausted, GhCliError, calls_made, configure_limiter, graphql_points_used
 from .link_resolver import resolve_link
 from .push_counter import count_pushes_after_review
+from .review_fix_detector import process_pr as process_review_fix_pr
 from .issue_linker import link_issues
 from .session_linker import link_sessions
 from .store import (
@@ -477,6 +478,20 @@ def _process_prs(
         # Insert PR→issue link if resolved
         if linked_issue is not None:
             upsert_pr_issue_link(repo, pr["number"], linked_issue, github_db, conn=conn)
+
+        # Issue #86: detect /review-fix cycle from comments + pre-fetched
+        # commits. Emits one pr_review_fix_events row when the marker is
+        # present; no-op otherwise. Errors are logged inside process_pr
+        # and never abort the poll cycle.
+        try:
+            process_review_fix_pr(
+                repo, pr, pre_fetched_commits, github_db, conn=conn,
+            )
+        except Exception as exc:  # noqa: BLE001 — belt + braces
+            logger.warning(
+                "{}  review-fix detector error (PR #{}): {}",
+                repo, pr["number"], exc,
+            )
 
     # Backfill: fetch PR edit history in bulk after all upserts
     if is_backfill and prs:

@@ -42,6 +42,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from am_i_shipping.config_loader import SynthesisConfig
 from synthesis.llm_adapter import _get_adapter
+from synthesis.weekly import _resolve_unit_sessions
 
 
 logger = logging.getLogger(__name__)
@@ -607,6 +608,23 @@ def run(
                         else None
                     )
 
+            # Issue #86: when the unit ran the full idealized skill sequence
+            # (/refine-issue → /resolve-issue → /review-fix) and metrics are
+            # within tolerance, override severity to 'none' so gap_analysis
+            # does not mis-attribute a clean run to step_4_plan / step_5_plan_confirmed.
+            # Runs BEFORE failure_precondition derivation so an overridden
+            # unit correctly lands with precondition=NULL.
+            severity, direction, ideal_override = _apply_ideal_workflow_override(
+                gh_conn, week_start, unit_id, severity, direction, unit,
+            )
+            if ideal_override:
+                # Drop any LLM-attributed failure_precondition — override
+                # means there is no gap, so the attribution must be NULL.
+                failure_precondition = None
+                scope_gap_text = None
+                effort_gap_text = None
+                outcome_gap_text = None
+
             # Offline / no-adapter / LLM-declined path: derive
             # failure_precondition from heuristic.
             if failure_precondition is None and severity != "none":
@@ -701,6 +719,87 @@ def _compute_effort_gap_ratio(
     if expected_sessions <= 0:
         return None
     return round(actual_sessions / expected_sessions, 4)
+
+
+# Issue #86: the idealized-workflow skill set. When all three have been
+# invoked for a unit's sessions and metrics are within tolerance, the unit
+# executed the design phase as intended and should NOT be flagged as a
+# step_4_plan / step_5_plan_confirmed fault.
+_IDEAL_WORKFLOW_SKILLS: frozenset = frozenset(
+    {"refine-issue", "resolve-issue", "review-fix"}
+)
+
+
+def _unit_has_ideal_skill_sequence(
+    gh_conn: sqlite3.Connection,
+    week_start: str,
+    unit_id: str,
+) -> bool:
+    """Return True when the unit's sessions cover the full idealized skill set.
+
+    Walks the unit's sessions via the same helper ``expectations`` uses
+    (``_resolve_unit_sessions``) and checks ``skill_invocations`` for
+    ``refine-issue``, ``resolve-issue``, and ``review-fix`` presence.
+    Returns ``False`` when ``skill_invocations`` is missing (legacy DB) or
+    the unit has no resolvable sessions — treating "unknown" as "not clean"
+    so this signal can only remove a gap, never introduce one.
+    """
+    unit_row = gh_conn.execute(
+        "SELECT root_node_id, root_node_type FROM units "
+        "WHERE week_start = ? AND unit_id = ?",
+        (week_start, unit_id),
+    ).fetchone()
+    if unit_row is None:
+        return False
+    root_node_id = unit_row[0] or ""
+    root_node_type = unit_row[1] or ""
+    session_uuids = _resolve_unit_sessions(
+        gh_conn, week_start, root_node_id, root_node_type
+    )
+    if not session_uuids:
+        return False
+    try:
+        placeholders = ",".join("?" * len(session_uuids))
+        rows = gh_conn.execute(
+            f"SELECT DISTINCT skill_name FROM skill_invocations "
+            f"WHERE session_uuid IN ({placeholders})",
+            session_uuids,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return False
+    observed = {r[0] for r in rows if r and r[0]}
+    return _IDEAL_WORKFLOW_SKILLS.issubset(observed)
+
+
+def _apply_ideal_workflow_override(
+    gh_conn: sqlite3.Connection,
+    week_start: str,
+    unit_id: str,
+    severity: str,
+    direction: str,
+    unit: Dict[str, Any],
+) -> Tuple[str, str, bool]:
+    """Return ``(severity, direction, overridden)``.
+
+    When the unit ran the full idealized skill sequence AND the heuristic
+    severity is within tolerance (``none`` or ``minor``) AND the unit did not
+    abandon (``status`` not in the abandoned set AND the unit row exists with
+    a known status), override the severity to ``none`` and direction to
+    ``match``. ``overridden=True`` is returned so the caller can set
+    ``failure_precondition`` to ``NULL``.
+
+    The override only fires when the metrics are already close to clean —
+    a critical/major unit with all three skills invoked is still a real gap
+    (the skills ran but the outcome diverged), so we do not paper over it.
+    """
+    if severity not in {"none", "minor"}:
+        return severity, direction, False
+    status = (unit.get("status") or "").strip().lower()
+    if status in {"abandoned", "stale", "stalled", "open"}:
+        return severity, direction, False
+    if not _unit_has_ideal_skill_sequence(gh_conn, week_start, unit_id):
+        return severity, direction, False
+    return "none", "match", True
 
 
 def _heuristic_failure_precondition(

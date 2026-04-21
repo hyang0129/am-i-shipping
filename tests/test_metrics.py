@@ -143,6 +143,9 @@ class TestTotalReprompts:
 
 
 class TestReviewCycles:
+    """Issue #86 semantics: inline review comments win, then
+    pr_review_fix_events flag (=1), no push_count fallback."""
+
     @pytest.fixture
     def github_conn(self):
         conn = sqlite3.connect(":memory:")
@@ -152,14 +155,30 @@ class TestReviewCycles:
             "review_comments_json TEXT, push_count INTEGER, "
             "PRIMARY KEY (repo, pr_number))"
         )
+        conn.execute(
+            "CREATE TABLE pr_review_fix_events ("
+            "repo TEXT, pr_number INTEGER, "
+            "summary_comment_id INTEGER, posted_at TEXT, "
+            "fix_commit_count INTEGER DEFAULT 0, "
+            "PRIMARY KEY (repo, pr_number))"
+        )
         conn.executemany(
             "INSERT INTO pull_requests VALUES (?, ?, ?, ?)",
             [
                 ("r", 1, '[{"id": 1}, {"id": 2}, {"id": 3}]', 0),
-                ("r", 2, "[]", 4),
-                ("r", 3, None, 2),
-                ("r", 4, "malformed[", 1),
+                ("r", 2, "[]", 4),       # no review-fix → 0 (push_count dropped)
+                ("r", 3, None, 2),       # no review-fix → 0
+                ("r", 4, "malformed[", 1),  # no review-fix → 0
                 ("r", 5, "[]", 0),
+                ("r", 6, "[]", 13),      # has review-fix event → 1 (the #189 case)
+                ("r", 7, '[{"id": 1}, {"id": 2}]', 5),  # review-fix + inline → inline wins
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO pr_review_fix_events VALUES (?, ?, ?, ?, ?)",
+            [
+                ("r", 6, None, "2026-04-18T19:38:31Z", 2),
+                ("r", 7, None, "2026-04-18T19:38:31Z", 1),
             ],
         )
         conn.commit()
@@ -169,23 +188,37 @@ class TestReviewCycles:
     def test_review_comments_preferred(self, github_conn):
         assert metrics.review_cycles([("r", 1)], github_conn) == 3
 
-    def test_fallback_to_push_count(self, github_conn):
-        # empty array → fall back to push_count=4
-        assert metrics.review_cycles([("r", 2)], github_conn) == 4
+    def test_no_push_count_fallback(self, github_conn):
+        # Issue #86: push_count is no longer a fallback. PR has push_count=4
+        # but no review-fix event and no inline comments → 0.
+        assert metrics.review_cycles([("r", 2)], github_conn) == 0
 
-    def test_null_review_comments_falls_back(self, github_conn):
-        assert metrics.review_cycles([("r", 3)], github_conn) == 2
+    def test_null_review_comments_returns_zero(self, github_conn):
+        # Was previously 2 via push_count fallback; now 0 (no review-fix event).
+        assert metrics.review_cycles([("r", 3)], github_conn) == 0
 
-    def test_malformed_json_falls_back(self, github_conn):
-        assert metrics.review_cycles([("r", 4)], github_conn) == 1
+    def test_malformed_json_returns_zero(self, github_conn):
+        # Was previously 1 via push_count fallback; now 0.
+        assert metrics.review_cycles([("r", 4)], github_conn) == 0
 
     def test_both_empty_returns_zero(self, github_conn):
         assert metrics.review_cycles([("r", 5)], github_conn) == 0
 
+    def test_review_fix_event_counts_as_one(self, github_conn):
+        # The PR-#189 case: empty inline review comments, push_count=13,
+        # one review-fix event → review_cycles = 1, NOT 13.
+        assert metrics.review_cycles([("r", 6)], github_conn) == 1
+
+    def test_inline_comments_beat_review_fix_event(self, github_conn):
+        # Inline review comments are the richer signal; when both are
+        # present, the inline count wins.
+        assert metrics.review_cycles([("r", 7)], github_conn) == 2
+
     def test_multiple_prs_sum(self, github_conn):
+        # PR1=3 (inline), PR6=1 (review-fix) → 4 total.
         assert metrics.review_cycles(
-            [("r", 1), ("r", 2)], github_conn
-        ) == 3 + 4
+            [("r", 1), ("r", 6)], github_conn
+        ) == 4
 
     def test_missing_pr_ignored(self, github_conn):
         assert metrics.review_cycles(
@@ -194,3 +227,24 @@ class TestReviewCycles:
 
     def test_empty_returns_zero(self, github_conn):
         assert metrics.review_cycles([], github_conn) == 0
+
+    def test_legacy_db_without_review_fix_table(self):
+        """A github.db that pre-dates Issue #86 has no pr_review_fix_events
+        table. review_cycles must not raise; it should silently return 0
+        for the no-fallback path."""
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE pull_requests ("
+            "repo TEXT, pr_number INTEGER, "
+            "review_comments_json TEXT, push_count INTEGER, "
+            "PRIMARY KEY (repo, pr_number))"
+        )
+        conn.execute(
+            "INSERT INTO pull_requests VALUES (?, ?, ?, ?)",
+            ("r", 1, "[]", 5),
+        )
+        conn.commit()
+        try:
+            assert metrics.review_cycles([("r", 1)], conn) == 0
+        finally:
+            conn.close()

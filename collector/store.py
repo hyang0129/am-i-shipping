@@ -117,9 +117,13 @@ def upsert_session(
     finally:
         conn.close()
 
+    # Issue #86: persist skill_invocations to github.db alongside session_gh_events.
+    # Both tables share github.db so a single init + single connection is sufficient.
+    skill_invocations = getattr(record, "skill_invocations", None) or []
+
     # Persist gh_events to github.db if present
     gh_events = getattr(record, "gh_events", None) or []
-    if gh_events:
+    if gh_events or skill_invocations:
         github_db_path = db_path.parent / "github.db"
         if not skip_init:
             from am_i_shipping.db import init_github_db
@@ -143,6 +147,23 @@ def upsert_session(
                         ev.get("url"),
                         ev.get("confidence"),
                         ev.get("created_at"),
+                    ),
+                )
+            # Issue #86: skill invocations. Use INSERT OR REPLACE so re-parsing
+            # an already-ingested session overwrites rather than leaves stale
+            # target_repo/target_ref in place.
+            for inv in skill_invocations:
+                gh_conn.execute(
+                    "INSERT OR REPLACE INTO skill_invocations "
+                    "(session_uuid, skill_name, invoked_at, target_repo, target_ref, invocation_index) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        record.session_uuid,
+                        inv["skill_name"],
+                        inv.get("invoked_at"),
+                        inv.get("target_repo"),
+                        inv.get("target_ref"),
+                        inv.get("invocation_index", 0),
                     ),
                 )
             gh_conn.commit()

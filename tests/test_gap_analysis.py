@@ -128,6 +128,47 @@ def _all_gap_rows(exp_db: Path, week_start: str = WEEK_START) -> list[dict]:
     return load_gap_rows(str(exp_db), week_start)
 
 
+def _seed_ideal_skill_workflow(
+    gh_db: Path,
+    *,
+    unit_id: str,
+    session_uuid: str,
+    week_start: str = WEEK_START,
+    skills: tuple = ("refine-issue", "resolve-issue", "review-fix"),
+) -> None:
+    """Issue #86 test helper: seed a session + graph node for the unit + a full
+    set of skill_invocations so _unit_has_ideal_skill_sequence returns True.
+
+    The unit must already exist (seed via _seed_unit first). This overrides
+    the unit's root_node_id to match the session node so the graph walk
+    finds the session.
+    """
+    conn = sqlite3.connect(str(gh_db))
+    try:
+        root_id = f"n-{unit_id}"
+        # Re-link unit to point at a session graph node.
+        conn.execute(
+            "UPDATE units SET root_node_id = ? WHERE week_start = ? AND unit_id = ?",
+            (root_id, week_start, unit_id),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO graph_nodes "
+            "(week_start, node_id, node_type, node_ref, created_at) "
+            "VALUES (?, ?, 'session', ?, ?)",
+            (week_start, root_id, session_uuid, "2026-04-14T10:00:00Z"),
+        )
+        for idx, skill in enumerate(skills):
+            conn.execute(
+                "INSERT OR REPLACE INTO skill_invocations "
+                "(session_uuid, skill_name, invoked_at, target_repo, target_ref, invocation_index) "
+                "VALUES (?, ?, ?, NULL, NULL, ?)",
+                (session_uuid, skill, f"2026-04-14T10:0{idx}:00Z", idx),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @pytest.fixture(autouse=True)
 def _scrub_live_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("AMIS_SYNTHESIS_LIVE", raising=False)
@@ -660,3 +701,109 @@ class TestWeeklyIntegration:
             cfg, gh_db, sess_db, WEEK_START, dry_run=False,
         )
         assert result is not None
+
+
+class TestIdealWorkflowOverride:
+    """Issue #86: when a unit ran /refine-issue → /resolve-issue → /review-fix
+    and metrics are within tolerance, gap_analysis emits severity=none,
+    failure_precondition=NULL — the clean-workflow run should not be blamed
+    on step_4_plan / step_5_plan_confirmed."""
+
+    def test_clean_workflow_overrides_to_none(self, tmp_path: Path):
+        """The issue-#86 canonical case: PR-#189-shaped unit with all three
+        skills invoked and clean metrics → severity=none."""
+        gh, exp = _init_dbs(tmp_path)
+        # Simulate the pre-override state: heuristic would have reported
+        # 'minor' for review_cycles=2 or similar. Seed low metrics instead
+        # so the baseline severity is 'none' or 'minor'; the test asserts
+        # the override lands on 'none' with failure_precondition NULL.
+        _seed_unit(
+            gh, unit_id="u_clean_workflow", total_reprompts=0,
+            review_cycles=1, status="closed",
+        )
+        _seed_expectation(exp, unit_id="u_clean_workflow")
+        _seed_ideal_skill_workflow(
+            gh, unit_id="u_clean_workflow",
+            session_uuid="00000000-0000-0000-0000-000000000189",
+        )
+
+        written = gap_analysis.run(
+            WEEK_START, github_db=str(gh), expectations_db=str(exp),
+            config=_make_config(),
+        )
+        assert written == 1
+        rows = _all_gap_rows(exp)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["severity"] == "none"
+        assert row["failure_precondition"] is None
+
+    def test_missing_one_skill_no_override(self, tmp_path: Path):
+        """When only two of the three skills are present, the override does
+        NOT fire — the unit did not run the full idealized workflow."""
+        gh, exp = _init_dbs(tmp_path)
+        _seed_unit(
+            gh, unit_id="u_partial", total_reprompts=5,
+            review_cycles=2, status="closed",
+        )
+        _seed_expectation(exp, unit_id="u_partial")
+        _seed_ideal_skill_workflow(
+            gh, unit_id="u_partial",
+            session_uuid="00000000-0000-0000-0000-000000000042",
+            skills=("refine-issue", "resolve-issue"),  # missing review-fix
+        )
+        gap_analysis.run(
+            WEEK_START, github_db=str(gh), expectations_db=str(exp),
+            config=_make_config(),
+        )
+        rows = _all_gap_rows(exp)
+        # Heuristic: total_reprompts=5 → significant via reprompt proxy OR
+        # significant via effort_gap_ratio = 6. Override does not fire
+        # because only 2 of 3 skills were invoked.
+        assert rows[0]["severity"] != "none"
+        assert rows[0]["failure_precondition"] is not None
+
+    def test_clean_workflow_does_not_override_abandoned(self, tmp_path: Path):
+        """A unit that ran the full workflow but abandoned anyway is still a
+        critical gap — the override only fires on already-close-to-clean runs."""
+        gh, exp = _init_dbs(tmp_path)
+        _seed_unit(
+            gh, unit_id="u_abandoned_workflow", status="abandoned",
+            total_reprompts=0,
+        )
+        _seed_expectation(exp, unit_id="u_abandoned_workflow")
+        _seed_ideal_skill_workflow(
+            gh, unit_id="u_abandoned_workflow",
+            session_uuid="00000000-0000-0000-0000-000000000099",
+        )
+        gap_analysis.run(
+            WEEK_START, github_db=str(gh), expectations_db=str(exp),
+            config=_make_config(),
+        )
+        rows = _all_gap_rows(exp)
+        assert rows[0]["severity"] == "critical"
+        assert rows[0]["failure_precondition"] is not None
+
+    def test_legacy_db_without_skill_invocations_is_safe(self, tmp_path: Path):
+        """When the skill_invocations table does not exist (legacy DB), the
+        override silently does not fire — pre-#86 behavior preserved."""
+        from am_i_shipping.db import init_expectations_db, init_github_db
+        gh = tmp_path / "github.db"
+        exp = tmp_path / "exp.db"
+        init_github_db(gh)
+        init_expectations_db(exp)
+        # Drop skill_invocations to simulate a legacy DB.
+        conn = sqlite3.connect(str(gh))
+        try:
+            conn.execute("DROP TABLE skill_invocations")
+            conn.commit()
+        finally:
+            conn.close()
+        _seed_unit(gh, unit_id="u_legacy", total_reprompts=0)
+        _seed_expectation(exp, unit_id="u_legacy")
+
+        # Must not raise.
+        gap_analysis.run(
+            WEEK_START, github_db=str(gh), expectations_db=str(exp),
+            config=_make_config(),
+        )
