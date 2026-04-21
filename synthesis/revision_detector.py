@@ -679,7 +679,7 @@ def run(
         if config is None:
             config = SynthesisConfig(
                 anthropic_api_key_env="ANTHROPIC_API_KEY",
-                model="claude-sonnet-4-5",
+                model="claude-sonnet-4-6",
                 output_dir="retrospectives",
                 week_start="monday",
                 abandonment_days=14,

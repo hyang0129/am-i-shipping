@@ -35,7 +35,7 @@ WEEK_START = "2026-04-14"
 def _make_config(**overrides) -> SynthesisConfig:
     base = SynthesisConfig(
         anthropic_api_key_env="ANTHROPIC_API_KEY",
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-4-6",
         output_dir="retrospectives",
         week_start="monday",
         abandonment_days=14,
@@ -233,7 +233,7 @@ class TestClassifyRevision:
             "text": "actually, also do Y",
             "context": "turn 5 [ANCHOR]: actually, also do Y",
         }
-        result = classify_revision(record, adapter=adapter, model="claude-sonnet-4-5")
+        result = classify_revision(record, adapter=adapter, model="claude-sonnet-4-6")
         assert result["facet"] in FACET_ENUM
         assert isinstance(result["before_text"], str)
         assert isinstance(result["after_text"], str)
@@ -348,7 +348,7 @@ def _seed_expectation(
                 "one session",
                 "tests pass",
                 0.8 if skip_reason is None else None,
-                "claude-sonnet-4-5",
+                "claude-sonnet-4-6",
                 100,
                 skip_reason,
             ),

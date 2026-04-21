@@ -33,7 +33,7 @@ WEEK_START = "2026-04-14"
 def _make_config(**overrides) -> SynthesisConfig:
     base = SynthesisConfig(
         anthropic_api_key_env="ANTHROPIC_API_KEY",
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-4-6",
         output_dir="retrospectives",
         week_start="monday",
         abandonment_days=14,
@@ -78,7 +78,7 @@ def _seed_expectation(
                 expected_effort,
                 expected_outcome,
                 0.8,
-                "claude-sonnet-4-5",
+                "claude-sonnet-4-6",
                 100,
                 None,
             ),

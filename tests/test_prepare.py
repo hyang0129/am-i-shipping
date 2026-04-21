@@ -72,7 +72,7 @@ def _write_config(tmp_path: Path, data_dir: Path) -> Path:
               data_dir: "{data_dir}"
             synthesis:
               anthropic_api_key_env: "ANTHROPIC_API_KEY"
-              model: "claude-sonnet-4-5"
+              model: "claude-sonnet-4-6"
               output_dir: "{tmp_path}/retrospectives"
               week_start: "monday"
               abandonment_days: 14
