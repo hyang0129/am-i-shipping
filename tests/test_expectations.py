@@ -883,3 +883,89 @@ def test_issue_139_session_attribution_fallback(
     # The session is short (7 messages) but must be found via attribution fallback.
     assert skip_reason == "", f"unexpected skip: {skip_reason}"
     assert input_bytes > 0
+
+
+def test_refined_issue_body_prepended_when_refine_skill_invoked(tmp_path: Path):
+    """Issue #86: when a unit's session invoked /refine-issue with a resolved
+    target issue, _build_unit_input prepends the current issues.body (the
+    refined spec) to the classifier input so expected_scope is grounded in
+    the refined intent rather than the raw prompt prose."""
+    gh, sess, exp = _init_dbs(tmp_path)
+    _seed_unit(gh, unit_id="u_refined", root_node_id="n-u_refined")
+    session_uuid = "00000000-0000-0000-0000-0000000000aa"
+    _seed_session_and_node(
+        gh, sess,
+        unit_root_id="n-u_refined",
+        session_uuid=session_uuid,
+        raw_content_json=[
+            {"role": "user", "content": "fix the thing"},
+            {"role": "assistant", "content": [{"type": "tool_use", "name": "Edit"}]},
+        ],
+    )
+    # Seed a refined issue body and a /refine-issue skill invocation
+    # targeting that issue.
+    conn = sqlite3.connect(str(gh))
+    try:
+        conn.execute(
+            "INSERT INTO issues "
+            "(repo, issue_number, title, type_label, state, body, comments_json, created_at, closed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "org/repo", 86, "issue title", "bug", "open",
+                "## Refined Spec\n\nThe refined expected_scope is very specific: metrics.py review_cycles.",
+                "[]", "2026-04-20T10:00:00Z", None,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO skill_invocations "
+            "(session_uuid, skill_name, invoked_at, target_repo, target_ref, invocation_index) "
+            "VALUES (?, 'refine-issue', '2026-04-20T10:00:00Z', 'org/repo', '86', 0)",
+            (session_uuid,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    gh_conn = sqlite3.connect(str(gh))
+    sess_conn = sqlite3.connect(str(sess))
+    try:
+        unit_input, input_bytes, _, skip_reason = _build_unit_input(
+            gh_conn, sess_conn, "u_refined", WEEK_START,
+        )
+    finally:
+        gh_conn.close()
+        sess_conn.close()
+
+    assert skip_reason == ""
+    assert "Refined issue body" in unit_input
+    assert "metrics.py review_cycles" in unit_input
+    assert "org/repo#86" in unit_input
+
+
+def test_no_refine_skill_produces_unchanged_input(tmp_path: Path):
+    """Without a /refine-issue invocation, the input does not include a
+    'Refined issue body' section — existing behavior preserved."""
+    gh, sess, exp = _init_dbs(tmp_path)
+    _seed_unit(gh, unit_id="u_no_refine", root_node_id="n-u_no_refine")
+    _seed_session_and_node(
+        gh, sess,
+        unit_root_id="n-u_no_refine",
+        session_uuid="00000000-0000-0000-0000-0000000000bb",
+        raw_content_json=[
+            {"role": "user", "content": "quick tweak"},
+            {"role": "assistant", "content": [{"type": "tool_use", "name": "Edit"}]},
+        ],
+    )
+
+    gh_conn = sqlite3.connect(str(gh))
+    sess_conn = sqlite3.connect(str(sess))
+    try:
+        unit_input, _, _, skip_reason = _build_unit_input(
+            gh_conn, sess_conn, "u_no_refine", WEEK_START,
+        )
+    finally:
+        gh_conn.close()
+        sess_conn.close()
+
+    assert skip_reason == ""
+    assert "Refined issue body" not in unit_input

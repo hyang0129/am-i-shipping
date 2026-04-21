@@ -22,7 +22,7 @@
       "elapsed_days": 2.2534722222222223,
       "dark_time_pct": 0.9532710280373832,
       "total_reprompts": 1,
-      "review_cycles": 2,
+      "review_cycles": 0,
       "status": "closed"
     }
   ]
