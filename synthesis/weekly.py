@@ -299,6 +299,66 @@ def _unit_nodes(
     )
 
 
+def _resolve_unit_sessions(
+    gh_conn: sqlite3.Connection,
+    week_start: str,
+    root_node_id: str,
+    root_node_type: str,
+) -> List[str]:
+    """Return session UUIDs for a unit, handling both graph-edge and issue-attribution linkage.
+
+    For PR-rooted and session-rooted units, session nodes appear as ``node_type='session'``
+    members of the graph component reachable via ``graph_edges``. For issue-rooted units,
+    session linkage lives instead in ``session_issue_attribution`` (session nodes are never
+    added to ``graph_edges`` for those units), so graph traversal yields zero sessions.
+
+    This helper replicates the fallback used by :func:`synthesis.expectations._build_unit_input`
+    so that both X-1 (expectations) and X-3 (revision_detector) resolve sessions identically.
+
+    Parameters
+    ----------
+    gh_conn:
+        Open connection to the collector DB (github.db). Must be readable.
+    week_start:
+        ``YYYY-MM-DD`` anchor matching the unit row.
+    root_node_id:
+        ``root_node_id`` from the ``units`` table (e.g. ``"issue:repo#42"``).
+    root_node_type:
+        ``root_node_type`` from the ``units`` table (e.g. ``"issue"``, ``"pr"``,
+        ``"session"``).
+
+    Returns
+    -------
+    List of session UUIDs (strings), possibly empty if no sessions are found.
+    """
+    component = _unit_nodes(gh_conn, week_start, root_node_id or "")
+    session_uuids: List[str] = [
+        node_ref
+        for _nid, node_type, node_ref in component
+        if node_type == "session" and node_ref
+    ]
+
+    # Issue-rooted units: session nodes are not in graph_edges; fall back to
+    # session_issue_attribution. Mirrors the same logic in
+    # synthesis.expectations._build_unit_input.
+    if not session_uuids and root_node_type == "issue" and root_node_id:
+        ref = root_node_id.removeprefix("issue:")
+        if "#" in ref:
+            _repo, _, _num = ref.rpartition("#")
+            try:
+                _issue_number = int(_num)
+                rows = gh_conn.execute(
+                    "SELECT session_uuid FROM session_issue_attribution "
+                    "WHERE week_start = ? AND repo = ? AND issue_number = ?",
+                    (week_start, _repo, _issue_number),
+                ).fetchall()
+                session_uuids = [r[0] for r in rows]
+            except (ValueError, sqlite3.OperationalError):
+                pass
+
+    return session_uuids
+
+
 def _load_session_transcripts(
     sessions_conn: sqlite3.Connection,
     session_uuids: List[str],
@@ -403,7 +463,28 @@ Required Markdown sections (exact headings, in order)
    Do not prescribe follow-up; surface the signal.
 5. `## Dark Time`                 — fraction of each unit's wall-clock
    span during which no session was active. Highlight the top-2.
-6. `## Clarifying Questions`      — at most TWO total, numbered `1.`
+6. `## Expectation Gaps`          — units whose expected vs. actual gap
+   was `major` or `critical`. Each item names the unit, the direction
+   of the gap (`under`/`over`/`match`/`ambiguous`), and the idealized-
+   workflow step (`phase_0_setup` / `step_1_intent` / ...) that was the
+   root-cause precondition. Omit the section body when no major or
+   critical gaps exist; keep the heading.
+7. `## Expectation Revisions`     — units with mid-stream expectation
+   shifts (reprompts, scope-change turns, or session breaks > 24 h
+   anchored after the commitment point). Each item names the unit, the
+   trigger type, the facet that shifted (`scope`/`effort`/`outcome`),
+   and the before/after summary. Low-confidence revisions (< 0.5) are
+   annotated as such, not omitted. Omit the section body when no
+   revisions exist; keep the heading.
+8. `## Calibration Trends`        — *conditional; present only when
+   ≥20 user corrections have accumulated in `expectation_corrections`
+   (Epic #27 X-5).* Per-work-type calibration deltas grouped by
+   `type_label`. Each bullet names the work type, the correction rate
+   per facet (`scope`/`effort`/`outcome`), and the sample count.
+   The LLM must preserve the supplied bullets verbatim — do not invent
+   new work types or rephrase the numeric deltas. Omit the section
+   entirely when the calibration pass produced no rows.
+9. `## Clarifying Questions`      — at most TWO total, numbered `1.`
    and `2.`. Each question should be answerable from the user's memory
    of the week — no research required.
 
@@ -492,12 +573,84 @@ def _format_unit_block(
     return "\n".join(lines)
 
 
+def _render_gap_block(gap_rows: List[dict]) -> List[str]:
+    """Render the ``## Expectation Gaps`` Markdown block for the prompt.
+
+    Only major and critical rows are included — minor and none rows live
+    in ``expectation_gaps`` for X-5 calibration but do not appear in the
+    retrospective (signal density). Returns a list of lines; empty list
+    when there is nothing to render (the caller then skips adding the
+    header).
+    """
+    if not gap_rows:
+        return []
+    lines: List[str] = ["", "## Expectation Gaps (from X-2 gap analysis)", ""]
+    for row in gap_rows:
+        unit_id = row.get("unit_id")
+        severity = row.get("severity") or ""
+        direction = row.get("direction") or ""
+        fp = row.get("failure_precondition") or ""
+        lines.append(
+            f"- unit {unit_id}: severity={severity}, direction={direction}, "
+            f"failure_precondition={fp}"
+        )
+        for key in ("scope_gap", "effort_gap", "outcome_gap"):
+            val = row.get(key)
+            if val:
+                lines.append(f"    - {key}: {val}")
+    lines.append("")
+    return lines
+
+
+def _render_revision_block(revision_rows: List[dict]) -> List[str]:
+    """Render the ``## Expectation Revisions`` Markdown block.
+
+    Groups rows by unit, names each revision's trigger + facet, and
+    annotates low-confidence (<0.5) rows with ``[low confidence]`` so
+    they are surfaced rather than silently dropped (AS-6).
+    """
+    if not revision_rows:
+        return []
+    lines: List[str] = ["", "## Expectation Revisions (from X-3 revision detection)", ""]
+    # Group by unit, preserving the order (rows are already sorted by
+    # unit_id + revision_index upstream).
+    current_unit: Optional[str] = None
+    for row in revision_rows:
+        unit_id = row.get("unit_id")
+        if unit_id != current_unit:
+            lines.append(f"- unit {unit_id}:")
+            current_unit = unit_id
+        trigger = row.get("revision_trigger") or ""
+        facet = row.get("facet") or ""
+        confidence = row.get("confidence")
+        conf_marker = ""
+        if isinstance(confidence, (int, float)) and confidence < 0.5:
+            conf_marker = " [low confidence]"
+        turn = row.get("revision_turn")
+        lines.append(
+            f"    - revision at turn {turn}: trigger={trigger}, "
+            f"facet={facet}{conf_marker}"
+        )
+        before = row.get("before_text")
+        after = row.get("after_text")
+        if before:
+            lines.append(f"        - before: {before}")
+        if after:
+            lines.append(f"        - after: {after}")
+    lines.append("")
+    return lines
+
+
 def _assemble_prompt(
     units: List[dict],
     unit_transcripts: dict,
     unit_timelines: dict,
     week_start: str,
     unit_attributions: Optional[dict] = None,
+    gap_rows: Optional[List[dict]] = None,
+    revision_rows: Optional[List[dict]] = None,
+    calibration_trends: Optional[dict] = None,
+    calibration_unit_count: Optional[int] = None,
 ) -> Tuple[str, List[dict]]:
     """Return (system_prompt, user_messages) for the synthesis call.
 
@@ -536,6 +689,31 @@ def _assemble_prompt(
                 )
             body_parts.append("")
 
+    # Epic #27 — X-2 (#73): inject gap rows into the user message so the
+    # LLM can reason about them. Only major/critical are surfaced here;
+    # minor/none stay in the DB for X-5 calibration.
+    if gap_rows:
+        body_parts.extend(_render_gap_block(gap_rows))
+
+    # Epic #27 — X-3 (#74): inject revision rows. All revisions are
+    # surfaced (low-confidence ones are annotated, not dropped).
+    if revision_rows:
+        body_parts.extend(_render_revision_block(revision_rows))
+
+    # Epic #27 — X-5 (#76): calibration trends. Empty dict below the
+    # ≥20-correction threshold — block is omitted entirely.
+    # AC-9 gate: also pass processed_unit_count so render_calibration_block
+    # can enforce the ≥30-unit floor alongside the correction threshold.
+    if calibration_trends:
+        from synthesis.calibration import render_calibration_block
+
+        body_parts.extend(
+            render_calibration_block(
+                calibration_trends,
+                processed_unit_count=calibration_unit_count,
+            )
+        )
+
     user_content = "\n".join(body_parts)
     return _STATIC_SYSTEM_PROMPT, [{"role": "user", "content": user_content}]
 
@@ -556,6 +734,7 @@ def run_synthesis(
     sessions_db: Union[str, Path],
     week_start: str,
     dry_run: bool = False,
+    expectations_db: Optional[Union[str, Path]] = None,
 ) -> Optional[Path]:
     """End-to-end weekly synthesis for *week_start*.
 
@@ -742,8 +921,140 @@ def run_synthesis(
                         gh_conn, week_start, repo_part, issue_number, session_uuids
                     )
 
+        # Epic #27 — X-2 (#73) + X-3 (#74): run the gap + revision passes
+        # before prompt assembly so their rows are available to inject
+        # into the user message. Silent no-op when expectations_db is
+        # None (operator has not wired X-1 yet) or the DB has no
+        # expectations rows for this week.
+        gap_rows: List[dict] = []
+        revision_rows: List[dict] = []
+        if expectations_db is not None:
+            from synthesis import gap_analysis
+
+            try:
+                gap_analysis.run(
+                    week_start,
+                    github_db=str(gh_path),
+                    expectations_db=str(expectations_db),
+                    config=config,
+                )
+                gap_rows = gap_analysis.load_gap_rows(
+                    str(expectations_db),
+                    week_start,
+                    min_severity=("major", "critical"),
+                )
+                # Epic #27 — X-4 (#75): auto-confirm sweep fires on every
+                # ``am-synthesize --week`` invocation (AS-6). Any gap row
+                # older than 14 days without a user correction gets
+                # ``corrected_by='auto_confirm'`` rows written. Non-fatal
+                # if the corrections table is missing — log + proceed.
+                from synthesis.correction import auto_confirm_sweep
+
+                try:
+                    auto_confirm_sweep(str(expectations_db))
+                except sqlite3.OperationalError as exc:
+                    logger.warning(
+                        "Auto-confirm sweep skipped for week=%s: %s",
+                        week_start, exc,
+                    )
+            except sqlite3.OperationalError as exc:
+                # Most likely: expectations.db not initialised yet (X-1
+                # hasn't been run). Log a warning and proceed without the
+                # gap section — degraded operation over a broken pipeline.
+                logger.warning(
+                    "Gap analysis skipped for week=%s: %s. Run "
+                    "'am-init-db' and 'am-extract-expectations' first.",
+                    week_start, exc,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Gap analysis failed for week=%s: %s. Retrospective "
+                    "will be written without the Expectation Gaps section.",
+                    week_start, exc,
+                )
+
+            # X-3 revision detection — parallel to the gap pass. Each
+            # side reads X-1's ``expectations`` rows and writes its own
+            # sibling table, so the two can run in either order.
+            from synthesis import revision_detector
+
+            try:
+                revision_detector.run(
+                    week_start,
+                    github_db=str(gh_path),
+                    sessions_db=str(sess_path),
+                    expectations_db=str(expectations_db),
+                    config=config,
+                )
+                revision_rows = revision_detector.load_revision_rows(
+                    str(expectations_db), week_start
+                )
+            except sqlite3.OperationalError as exc:
+                logger.warning(
+                    "Revision detection skipped for week=%s: %s. Run "
+                    "'am-init-db' and 'am-extract-expectations' first.",
+                    week_start, exc,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Revision detection failed for week=%s: %s. "
+                    "Retrospective will be written without the "
+                    "Expectation Revisions section.",
+                    week_start, exc,
+                )
+
+        # Epic #27 — X-5 (#76): calibration trends pass. Runs AFTER the
+        # X-4 auto-confirm sweep (which populates additional correction
+        # rows) so the threshold count reflects the freshest state. Below
+        # the ≥20 user-correction threshold this is a strict no-op and
+        # returns an empty dict — the retrospective omits the section.
+        calibration_trends: dict = {}
+        calibration_unit_count: Optional[int] = None
+        if expectations_db is not None:
+            from synthesis import calibration
+
+            try:
+                calibration_trends = calibration.run(
+                    week_start,
+                    github_db=str(gh_path),
+                    expectations_db=str(expectations_db),
+                )
+                # AC-9: also count total processed units (expectation_gaps
+                # rows across all weeks) so render_calibration_block can
+                # enforce the ≥30-unit floor (the second gate).
+                _exp_conn = sqlite3.connect(str(expectations_db))
+                try:
+                    calibration_unit_count = calibration._count_processed_units(
+                        _exp_conn
+                    )
+                except Exception:  # noqa: BLE001
+                    calibration_unit_count = None
+                finally:
+                    _exp_conn.close()
+            except sqlite3.OperationalError as exc:
+                logger.warning(
+                    "Calibration pass skipped for week=%s: %s. Run "
+                    "'am-init-db' and 'am-extract-expectations' first.",
+                    week_start, exc,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Calibration pass failed for week=%s: %s. "
+                    "Retrospective will be written without the "
+                    "Calibration Trends section.",
+                    week_start, exc,
+                )
+
         system_prompt, messages = _assemble_prompt(
-            units, unit_transcripts, unit_timelines, week_start, unit_attributions
+            units,
+            unit_transcripts,
+            unit_timelines,
+            week_start,
+            unit_attributions,
+            gap_rows=gap_rows,
+            revision_rows=revision_rows,
+            calibration_trends=calibration_trends,
+            calibration_unit_count=calibration_unit_count,
         )
 
         # --- Issue #54 P-2: prompt-size guard -------------------------
@@ -834,6 +1145,7 @@ def run_synthesis(
 __all__ = [
     "run_synthesis",
     "water_fill_truncate",
+    "_resolve_unit_sessions",
     "TRANSCRIPT_BUDGET_BYTES",
     "MAX_UNITS_PER_PROMPT",
     "MAX_PROMPT_SOFT_WARN_BYTES",

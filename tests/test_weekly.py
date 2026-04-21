@@ -110,7 +110,7 @@ def _make_config(tmp_path: Path, output_dir: Path) -> SynthesisConfig:
     """Build a SynthesisConfig pinned to *output_dir*."""
     return SynthesisConfig(
         anthropic_api_key_env="ANTHROPIC_API_KEY",
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-4-6",
         output_dir=str(output_dir),
         week_start="monday",
         abandonment_days=14,

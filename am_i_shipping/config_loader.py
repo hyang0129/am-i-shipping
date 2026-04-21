@@ -76,7 +76,7 @@ class SynthesisConfig:
     """
 
     anthropic_api_key_env: str = "ANTHROPIC_API_KEY"
-    model: str = "claude-sonnet-4-5"
+    model: str = "claude-sonnet-4-6"
     summary_model: str = "claude-haiku-4-5"
     output_dir: str = "retrospectives"
     week_start: str = "monday"  # "monday" or "sunday"

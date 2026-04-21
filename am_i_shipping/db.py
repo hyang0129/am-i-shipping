@@ -107,6 +107,15 @@ CREATE TABLE IF NOT EXISTS pr_sessions (
 );
 """
 
+GITHUB_ISSUE_SESSIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS issue_sessions (
+    repo            TEXT NOT NULL,
+    issue_number    INTEGER NOT NULL,
+    session_uuid    TEXT NOT NULL,
+    PRIMARY KEY (repo, issue_number, session_uuid)
+);
+"""
+
 GITHUB_CURSOR_SCHEMA = """
 CREATE TABLE IF NOT EXISTS poll_cursor (
     repo            TEXT PRIMARY KEY,
@@ -252,6 +261,249 @@ CREATE TABLE IF NOT EXISTS unit_summaries (
 );
 """
 
+# Epic #27 — X-1 (#72): expectations.db schema.
+# Standalone SQLite file under ``config.data_path``. Later slices in the epic
+# (X-2 through X-5) will add their own tables to the same DB but must NOT
+# rename the columns this slice writes — X-4 user corrections accumulate
+# against these column names and renaming is expensive.
+SYNTHESIS_EXPECTATIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS expectations (
+    week_start       TEXT NOT NULL,
+    unit_id          TEXT NOT NULL,
+    commitment_point TEXT,
+    expected_scope   TEXT,
+    expected_effort  TEXT,
+    expected_outcome TEXT,
+    confidence       REAL,
+    model            TEXT,
+    input_bytes      INTEGER,
+    extracted_at     TEXT DEFAULT (datetime('now')),
+    skip_reason      TEXT,
+    PRIMARY KEY (week_start, unit_id)
+);
+"""
+
+# Epic #27 — X-2 (#73): expectation_gaps schema.
+#
+# Written by ``synthesis.gap_analysis.run`` during ``am-synthesize``.
+# Every row is joined to an ``expectations`` row by ``(week_start, unit_id)``.
+#
+# IRREVERSIBLE column names (per the epic ADR): ``commitment_point``,
+# ``scope_gap``, ``effort_gap``, ``outcome_gap``. X-4 user corrections and
+# X-5 calibration both key off these names; renaming after X-4 ships is
+# expensive. Locked here.
+#
+# * ``severity``            — one of {``none``, ``minor``, ``major``, ``critical``}.
+# * ``direction``           — one of {``under``, ``over``, ``match``, ``ambiguous``}.
+# * ``failure_precondition``— constrained enum drawn from ``idealized-workflow.md``
+#                             phase/step identifiers. NULL when ``severity='none'``;
+#                             non-NULL otherwise.
+# * ``auto_confirmed``      — introduced in X-2 for X-4's hook. 0 by default;
+#                             flipped to 1 by the auto-confirm sweep for rows
+#                             older than 14 days without a user correction.
+SYNTHESIS_EXPECTATION_GAPS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS expectation_gaps (
+    week_start           TEXT NOT NULL,
+    unit_id              TEXT NOT NULL,
+    commitment_point     TEXT,
+    scope_gap            TEXT,
+    effort_gap           TEXT,
+    effort_gap_ratio     REAL,
+    outcome_gap          TEXT,
+    severity             TEXT,
+    direction            TEXT,
+    failure_precondition TEXT,
+    computed_at          TEXT DEFAULT (datetime('now')),
+    auto_confirmed       INTEGER DEFAULT 0,
+    PRIMARY KEY (week_start, unit_id)
+);
+"""
+
+# Columns added after the initial schema — migrated on init. Applied inside
+# ``init_expectations_db`` against an already-open connection so repeated runs
+# are a no-op.
+_EXPECTATIONS_MIGRATIONS = [
+    # X-2 added ``auto_confirmed`` to ``expectation_gaps``. The CREATE above
+    # already includes the column on fresh DBs; the migration handles DBs
+    # that shipped X-2 with an earlier column set.
+    "ALTER TABLE expectation_gaps ADD COLUMN auto_confirmed INTEGER DEFAULT 0",
+    # Epic #27 AC fix: added ``effort_gap_ratio`` (REAL) — numeric ratio of
+    # actual to expected effort sessions. The CREATE above already includes
+    # the column on fresh DBs; the migration handles older DBs.
+    "ALTER TABLE expectation_gaps ADD COLUMN effort_gap_ratio REAL",
+]
+
+# Epic #27 — X-3 (#74): expectation_revisions schema.
+#
+# Written by ``synthesis.revision_detector.run`` during ``am-synthesize``.
+# Every row is a sibling-history record of a mid-unit expectation shift
+# detected from a structural trigger (reprompt, session break >24h, or
+# scope-change turn). The committed ``expectations`` row from X-1 is
+# NEVER mutated — revisions accumulate alongside as a parallel history.
+#
+# IRREVERSIBLE column names (per the epic ADR, mirroring X-1/X-2's lock):
+# ``revision_index``, ``revision_turn``, ``revision_trigger``, ``facet``,
+# ``before_text``, ``after_text``. X-4 user corrections and X-5 calibration
+# will key off these names; renaming after X-4 ships is expensive.
+#
+# * ``revision_trigger`` — one of {``reprompt``, ``scope_change_turn``,
+#                          ``session_break``}.
+# * ``facet``            — one of {``scope``, ``effort``, ``outcome``}.
+# * ``confidence``       — LLM self-reported confidence in [0.0, 1.0].
+#                          Low-confidence rows (<0.5) are surfaced in the
+#                          retrospective with a marker, NOT dropped.
+SYNTHESIS_EXPECTATION_REVISIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS expectation_revisions (
+    week_start       TEXT NOT NULL,
+    unit_id          TEXT NOT NULL,
+    revision_index   INTEGER NOT NULL,
+    revision_turn    INTEGER,
+    revision_trigger TEXT,
+    facet            TEXT,
+    before_text      TEXT,
+    after_text       TEXT,
+    confidence       REAL,
+    detected_at      TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (week_start, unit_id, revision_index)
+);
+"""
+
+# Epic #27 — X-4 (#75): expectation_corrections schema.
+#
+# Written by ``synthesis.correction`` when the user runs
+# ``am-synthesize correct`` (interactive agentic workflow) and by the
+# auto-confirm sweep that runs on every ``am-synthesize --week``
+# invocation.
+#
+# IRREVERSIBLE column names (per the epic ADR): ``week_start``,
+# ``unit_id``, ``facet``, ``original_value``, ``corrected_value``,
+# ``correction_note``, ``corrected_by``. X-5 calibration keys off these
+# names; renaming after corrections accumulate is expensive.
+#
+# * ``facet``          — one of {``commitment_point``, ``scope``,
+#                         ``effort``, ``outcome``, ``severity``,
+#                         ``failure_precondition``}.
+# * ``corrected_by``   — one of {``user``, ``auto_confirm``}.
+# * ``original_value`` — the value that was in the ``expectation_gaps``
+#                         row at the moment the correction was written.
+#                         The gap row itself is NEVER mutated — X-5
+#                         needs the before/after delta.
+# * ``corrected_value``— equal to ``original_value`` when the user
+#                         confirmed without change; different when a
+#                         correction was supplied.
+SYNTHESIS_EXPECTATION_CORRECTIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS expectation_corrections (
+    week_start       TEXT NOT NULL,
+    unit_id          TEXT NOT NULL,
+    facet            TEXT NOT NULL,
+    original_value   TEXT,
+    corrected_value  TEXT,
+    correction_note  TEXT,
+    corrected_by     TEXT NOT NULL,
+    corrected_at     TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (week_start, unit_id, facet)
+);
+"""
+
+# Epic #27 — X-5 (#76): expectation_calibration_trends schema.
+#
+# Written by ``synthesis.calibration.run`` during ``am-synthesize`` once
+# ≥20 user corrections have accumulated in ``expectation_corrections``.
+# Each row captures the per-work-type calibration delta for a given
+# week. The shipped retrospective ``.md`` is immutable (Epic #17
+# Decision 2); this trend table is live data and may be recomputed on
+# re-runs via UPSERT semantics.
+#
+# Primary key: ``(work_type, week_start)`` — the intent document flagged
+# this choice as implementer-owned. UPSERT-by-PK keeps re-runs cheap and
+# consistent with the "trend table is live, .md is frozen" split.
+#
+# * ``work_type``            — mirror of ``github.db::issues.type_label``
+#                              or the literal ``"unknown"`` when the
+#                              issue's ``type_label`` is NULL / the unit
+#                              has no joined issue row.
+# * ``avg_*_delta``          — average over all user corrections for the
+#                              work-type where the facet actually changed
+#                              (``original_value != corrected_value``).
+#                              NULL when no user corrections for that
+#                              facet in the work-type.
+# * ``sample_count``         — number of ``corrected_by='user'`` rows
+#                              contributing to the group.
+SYNTHESIS_EXPECTATION_CALIBRATION_TRENDS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS expectation_calibration_trends (
+    work_type            TEXT NOT NULL,
+    week_start           TEXT NOT NULL,
+    avg_scope_delta      REAL,
+    avg_effort_delta     REAL,
+    avg_outcome_delta    REAL,
+    sample_count         INTEGER NOT NULL DEFAULT 0,
+    computed_at          TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (work_type, week_start)
+);
+"""
+
+EXPECTED_EXPECTATIONS_TABLES: dict[str, set[str]] = {
+    "expectations": {
+        "week_start",
+        "unit_id",
+        "commitment_point",
+        "expected_scope",
+        "expected_effort",
+        "expected_outcome",
+        "confidence",
+        "model",
+        "input_bytes",
+        "extracted_at",
+        "skip_reason",
+    },
+    "expectation_gaps": {
+        "week_start",
+        "unit_id",
+        "commitment_point",
+        "scope_gap",
+        "effort_gap",
+        "effort_gap_ratio",
+        "outcome_gap",
+        "severity",
+        "direction",
+        "failure_precondition",
+        "computed_at",
+        "auto_confirmed",
+    },
+    "expectation_revisions": {
+        "week_start",
+        "unit_id",
+        "revision_index",
+        "revision_turn",
+        "revision_trigger",
+        "facet",
+        "before_text",
+        "after_text",
+        "confidence",
+        "detected_at",
+    },
+    "expectation_corrections": {
+        "week_start",
+        "unit_id",
+        "facet",
+        "original_value",
+        "corrected_value",
+        "correction_note",
+        "corrected_by",
+        "corrected_at",
+    },
+    "expectation_calibration_trends": {
+        "work_type",
+        "week_start",
+        "avg_scope_delta",
+        "avg_effort_delta",
+        "avg_outcome_delta",
+        "sample_count",
+        "computed_at",
+    },
+}
+
+
 SYNTHESIS_SESSION_GH_EVENTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS session_gh_events (
     session_uuid  TEXT NOT NULL,
@@ -370,6 +622,7 @@ EXPECTED_GITHUB_TABLES: dict[str, set[str]] = {
     },
     "pr_issues": {"repo", "pr_number", "issue_number"},
     "pr_sessions": {"repo", "pr_number", "session_uuid"},
+    "issue_sessions": {"repo", "issue_number", "session_uuid"},
     "poll_cursor": {"repo", "last_polled_at"},
     "issue_body_edits": {
         "repo",
@@ -573,6 +826,7 @@ def init_github_db(db_path: Path) -> None:
         conn.execute(GITHUB_PRS_SCHEMA)
         conn.execute(GITHUB_PR_ISSUES_SCHEMA)
         conn.execute(GITHUB_PR_SESSIONS_SCHEMA)
+        conn.execute(GITHUB_ISSUE_SESSIONS_SCHEMA)
         conn.execute(GITHUB_CURSOR_SCHEMA)
         conn.execute(GITHUB_ISSUE_BODY_EDITS_SCHEMA)
         conn.execute(GITHUB_ISSUE_COMMENT_EDITS_SCHEMA)
@@ -622,14 +876,47 @@ def init_appswitch_db(db_path: Path) -> None:
         conn.close()
 
 
+def init_expectations_db(db_path: Path) -> None:
+    """Create ``expectations.db`` with the expectations table (Epic #27, X-1).
+
+    Idempotent (``CREATE TABLE IF NOT EXISTS``). Later slices of Epic #27
+    (X-2 through X-5) are expected to add additional tables to the same
+    DB file via their own ``init_*`` functions.
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(SYNTHESIS_EXPECTATIONS_SCHEMA)
+        # Epic #27 — X-2 (#73): expectation_gaps lives in the same DB.
+        conn.execute(SYNTHESIS_EXPECTATION_GAPS_SCHEMA)
+        # Epic #27 — X-3 (#74): expectation_revisions lives in the same DB.
+        conn.execute(SYNTHESIS_EXPECTATION_REVISIONS_SCHEMA)
+        # Epic #27 — X-4 (#75): expectation_corrections lives in the same DB.
+        conn.execute(SYNTHESIS_EXPECTATION_CORRECTIONS_SCHEMA)
+        # Epic #27 — X-5 (#76): expectation_calibration_trends lives in the
+        # same DB.
+        conn.execute(SYNTHESIS_EXPECTATION_CALIBRATION_TRENDS_SCHEMA)
+        for migration in _EXPECTATIONS_MIGRATIONS:
+            try:
+                conn.execute(migration)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        conn.commit()
+        # Assert on the same connection we just wrote to (for ':memory:'
+        # databases; see init_sessions_db for the rationale).
+        assert_schema(conn, EXPECTED_EXPECTATIONS_TABLES)
+    finally:
+        conn.close()
+
+
 def init_all(config: Config) -> None:
-    """Initialize all three databases under the configured data directory."""
+    """Initialize all four databases under the configured data directory."""
     data_dir = config.data_path
     data_dir.mkdir(parents=True, exist_ok=True)
 
     init_sessions_db(data_dir / "sessions.db")
     init_github_db(data_dir / "github.db")
     init_appswitch_db(data_dir / "appswitch.db")
+    init_expectations_db(data_dir / "expectations.db")
 
     print(f"Databases initialized in {data_dir}")
 

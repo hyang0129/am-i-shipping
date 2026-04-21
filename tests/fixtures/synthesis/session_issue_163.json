@@ -1,0 +1,230 @@
+[
+  {
+    "role": "user",
+    "content": "<command-message>refine-issue</command-message>\n<command-name>/refine-issue</command-name>\n<command-args> user testing showed that we can just /login on claude cli even while other clis are running tasks. The switch is imperceptible (other clis referencing that config dir just continue working without issue). This suggests that our current appropriate of priority profile coudl be simpliefied into multiple profiles that we keep warm via probing and a single \"main\" profile. All claude sessions should use the main profile (eg. in devcontainers, they would mount the volume) so that the user can seemlessly swap the claude code account with a click (essentially changing the relevant json files, I believe it was a credential file + a user file or soemthing I'm not sure).</command-args>"
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "# Refine Issue\n\n## Purpose\n\nConverts a vague issue or one-line description into a behavioral spec that implementation agents\ncannot satisfy without also satisfying the user's real intent.\n\nThe core failure this command prevents: implementations that technically close a ticket while\nleaving the user's actual experience unchanged \u2014 a `check_fk()` function that exists but is\nnever called, a pipeline phase added to a legacy script but not to the CLI or orchestration server.\n\n**This command never writes source code and never opens PRs.**\nIts sole output is a refined spec document, optionally posted as a GitHub issue comment.\n\nThe refined spec is the intended input to `/resolve-issue` or `/fix-issue`.\n\n---\n\n## Args\n\n`/refine-issue <issue> [--no-post]`\n\n- `issue`: required. One of:\n  - GitHub issue number (e.g. `42`)\n  - Full GitHub issue URL (e.g. `https://github.com/org/repo/issues/42`)\n  - Quoted free-form description (e.g. `\"add reading level checks to the generation pipeline\"`)\n- `--no-post`: optional flag. If present and `issue` is a number or URL, keep the refined spec\n  local only \u2014 do not post it to GitHub. Ignored in free-form mode (see below).\n\nDetect whether `issue` is a number/URL/repo-ref or a free-form description:\n- If it matches `^[\\w.-]+/[\\w.-]+#\\d+$` (e.g. `owner/repo#42`) \u2192 extract `owner/repo` and issue number.\n- If it matches `^\\d+$` \u2192 treat as issue number (repo must be detected).\n- If it matches `^https?://github\\.com/` \u2192 extract `owner/repo` and issue number from the URL.\n- Otherwise \u2192 treat as free-form description. `--no-post` is silently ignored in this mode\n  (free-form always creates a new issue).\n\n**Default posting behavior:**\n- Issue reference mode (number, URL, `owner/repo#N`): post the refined spec to GitHub **by default**.\n  Pass `--no-post` to suppress this and keep the spec local only.\n- Free-form mode: always creates a new GitHub issue \u2014 `--no-post` has no effect. Warn if the user\n  passes it: *\"`--no-post` ignored; free-form mode always creates a new issue.\"*\n\n---\n\n## Setup\n\n### Repo detection (issue reference mode only)\n\nIf `issue` is `owner/repo#number` or a full URL, extract `owner/repo` directly \u2014 no detection or\nconfirmation needed. Set `REPO=<owner/repo>` and proceed.\n\nIf `issue` is just a number, detect the repo:\n```bash\ngit remote -v\ngh repo view --json nameWithOwner\n```\n\nDetermine `owner/repo`:\n- If exactly one GitHub remote, use it.\n- If multiple remotes, prefer `upstream` (fork workflow), otherwise `origin`.\n- If no remote can be found, check conversation context for a repo name.\n\n**Confirm only when the repo was auto-detected** (i.e., `issue` was a bare number):\n```\nRepo detected: <owner/repo> (from <source>)\n\nProceed with issue #<number> in <owner/repo>? [yes / no / different-repo]\n```\n\nWait for the user to confirm or correct. Then set `REPO=<owner/repo>`.\n\n### Fetch the issue (issue reference mode only)\n\n```bash\ngh issue view <number> --repo <owner/repo> --json number,title,body,labels,comments\n```\n\nIf `gh` is unavailable, stop and tell the user to install the GitHub CLI.\n\n### Git root detection\n\n```bash\nGIT_ROOT=\"$(git rev-parse --show-toplevel 2>/dev/null)\"\nif [ -z \"$GIT_ROOT\" ]; then\n  for candidate in /workspaces/* \"$HOME\"/repos/* \"$HOME\"/repo/* \"$HOME\"/projects/* \"$HOME\"/*; do\n    if [ -d \"$candidate/.git\" ]; then\n      GIT_ROOT=\"$candidate\"\n      break\n    fi\n  done\nfi\n```\n\nIf `GIT_ROOT` is empty, the Spec agent will work without codebase context \u2014 note this in the\noutput spec. Do not stop. Skip the scratch directory setup below.\n\nIf `GIT_ROOT` is set, verify the scratch directory exists before spawning anything:\n```bash\ntest -d \"$GIT_ROOT/.claude-work\" && echo \"EXISTS\" || echo \"MISSING\"\n```\nIf `MISSING`, stop and tell the user:\n```\n.claude-work/ not found in this repo. Please run:\n  mkdir -p <GIT_ROOT>/.claude-work && echo '.claude-work/' >> <GIT_ROOT>/.git/info/exclude\nThen re-run this command.\n```\nDo not proceed until the directory exists.\n\nWhen `GIT_ROOT` is empty, the Spec agent writes its output to a temp path instead:\n`/tmp/REFINED_<slug>-<number>.md`. Report this path to the user in the final summary.\n\n---\n\n## Step 1 \u2014 Resume Check\n\nBefore spawning anything, check whether a prior refinement exists for this issue:\n\n```bash\nls \"$GIT_ROOT/.claude-work/REFINED_\"*\"-<number>.md\" 2>/dev/null\n```\n\nIf a file is found, ask the user:\n```\nFound existing refined spec: .claude-work/REFINED_<slug>-<number>.md\n\nResume from it (r) or start over (s)?\n```\n\n- If **resume**: read the existing file, skip to Step 4 (present it) and proceed from there.\n- If **start over**: delete the old file and continue to Step 2 (spawn Intent agent).\n- In free-form mode (no issue number): skip this check entirely.\n\n---\n\n## Step 2 \u2014 Intent Interview (interactive, multi-round)\n\nConduct the intent interview directly in this session. Do not spawn a subagent for this step.\n\nThis is the most important step in this workflow. Your sole job here is to fully understand what\nthe user wants and why \u2014 not to produce a document, not to search code. Run as many rounds as\nneeded until intent is completely understood.\n\nRole: dialogue-only. No file writes, no code search, no spec production.\n\n**You are a requirements interviewer, not a spec writer.**\n\nYour job is to understand the user's intent so completely that a different agent \u2014 who has never\nspoken to the user \u2014 could produce a spec the user would sign off on without a single correction.\n\n**Start by reading the issue or description carefully.** Then immediately begin probing. Do not\nattempt to summarize or restate the issue back to the user \u2014 start asking.\n\n**Probe dimensions (work through all of these across as many rounds as needed):**\n\n1. **The real outcome**\n   - What does success look like from the user's perspective \u2014 not a code change, a *lived experience*?\n   - What would change about their day if this were done right?\n   - If the feature disappeared tomorrow, what would they miss?\n\n2. **Hidden scope**\n   - Are there places where this behavior should apply that the issue doesn't mention?\n   - Has the user ever been surprised that something \"worked\" in one place but not another?\n   - Is there anything they assumed was obvious that they didn't bother writing down?\n\n3. **Acceptance conditions**\n   - How will they know it's working? What will they check?\n   - What's the simplest thing that would count as \"not done\"?\n   - Is there a failure mode they've seen before that they definitely don't want to repeat?\n\n4. **Constraints and non-goals**\n   - What should explicitly NOT change as part of this?\n   - Is there anything that would be tempting to add but is out of scope for now?\n   - Are there performance, backward-compatibility, or API-stability concerns?\n\n5. **Priority and motivation**\n   - Why is this important now? What triggered the request?\n   - Is there a deadline, a downstream dependency, or a user complaint that drove this?\n\n**Conversation rules:**\n- Ask one or two focused questions per round \u2014 not a numbered list of ten.\n- When the user answers, synthesize what you've learned before asking the next question.\n  Show them you understood, then probe the next gap.\n- If an answer opens a new dimension you hadn't considered, follow it.\n- Do not declare understanding complete until you can articulate:\n  - The job statement (when / want / so I can) with a real-world outcome\n  - At least one hidden assumption the issue didn't surface\n  - What \"done\" looks like from the user's perspective\n  - What's explicitly out of scope\n- Signal completion by saying:\n  ```\n  I think I have a complete picture of your intent. Here's what I'll hand off to the spec:\n\n  **Job statement:** When I <situation>, I want to <motivation>, so I can <real-world outcome>.\n  **Core behavioral intent:** <2\u20133 sentences on observable change>\n  **Key hidden assumptions:** <bullet list>\n  **Done looks like:** <what the user will check>\n  **Out of scope:** <explicit exclusions>\n\n  Does this capture it accurately, or is there anything to correct?\n  ```\n- Wait for the user to confirm or correct before concluding.\n\n**Output:** When the user confirms, write a structured intent summary to:\n`.claude-work/INTENT_<slug>-<number>.md`\n\n```markdown\n# Intent Summary: <title>\n\n## Job Statement\nWhen I <situation>, I want to <motivation>, so I can <real-world outcome>.\n\n## Behavioral Intent\n<2\u20133 sentences: what must be observably different after this is resolved, from the user's\nperspective \u2014 describe the experience, not the implementation>\n\n## Hidden Assumptions Surfaced\n- <assumption the issue author made that may not be obvious to an implementer>\n- <assumption about which components are in scope>\n- <any \"and obviously it should work in X too\" that was never written down>\n\n## Acceptance Conditions (user-stated)\n<What the user said they will check. Not test cases \u2014 their natural language description of\n\"done.\" The Spec agent will formalize these into scenarios.>\n\n## Out of Scope\n<Explicit exclusions, confirmed with the user>\n\n## Motivation Context\n<Why now, what triggered it, any urgency or downstream dependency>\n\n## Clarifying Q&A Log\n<A compact log of the key exchanges \u2014 question \u2192 answer \u2014 that surfaced non-obvious intent.\nInclude only rounds that changed understanding, not small clarifications.>\n```\n\n---\n\n## Step 3 \u2014 Spec Agent (one-shot formalization)\n\nAfter the Intent agent completes and the intent summary is written, spawn a **Spec agent**\n(`model: \"claude-opus-4-6\"`).\n\nPass it:\n- The full issue body + comments (if issue reference mode), or the free-form description.\n- The path to the intent summary: `.claude-work/INTENT_<slug>-<number>.md`\n- `GIT_ROOT` (or note that codebase context is unavailable).\n- The output path: `.claude-work/REFINED_<slug>-<number>.md`\n\n### Spec agent instructions\n\nRole: read-only codebase research + produce refined spec. No file writes except the output document.\nNo dialogue with the user \u2014 all intent is already captured in the intent summary.\n\n**Context bootstrap (do this before anything else):**\n1. Read `~/.claude/CLAUDE.md` (global instructions) and `$GIT_ROOT/CLAUDE.md` (repo instructions)\n   if they exist.\n2. If `.codesight/CODESIGHT.md` exists at `$GIT_ROOT`, read it in full.\n3. If `docs/agent_index.md` exists at `$GIT_ROOT`, read it in full.\n   If not found there, glob for `**/agent_index.md` and read any match.\n4. Read the intent summary at `.claude-work/INTENT_<slug>-<number>.md` in full. This is your\n   source of truth for what the user wants \u2014 treat it as authoritative.\n\n**Phase A \u2014 Codebase surface area research**\n\nSearch the codebase to enumerate *every place where the behavior described in the intent summary\nmust be present*. Do not assume the issue author knows all the relevant components.\n\n**Required search checklist \u2014 perform all of these before declaring surface area complete:**\n1. The user-facing verb from the issue title (e.g. \"validate\", \"check\", \"generate\")\n2. The object noun from the issue title (e.g. \"reading level\", \"FK grade\", \"token\")\n3. Any existing symbol or function that already does a fraction of the requested behavior\n4. All files matching repo-convention globs for entry points:\n   `**/cli*`, `**/commands*`, `**/handlers*`, `**/routes*`, `**/pipeline*`, `**/server*`\n5. Any config, hook, or script files that invoke the affected behavior\n\nAfter completing the checklist, state explicitly:\n```\nSurface area search: examined N files, found M candidate matches across the required checklist.\nCoverage confidence: [high / medium / low \u2014 explain if medium or low]\n```\n\nFor each entry point found, check whether the relevant behavior currently exists there, is\npartially present, or is entirely absent.\n\n**Dead-code check:** For any symbol that appears to implement the requested behavior, grep for\nits name and count call sites. If call sites \u2264 1 (i.e., only the definition), flag it as\nsuspicious: *\"defined at `src/quality.py:42` but found no call sites \u2014 may be unwired.\"*\nDo not conclude it is unreachable; list the evidence and let the implementer verify.\n\nIf `GIT_ROOT` is empty, Phase A cannot run against a real codebase. Mark all surface area rows\nas `[UNVERIFIED \u2014 no codebase]` and note that the user must validate the table manually.\n\n**Phase B \u2014 Produce the refined spec**\n\nWrite `.claude-work/REFINED_<slug>-<number>.md`. Ground every section in the intent summary \u2014\ndo not invent intent. If the intent summary is silent on something, say so explicitly.\n\n```markdown\n# Refined Spec: <title> (#<number> | free-form)\n\n## Job Statement\nWhen I <situation>, I want to <motivation>, so I can <outcome>.\n\n*Bad example (too shallow):* \"When I generate content, I want to check reading level, so I can\nhave reading level checked.\" The outcome is just the motivation restated.\n*Good example:* \"When I generate content, I want to check reading level, so I can confidently\npublish material that any 6th grader can read without friction.\"\nThe outcome must describe a real-world consequence, not just the presence of the mechanism.\n\n## Behavioral Intent\n<2\u20133 sentences: what must be *observably different* after this is resolved. Write this from\nthe user's perspective \u2014 describe the experience, not the implementation. If a check is added,\nthe intent is not \"the check exists\" but \"the output consistently meets the standard.\">\n\n## Hidden Assumptions Surfaced\n- <assumption the issue author made that may not be obvious to an implementer>\n- <assumption about which components are in scope>\n- <any \"and obviously it should work in X too\" that will never be said aloud>\n\n## Acceptance Scenarios\n\nOne scenario per entry point. Each scenario must be falsifiable \u2014 it must be expressible as a\ntest that would have caught the failure if it had been written before implementation.\n\n### Entry Point: <name> (e.g. CLI `generate` command)\n**Given** <precondition \u2014 system state before the action>\n**When** <the user's action at this entry point>\n**Then** <observable outcome \u2014 what the user sees or measures>\n**Falsifiability:** <the test that would have caught \"wired but disconnected\" \u2014 e.g.\n\"an integration test that calls `cli generate` and asserts the output FK grade is \u2264 6\">\n\n### Entry Point: <name> (e.g. Orchestration Server `/run` endpoint)\n**Given** ...\n**When** ...\n**Then** ...\n**Falsifiability:** ...\n\n[One block per relevant entry point. If an entry point is explicitly out of scope, say so\nand explain why.]\n\n## Surface Area\n\nEvery component that must change for all acceptance scenarios to pass. This is the definitive\nlist \u2014 if a component is not on this list, it will not be touched. If the implementer believes\nsomething is missing, they must flag it before writing code.\n\n| Component | File / path (with line numbers) | Change required | Acceptance scenario(s) it satisfies |\n|---|---|---|---|\n| <e.g. FK check function> | `src/pipeline/quality.py:42` | Wire into generation pipeline | Entry Point: CLI, Entry Point: Server |\n| <e.g. CLI `generate` command> | `src/cli/generate.py:118` | Pass FK result to output validator | Entry Point: CLI |\n| <e.g. Orchestration server> | `server/handlers/run.py:77` | Apply same validation before returning | Entry Point: Server |\n\nInclude the starting line number of the relevant function or block. If line numbers are\nunavailable (e.g., no codebase), mark the path as `[UNVERIFIED]`.\n\n## Out of Scope\n<Anything that might seem related but should NOT be changed in this issue. Be explicit \u2014 if\nleft unspecified, implementers may either under- or over-reach.>\n\n## Clarifying Questions\n<Questions the implementer should answer before writing code. If none, write \"None \u2014 proceed\ndirectly to implementation.\">\n```\n\n**Quality checks before finishing:**\n- Every acceptance scenario is for a distinct entry point (not a distinct feature).\n- Every row in the surface area table is traceable to at least one acceptance scenario.\n- The behavioral intent describes what the user *observes*, not what the code *does*.\n- The job statement outcome is a real-world consequence, not a restatement of the motivation.\n- The surface area search coverage statement is present and honest.\n- Any suspicious dead-code symbols are flagged in the surface area table or as a note.\n- The job statement, behavioral intent, and hidden assumptions are grounded in the intent summary \u2014\n  not inferred independently. If the intent summary is missing something, flag it rather than guess.\n\n---\n\n## Step 4 \u2014 Publish to GitHub\n\nPublish the spec to GitHub **before** reporting completion. The GitHub issue is the approval\nsurface \u2014 the user reviews and approves the spec there, not in this session.\n\n### If the input was a free-form description (no existing issue)\n\nAlways create a new GitHub issue with the refined spec as the body:\n\n```bash\ngh issue create --repo <REPO> \\\n  --title \"<title derived from the Job Statement>\" \\\n  --body \"$(cat <<'EOF'\n## Refined Spec (generated by /refine-issue)\n\n<paste the full contents of .claude-work/REFINED_<slug>-<number>.md here>\n\n---\n*Spec generated by /refine-issue \u2014 ready for review.*\nEOF\n)\"\n```\n\n`REPO` is determined from the current git remote (same logic as bare-number detection in Setup).\nIf no remote can be determined, ask the user which repo to create the issue in.\n\n### If the input was an issue reference and `--no-post` was NOT passed (default)\n\nPost the refined spec as a comment on the existing issue:\n\n```bash\ngh issue comment <number> --repo <REPO> --body \"$(cat <<'EOF'\n## Refined Spec (generated by /refine-issue)\n\n<paste the full contents of .claude-work/REFINED_<slug>-<number>.md here>\n\n---\n*Spec generated by /refine-issue \u2014 ready for review.*\nEOF\n)\"\n```\n\n### If the input was an issue reference and `--no-post` was passed\n\nDo not post to GitHub. The spec exists only locally.\n\n---\n\n## Step 5 \u2014 Report Completion\n\nAfter publishing, present this summary (do not print the full spec \u2014 the user reviews it on GitHub):\n\n```\n## refine-issue complete\n\nInput: #<number> <title> | \"<description>\"\nIntent summary: .claude-work/INTENT_<slug>-<number>.md\nSpec: <issue URL or .claude-work/REFINED_<slug>-<number>.md if --no-post>\nSearch coverage: <coverage statement from Phase A>\n\nEntry points identified: <N>\nSurface area: <N> components\n```\n\n---\n\n## Constraints\n\n- Never write or modify source files.\n- Never open branches, commits, or PRs.\n- Never assume the issue author has named all the components that need to change.\n- If a codebase is unavailable (no git root), the Spec agent must clearly mark the surface\n  area table as \"unverified \u2014 codebase not available\" and the user must validate it manually.\n- The output spec is a *recommendation*, not a binding contract \u2014 the user should review it\n  before passing it to `/fix-issue` or `/resolve-issue`.\n- If blocked or uncertain about the repo structure, stop and report rather than guessing.\n- The Intent agent must not produce a spec \u2014 only the intent summary. The Spec agent must not\n  conduct dialogue \u2014 only formalize what the Intent agent discovered.\n\n\nARGUMENTS:  user testing showed that we can just /login on claude cli even while other clis are running tasks. The switch is imperceptible (other clis referencing that config dir just continue working without issue). This suggests that our current appropriate of priority profile coudl be simpliefied into multiple profiles that we keep warm via probing and a single \"main\" profile. All claude sessions should use the main profile (eg. in devcontainers, they would mount the volume) so that the user can seemlessly swap the claude code account with a click (essentially changing the relevant json files, I believe it was a credential file + a user file or soemthing I'm not sure)."
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "Let me check the git root and scratch directory before starting the interview."
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "Good. Now let me start the intent interview.\n\n---\n\nThe description touches something interesting: you've discovered that `/login` on one Claude CLI doesn't disrupt other running CLIs sharing the same config dir, which means \"switching accounts\" is just a file swap \u2014 and that insight suggests the current \"priority profile\" concept could be simplified.\n\nBefore I can write a good spec, I need to understand the real experience you want. Let me start probing.\n\n**Round 1:**\n\nRight now, what does a user actually *do* when they want to switch which Claude account is \"active\"? Walk me through the current flow \u2014 what do they click or type, and what happens?"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "<ide_opened_file>The user opened the file /temp/readonly/Bash tool output (vnslpr) in the IDE. This may or may not be related to the current task.</ide_opened_file>"
+      },
+      {
+        "type": "text",
+        "text": "well the original goal was to have the above behaviour. I see one profile hitting its limit, so I want to swap to another that has more limit remaining. The priority profiile process was implemented bc I wasn't sure if swapping with active sessions would disrupt those ssessions. Tests show that swapping with active sessions doesn't actually affect those sessions (surprisingly)"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "Got it \u2014 so the original fear was \"swapping mid-session would break things,\" but testing proved it's safe. That unlocks a much simpler model.\n\n**Round 2:**\n\nWhen you say \"swap to another profile with a click,\" what does that click look like in the UI? Are you imagining something like:\n- A dropdown in the Profile Manager widget that sets the \"active\" profile globally, and all *new* terminal sessions pick it up?\n- Or something more immediate \u2014 where even existing terminals switch over because they're all mounting the same shared config volume?\n\nAnd when you say \"keep profiles warm via probing\" \u2014 is the goal just to know which profiles still have quota remaining, so you can make an informed choice? Or should it auto-switch when a profile hits its limit?"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "I think the existing profile manager ui is fine. It has a set priority profile. Maybe it just now sets the \"in use\" profile"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "Good \u2014 so the UI stays the same, just the label/concept shifts from \"priority\" to \"in use.\"\n\n**Round 3:**\n\nThe mechanics: when you click \"set as in-use profile\" on a profile, what should actually happen on disk? You mentioned credentials file + user file \u2014 do you know if it's:\n\n- **Copy** those files from the selected profile's config dir into a \"main\" shared location that devcontainers mount?\n- **Symlink** the shared location to point at the selected profile's dir?\n- Or something else entirely?\n\nAnd is the current behavior \u2014 where the priority profile name gets injected into terminal commands as `${priority_credential}` \u2014 something that goes away entirely, or does it stay for backward compat?"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "copy is probably safer. Also keep warm probes is the idea that if we autha profile and do not use it, it will go stale and require re auth. I'm not sure what the window is. But probes run on a scheudle anyways I think that behaviour just stays unchanged. But this in use profile should be separate from the tracked profiles (we don't want to override any of the tracked profiles). It also shouldn't behave like the existing tracked profiles (it doesn't show up in profile manager) becaues its only purpose is for this swapping behaviour."
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "Good \u2014 so the \"in-use\" slot is a dedicated staging location (not one of the tracked profiles), and copying into it is what makes the swap happen.\n\n**Round 4:**\n\nRight now `${priority_credential}` gets injected into terminal `cmd` strings \u2014 that's how new terminals know which profile to authenticate with. With this new model, does that mechanism go away entirely? Since all terminals would now mount the shared \"in-use\" volume, there's nothing to inject \u2014 they'd just pick up whatever's in that volume automatically?\n\nAnd one more: when you copy files from a tracked profile into the in-use slot, does that replace the in-use slot completely (full copy of the config dir)? Or just the specific credential + user JSON files?"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "no need for priority credential injection"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "That simplifies things significantly \u2014 no injection, no placeholder, just mount the in-use volume.\n\n**Round 5:**\n\nTwo quick final things:\n\n1. When you copy into the in-use slot \u2014 is it just the credential + user JSON files, or the entire profile config dir? (Knowing this matters for the implementation spec.)\n\n2. What does \"done\" look like to you? I'm imagining: you open Profile Manager, see Profile B has quota remaining, click \"Set as in-use,\" and then any new devcontainer terminal you open is authenticated as Profile B's account \u2014 is that the success scenario?"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "no need for the entire profile dir. This also simplifies our session history management as all of it will be tracked in the main/in use profile. It would also have all skills too. \n\nsuccess  \n\n1. start canvas, main profile already has creds (from previous session) \n2. startup cards reference main profile (if this is first startup with no profile for now just have cards that use main profile error with retry, we can also determine main profile required cards via interaction with priority profile. Eg. canvas claude uses priority profile so it \"requires\" main profile now. ) \n3.  Fucntions that referenced priority profile now reference the main profile, which shoudl also be the same directory in the volume (we simply copy over credits when we switch) \n4. when we switch, it changes the volume main profile. All existing terminals on their next api send will automatically use the new credentials. Minor transient errors are okay (eg if 1% of swaps cause active sessions to error thats fine)."
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "I think I have a complete picture. Here's what I'll hand off to the spec:\n\n**Job statement:** When I see a Claude profile hitting its usage limit, I want to switch the active account with a single click, so I can keep working across all devcontainer terminals without manual re-auth or disruption.\n\n**Core behavioral intent:** The \"priority profile\" concept is replaced by a \"main profile\" \u2014 a dedicated config dir (volume mount) that all terminals and canvas cards reference. Switching the in-use profile copies just the credentials + user JSON from a tracked profile into that main slot. Existing terminals pick up new creds on their next API call. Session history and skills accumulate naturally in the main profile dir.\n\n**Key hidden assumptions:**\n- Main profile dir is a separate persistent location, not one of the tracked profiles, and doesn't appear in Profile Manager\n- `${priority_credential}` injection is removed entirely \u2014 functions that referenced it now reference the main profile dir directly\n- On first startup with no main profile: cards that require it error with retry (not silent failure)\n- Canvas Claude \"requires\" main profile (inherits from old priority profile dependency)\n- Probing of tracked profiles stays unchanged (keep-warm)\n\n**Done looks like:**\n1. Canvas starts \u2192 main profile already authenticated from prior session\n2. Startup cards use main profile; if absent, error + retry UI\n3. All priority_profile references replaced with main profile dir\n4. Clicking \"Set as in-use\" on a tracked profile \u2192 copies creds \u2192 next API call from any terminal uses new account; minor transient errors acceptable\n\n**Out of scope:** Copying the full profile config dir; managing main profile in Profile Manager; making swaps atomic/zero-disruption.\n\nDoes this capture it accurately, or anything to correct?"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "yes this is good"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "Writing the intent summary now, then spawning the Spec agent."
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "Now spawning the Spec agent."
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "Spec looks solid. Let me read it and post to GitHub."
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "That's a thorough spec. Now posting to GitHub as a new issue."
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "## refine-issue complete\n\n**Input:** Free-form description \u2014 simplify priority profile to main profile\n**Intent summary:** `.claude-work/INTENT_main-profile-simplification-freeform.md`\n**Issue:** https://github.com/hyang0129/supreme-claudemander/issues/163\n**Search coverage:** 23 Python files + 1 HTML + 4 devcontainer files + 4 dev presets + 10 test files \u2014 confidence: high\n\n**Entry points identified:** 7\n**Surface area:** 30 components (including tests and dev presets)\n\nKey finding: the file-copy logic on \"Set as in-use\" is entirely net-new code \u2014 nothing like it exists today. Also flagged: existing saved blueprints using `get_priority_profile` will break silently after the rename unless a deprecated alias is kept (Clarifying Question #3 in the issue)."
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "Main profile path \u2014 fixed string or config key? The intent says /profiles/main is the main slot, but should this be a hardcoded constant (e.g. MAIN_PROFILE_NAME = \"main\") or a configurable key in config.json? A hardcoded constant simplifies every code path; a config key allows flexibility but adds another setting to manage.\n\nhmm config.json \n\nWhich files exactly are copied on swap? The intent says \"credentials + user JSON files.\" In the Claude CLI, this is typically credentials.json (auth token) and .claude.json (user/project settings). Confirm this list \u2014 are there other files (e.g. settings.json) that must also be copied, or does copying just those two files produce a working authenticated session?\n\nwell we don't want to copy settings. Its purely a credential copy. All other components shoudl stay the same. \n\nWhat happens to existing get_priority_profile blueprint steps saved on disk? Should the server return a clear \"action removed/renamed\" error for old blueprints, or should get_priority_profile be kept as a deprecated alias for get_main_profile with a warning? This affects whether existing user blueprints silently break.\n\nhmm raise an error if they are called I guess? Create a followup stub issue about this to be refined later. \n\nWhere does the main profile live in the Windows-side (non-devcontainer) setup? In the devcontainer setup the claude-profiles volume is mounted at /profiles and the main slot would be /profiles/main. For users running the server natively on Windows (with ~/.claude-profiles bind-mounted into the util container), does the main slot become /profiles/main inside the container and ~/.claude-profiles/main on the host?\n\nHmm I think we just don't do windows side since windows can just WSL into volume anyways. \n\nError state for \"no main profile\" \u2014 which cards are affected? The intent identifies Canvas Claude cards. Are startup script cards (e.g. util-terminal) also expected to show the error state, or only cards that explicitly launch claude with CLAUDE_CONFIG_DIR?\n\nonly cards that use the priority  profile. Cards (eg. probe service card) are tied to their own profile, not the priority so they stay unchanged."
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "Posting the answers to the issue and creating the stub follow-up."
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "Done.\n\n- Answers posted to https://github.com/hyang0129/supreme-claudemander/issues/163\n- Stub follow-up filed at https://github.com/hyang0129/supreme-claudemander/issues/164 (blueprint migration path for old `get_priority_profile` steps)\n\nIssue #163 is ready to hand to `/resolve-issue`."
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": "<command-message>resolve-issue</command-message>\n<command-name>/resolve-issue</command-name>"
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "# Resolve Issue\n\n## Purpose\n\nOrchestrator only. Sequences `/fix-issue`, `/review-fix`, and `/rebase` as isolated subagents with fresh context windows.\n\n**This command never reads files, never runs git commands, and never writes code.**\nIts sole job is to pass structured handoff data between the three phases.\n\nRunning each phase in a separate subagent prevents the context accumulation that causes poor\nhandoff adherence when all three phases run in a single growing conversation.\n\n---\n\n## Args\n\nSame as `/fix-issue`: `/resolve-issue <issue> [tier] [--worktree] [--base <branch>]`\n\nAll arguments are forwarded verbatim to the fix-issue subagent.\n\n---\n\n## Step 1 \u2014 fix-issue phase\n\nSpawn an Agent subagent (`model: \"claude-opus-4-6\"`) to run the fix-issue skill with the provided arguments.\n\nAppend these instructions to the subagent prompt:\n\n> After presenting the Final Summary, **stop immediately**. Do not invoke `/review-fix` or any\n> other command \u2014 the orchestrator handles sequencing. Return the following block as the very\n> last thing in your output:\n>\n> ```\n> HANDOFF\n> WORK_DIR=<absolute path \u2014 WORK_DIR value set during branch creation>\n> BRANCH=<branch name, e.g. fix/issue-42-short-slug>\n> PR_URL=<full GitHub PR URL, or empty if PR creation failed>\n> PR_NUMBER=<integer, or empty if PR creation failed>\n> REPO=<owner/repo>\n> SUCCESS=<true|false>\n> FAILURE_REASON=<empty if SUCCESS=true, otherwise a one-line description>\n> END_HANDOFF\n> ```\n\nWait for the subagent to complete. Parse the `HANDOFF` block from its output.\n\n**Gate**: if `SUCCESS=false`, stop here. Report `FAILURE_REASON` to the user. Do not proceed to Step 2.\n\n---\n\n## Step 2 \u2014 review-fix phase\n\nSpawn an Agent subagent (`model: \"claude-opus-4-6\"`) to run the review-fix skill:\n\n```\n/review-fix <WORK_DIR> <BRANCH>\n```\n\nAppend these instructions to the subagent prompt:\n\n> After presenting the Human Review Summary and posting the PR comment with the\n> `<!-- review-fix-summary -->` sentinel, **stop immediately**. Do not invoke `/rebase` \u2014\n> the orchestrator handles sequencing. Return the following block as the very last thing\n> in your output:\n>\n> ```\n> HANDOFF\n> SUCCESS=<true|false>\n> BLOCKERS=<\"none\" | brief one-line description of each blocker, semicolon-separated>\n> FAILURE_REASON=<empty if SUCCESS=true, otherwise a one-line description>\n> END_HANDOFF\n> ```\n>\n> Blockers that prevent /rebase from running:\n> - Any batch failed its tests and was not committed\n> - The final push failed\n> - The intent validator found high-risk findings that were not resolved\n\nWait for the subagent to complete. Parse the `HANDOFF` block from its output.\n\n**Gate**: if `SUCCESS=false` or `BLOCKERS` is not `none`, stop here. Report the blockers to\nthe user. Do not proceed to Step 3.\n\n---\n\n## Step 3 \u2014 rebase phase\n\nSpawn an Agent subagent (`model: \"claude-opus-4-6\"`) to run the rebase skill:\n\n```\n/rebase <BRANCH>\n```\n\nNo additional instructions needed \u2014 rebase runs to its own terminal state (READY or BLOCKER)\nand reports to the user directly.\n\nWait for the subagent to complete. Relay its terminal state to the user.\n\n---\n\n## Final report\n\nPresent to the user:\n\n```\n## resolve-issue complete: #<number> <title>\n\nPhase 1 \u2014 fix-issue:  \u2713 PR #<PR_NUMBER> created (<PR_URL>)\nPhase 2 \u2014 review-fix: \u2713 <N> findings addressed, <N> cycles\nPhase 3 \u2014 rebase:     <READY \u2713 | BLOCKER \u2717 \u2014 see above>\n\nBranch: <BRANCH>\nPR: <PR_URL>\n```\n\n---\n\n## Constraints\n\n- This orchestrator never touches files, git, or GitHub directly.\n- Each subagent runs in an isolated context \u2014 do not summarize or repeat the subagents' internal work beyond what is needed for the final report.\n- If any phase fails, stop immediately and report to the user. Do not attempt to continue or retry automatically.\n- The subagents handle all error reporting within their phases. Only the `HANDOFF` gate conditions (SUCCESS, BLOCKERS) determine whether to proceed.\n- Never pass `--admin` or bypass branch protection at any phase.\n"
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "[Request interrupted by user]"
+      }
+    ]
+  }
+]

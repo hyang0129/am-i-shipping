@@ -141,7 +141,7 @@ class TestSynthesisConfig:
         cfg = load_config(cfg_path)
 
         assert cfg.synthesis.anthropic_api_key_env == "ANTHROPIC_API_KEY"
-        assert cfg.synthesis.model == "claude-sonnet-4-5"
+        assert cfg.synthesis.model == "claude-sonnet-4-6"
         assert cfg.synthesis.output_dir == "retrospectives"
         assert cfg.synthesis.week_start == "monday"
         assert cfg.synthesis.abandonment_days == 14
@@ -215,7 +215,7 @@ class TestSynthesisConfig:
         assert cfg.synthesis.outlier_sigma == 3.5
         # Other fields remain at defaults.
         assert cfg.synthesis.abandonment_days == 14
-        assert cfg.synthesis.model == "claude-sonnet-4-5"
+        assert cfg.synthesis.model == "claude-sonnet-4-6"
 
     def test_synthesis_config_model_override(self, tmp_path):
         """Solo override of `model` exercises the str-cast branch in isolation."""
@@ -237,7 +237,7 @@ class TestSynthesisConfig:
         })
         cfg = load_config(cfg_path)
         assert cfg.synthesis.output_dir == "weekly-retros"
-        assert cfg.synthesis.model == "claude-sonnet-4-5"
+        assert cfg.synthesis.model == "claude-sonnet-4-6"
 
 
 class TestSynthesisOutputPath:

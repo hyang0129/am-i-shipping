@@ -100,7 +100,7 @@ synthesis:
   anthropic_api_key_env: "ANTHROPIC_API_KEY"
 
   # Anthropic model used for the weekly retrospective call.
-  model: "claude-sonnet-4-5"
+  model: "claude-sonnet-4-6"
 
   # model used for per-unit summarization (default: claude-haiku-4-5)
   # summary_model: claude-haiku-4-5
