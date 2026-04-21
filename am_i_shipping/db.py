@@ -504,6 +504,47 @@ EXPECTED_EXPECTATIONS_TABLES: dict[str, set[str]] = {
 }
 
 
+# Issue #86: skill invocations captured from Claude Code session transcripts.
+# One row per ``<command-name>/xxx</command-name>`` tag observed in a user-turn
+# content block. Populated by ``collector/session_parser.py`` BEFORE content-
+# block stripping — the tags appear in user message text, not in tool_use
+# blocks. ``target_repo`` / ``target_ref`` are resolved from co-occurring
+# ``session_gh_events`` rows when possible; NULL when the session did not
+# interact with any GitHub URL/repo within the same session.
+SYNTHESIS_SKILL_INVOCATIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS skill_invocations (
+    session_uuid TEXT NOT NULL,
+    skill_name   TEXT NOT NULL,
+    invoked_at   TEXT,
+    target_repo  TEXT,
+    target_ref   TEXT,
+    invocation_index INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_uuid, skill_name, invocation_index)
+);
+"""
+
+SYNTHESIS_SKILL_INVOCATIONS_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_skill_invocations_session_skill "
+    "ON skill_invocations (session_uuid, skill_name);"
+)
+
+# Issue #86: review-fix cycle events — one row per PR that ran ``/review-fix``
+# (identified by the ``<!-- review-fix-summary -->`` marker in comments_json).
+# Represents the review-fix cycle as a single unit rather than leaking
+# ``push_count`` into ``review_cycles``. ``fix_commit_count`` is the number
+# of commits authored after the summary comment was posted and before PR
+# merge — a coarse but cheap proxy for "how many fixes landed in this cycle".
+SYNTHESIS_PR_REVIEW_FIX_EVENTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pr_review_fix_events (
+    repo               TEXT NOT NULL,
+    pr_number          INTEGER NOT NULL,
+    summary_comment_id INTEGER,
+    posted_at          TEXT,
+    fix_commit_count   INTEGER DEFAULT 0,
+    PRIMARY KEY (repo, pr_number)
+);
+"""
+
 SYNTHESIS_SESSION_GH_EVENTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS session_gh_events (
     session_uuid  TEXT NOT NULL,
@@ -712,6 +753,22 @@ EXPECTED_GITHUB_TABLES: dict[str, set[str]] = {
         "fraction",
         "phase",
     },
+    # Issue #86 additions
+    "skill_invocations": {
+        "session_uuid",
+        "skill_name",
+        "invoked_at",
+        "target_repo",
+        "target_ref",
+        "invocation_index",
+    },
+    "pr_review_fix_events": {
+        "repo",
+        "pr_number",
+        "summary_comment_id",
+        "posted_at",
+        "fix_commit_count",
+    },
 }
 
 EXPECTED_APPSWITCH_TABLES: dict[str, set[str]] = {
@@ -841,6 +898,10 @@ def init_github_db(db_path: Path) -> None:
         conn.execute(SYNTHESIS_UNIT_SUMMARIES_SCHEMA)
         conn.execute(SYNTHESIS_SESSION_GH_EVENTS_SCHEMA)
         conn.execute(SYNTHESIS_SESSION_ISSUE_ATTRIBUTION_SCHEMA)
+        # Issue #86 — skill workflow as first-class signal.
+        conn.execute(SYNTHESIS_SKILL_INVOCATIONS_SCHEMA)
+        conn.execute(SYNTHESIS_SKILL_INVOCATIONS_INDEX)
+        conn.execute(SYNTHESIS_PR_REVIEW_FIX_EVENTS_SCHEMA)
         # Purge stale bridging edges from prior runs so they don't leak into
         # component computations. graph_edges may not exist on very first init
         # (all CREATE TABLEs above run first, so this is safe after them).
