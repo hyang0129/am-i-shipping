@@ -25,7 +25,7 @@ def _make_cfg(**overrides) -> SynthesisConfig:
     """Return a minimal SynthesisConfig for routing tests."""
     base = SynthesisConfig(
         anthropic_api_key_env="ANTHROPIC_API_KEY",
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-4-6",
         summary_model="claude-haiku-4-5",
         output_dir="retrospectives",
         week_start="monday",

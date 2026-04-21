@@ -515,7 +515,7 @@ def run(
                     result = adapter.call(
                         _GAP_SYSTEM_PROMPT,
                         user_text,
-                        config.model if config else "claude-sonnet-4-5",
+                        config.model if config else "claude-sonnet-4-6",
                         _MAX_OUTPUT_TOKENS,
                     )
                     parsed = _parse_llm_response(result.text)

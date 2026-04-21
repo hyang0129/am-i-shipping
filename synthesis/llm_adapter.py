@@ -152,6 +152,21 @@ def _version_sort_key(path: str) -> tuple[int, ...]:
     return (0,)
 
 
+def _auto_discover_claude_linux() -> str | None:
+    """Search known install locations for the claude binary on Linux/WSL."""
+    home = os.path.expanduser("~")
+    candidates = [
+        f"{home}/.vscode-server/extensions/anthropic.claude-code-*/resources/native-binary/claude",
+        f"{home}/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude",
+        f"{home}/.vscode-server/extensions/anthropic.claude-code-*/node_modules/.bin/claude",
+    ]
+    for pattern in candidates:
+        matches = sorted(glob.glob(pattern), key=_version_sort_key)
+        if matches and os.path.isfile(matches[-1]):
+            return matches[-1]
+    return None
+
+
 def resolve_cli_path(raw: str) -> str:
     """Expand a glob pattern and return the highest-versioned match."""
     if any(c in raw for c in ("*", "?", "[")):
@@ -204,7 +219,7 @@ def _claude_cmd() -> str:
                     "and 'claude' was not found on PATH."
                 )
             return resolve_cli_path(linux_explicit)
-        return shutil.which("claude") or "claude"
+        return shutil.which("claude") or _auto_discover_claude_linux() or "claude"
 
     explicit = os.environ.get("CLAUDE_CLI_PATH")
     if explicit:

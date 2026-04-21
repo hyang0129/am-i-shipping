@@ -26,7 +26,7 @@ def _make_synthesis_config(**overrides) -> SynthesisConfig:
     """Return a SynthesisConfig suitable for offline tests."""
     base = SynthesisConfig(
         anthropic_api_key_env="ANTHROPIC_API_KEY",
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-4-6",
         summary_model="claude-haiku-4-5",
         output_dir="retrospectives",
         week_start="monday",

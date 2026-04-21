@@ -107,6 +107,15 @@ CREATE TABLE IF NOT EXISTS pr_sessions (
 );
 """
 
+GITHUB_ISSUE_SESSIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS issue_sessions (
+    repo            TEXT NOT NULL,
+    issue_number    INTEGER NOT NULL,
+    session_uuid    TEXT NOT NULL,
+    PRIMARY KEY (repo, issue_number, session_uuid)
+);
+"""
+
 GITHUB_CURSOR_SCHEMA = """
 CREATE TABLE IF NOT EXISTS poll_cursor (
     repo            TEXT PRIMARY KEY,
@@ -613,6 +622,7 @@ EXPECTED_GITHUB_TABLES: dict[str, set[str]] = {
     },
     "pr_issues": {"repo", "pr_number", "issue_number"},
     "pr_sessions": {"repo", "pr_number", "session_uuid"},
+    "issue_sessions": {"repo", "issue_number", "session_uuid"},
     "poll_cursor": {"repo", "last_polled_at"},
     "issue_body_edits": {
         "repo",
@@ -816,6 +826,7 @@ def init_github_db(db_path: Path) -> None:
         conn.execute(GITHUB_PRS_SCHEMA)
         conn.execute(GITHUB_PR_ISSUES_SCHEMA)
         conn.execute(GITHUB_PR_SESSIONS_SCHEMA)
+        conn.execute(GITHUB_ISSUE_SESSIONS_SCHEMA)
         conn.execute(GITHUB_CURSOR_SCHEMA)
         conn.execute(GITHUB_ISSUE_BODY_EDITS_SCHEMA)
         conn.execute(GITHUB_ISSUE_COMMENT_EDITS_SCHEMA)
