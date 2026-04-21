@@ -267,6 +267,77 @@ def _surrounding_user_text(
 # ---------------------------------------------------------------------------
 
 
+# Issue #86: refined-spec grounding. When a session attached to a unit invoked
+# ``/refine-issue`` against a specific issue, the current ``issues.body`` is
+# the refined spec (the skill edits the body in place after producing the
+# refined structure). Surfacing that body as explicit context to the classifier
+# fixes a latent bug where ``expected_scope`` was grounded in the session's
+# raw user prompt prose ("fix the thing") rather than the post-refinement
+# structured intent.
+def _refined_issue_body_for_unit(
+    gh_conn: sqlite3.Connection,
+    session_uuids: List[str],
+    root_node_id: str,
+    root_node_type: str,
+) -> Optional[Tuple[str, str, int]]:
+    """Return ``(repo, issue_number, body)`` for the refined issue, or None.
+
+    Checks the unit's sessions for a ``skill_invocations`` row with
+    ``skill_name='refine-issue'``. When one is found with a resolved
+    ``target_repo`` / ``target_ref``, loads the current ``issues.body`` (the
+    post-refinement text). Falls back to the unit's root node when the root
+    is an issue and the skill row has no resolved target — this handles the
+    common case where ``/refine-issue`` was invoked implicitly on the issue
+    the unit is rooted on.
+
+    Returns ``None`` when no ``/refine-issue`` signal is present for the
+    unit, or when the ``skill_invocations`` table does not exist yet (legacy
+    DBs before Issue #86).
+    """
+    if not session_uuids:
+        return None
+    try:
+        placeholders = ",".join("?" * len(session_uuids))
+        row = gh_conn.execute(
+            f"SELECT target_repo, target_ref FROM skill_invocations "
+            f"WHERE skill_name = 'refine-issue' "
+            f"  AND session_uuid IN ({placeholders}) "
+            f"ORDER BY invoked_at ASC LIMIT 1",
+            session_uuids,
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+
+    target_repo, target_ref = row
+    # Fallback: if the skill row did not resolve its target, use the unit's
+    # root issue. graph nodes encode issues as ``root_node_id`` that refers
+    # back to graph_nodes.node_ref in the form ``repo#number``.
+    if (not target_repo or not target_ref) and root_node_type == "issue":
+        node_row = gh_conn.execute(
+            "SELECT node_ref FROM graph_nodes WHERE node_id = ? LIMIT 1",
+            (root_node_id,),
+        ).fetchone()
+        if node_row and node_row[0] and "#" in node_row[0]:
+            target_repo, _, target_ref = node_row[0].rpartition("#")
+
+    if not target_repo or not target_ref:
+        return None
+    try:
+        issue_number = int(target_ref)
+    except (TypeError, ValueError):
+        return None
+
+    body_row = gh_conn.execute(
+        "SELECT body FROM issues WHERE repo = ? AND issue_number = ?",
+        (target_repo, issue_number),
+    ).fetchone()
+    if body_row is None or not body_row[0]:
+        return None
+    return target_repo, str(issue_number), body_row[0]
+
+
 def _build_unit_input(
     gh_conn: sqlite3.Connection,
     sessions_conn: sqlite3.Connection,
@@ -321,6 +392,22 @@ def _build_unit_input(
         f"## Structural commitment-point candidate: turn index {candidate_idx}"
     )
     parts.append("")
+
+    # Issue #86: when /refine-issue was invoked for this unit's target issue,
+    # prepend the refined issue body. The classifier should ground
+    # expected_scope in the refined spec, not the raw user prompt prose.
+    refined = _refined_issue_body_for_unit(
+        gh_conn, session_uuids, root_node_id or "", root_node_type or ""
+    )
+    if refined is not None:
+        ref_repo, ref_number, ref_body = refined
+        parts.append(
+            "### Refined issue body (post-/refine-issue — prefer this for expected_scope)"
+        )
+        parts.append(f"Source: {ref_repo}#{ref_number}")
+        parts.append(ref_body)
+        parts.append("")
+
     parts.append(
         "### All user text turns (full context — reassign the candidate if needed)"
     )
