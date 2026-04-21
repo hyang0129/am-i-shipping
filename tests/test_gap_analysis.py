@@ -254,6 +254,65 @@ class TestComputeSeverityDirection:
         assert sev == "none"
         assert direction == "match"
 
+    # F-6 tests: significant severity must key off effort_gap_ratio, not just
+    # raw reprompt counts.
+
+    def test_significant_when_ratio_exceeds_2x(self):
+        """F-6: effort_gap_ratio >= 2.0 triggers significant regardless of raw count."""
+        # 3 reprompts < 6 (old proxy threshold), but ratio = 4.0 (4x expected).
+        sev, direction = compute_severity_direction(
+            status="closed",
+            total_reprompts=3,
+            review_cycles=0,
+            elapsed_days=1.0,
+            expected_effort="1 session",
+            expected_outcome="shipped",
+            skip_reason=None,
+            effort_gap_ratio=4.0,
+        )
+        assert sev == "significant"
+        assert direction == "over"
+
+    def test_not_significant_when_ratio_under_2x_and_low_reprompts(self):
+        """F-6: 4 reprompts against expected=3 sessions is NOT significant.
+
+        expected_effort='3 sessions' → expected_sessions=3.
+        actual_sessions = 4+1 = 5, ratio = 5/3 ≈ 1.67 (< 2.0).
+        reprompts=4 < 6, review_cycles=0 < 3.
+        Should land at 'minor', not 'significant'.
+        """
+        sev, direction = compute_severity_direction(
+            status="closed",
+            total_reprompts=4,
+            review_cycles=0,
+            elapsed_days=2.0,
+            expected_effort="3 sessions",
+            expected_outcome="shipped",
+            skip_reason=None,
+            effort_gap_ratio=round(5 / 3, 4),  # ≈ 1.6667
+        )
+        # 4 reprompts triggers 'minor' (>= 4), but ratio < 2.0 so NOT significant.
+        assert sev == "minor"
+        assert sev != "significant", (
+            "F-6: 4 reprompts against 3-session expectation (ratio≈1.67) "
+            "must NOT be significant"
+        )
+
+    def test_significant_proxy_used_when_ratio_is_none(self):
+        """F-6: falls back to reprompts >= 6 proxy when ratio unavailable."""
+        sev, direction = compute_severity_direction(
+            status="closed",
+            total_reprompts=6,
+            review_cycles=0,
+            elapsed_days=1.0,
+            expected_effort=None,
+            expected_outcome="shipped",
+            skip_reason=None,
+            effort_gap_ratio=None,  # unit row missing — no ratio
+        )
+        assert sev == "significant"
+        assert direction == "over"
+
 
 # ---------------------------------------------------------------------------
 # AS-2, AS-3, AS-4: gap pass produces one row per expectation with valid enums
@@ -449,6 +508,62 @@ class TestAutoConfirmSweep:
         by_uid = {r[0]: r[1] for r in rows}
         assert by_uid["u_old"] == 1, "old row should be auto-confirmed"
         assert by_uid["u_young"] == 0, "young row should be untouched"
+
+    def test_rerun_preserves_auto_confirmed_flag(self, tmp_path: Path):
+        """F-2 regression: re-running gap_analysis must NOT reset auto_confirmed=1.
+
+        Scenario:
+        1. Seed a gap row with computed_at 15 days ago.
+        2. Run gap_analysis.run once — the auto-confirm sweep flips it to 1.
+        3. Run gap_analysis.run a SECOND time on the same week.
+        4. Assert auto_confirmed is still 1 (not silently reset to 0).
+        """
+        gh, exp = _init_dbs(tmp_path)
+        _seed_unit(gh, unit_id="u_reg", total_reprompts=0, review_cycles=0)
+        _seed_expectation(exp, unit_id="u_reg")
+
+        # First run: row gets computed_at = now, auto_confirmed = 0.
+        gap_analysis.run(
+            WEEK_START, github_db=str(gh), expectations_db=str(exp),
+            config=_make_config(),
+        )
+
+        # Back-date computed_at to 15 days ago so the sweep will flip it.
+        old_ts = (
+            datetime.now(timezone.utc) - timedelta(days=15)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        conn = sqlite3.connect(str(exp))
+        try:
+            conn.execute(
+                "UPDATE expectation_gaps SET computed_at = ? "
+                "WHERE unit_id = 'u_reg'",
+                (old_ts,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Second run: sweep runs inside gap_analysis.run and should flip
+        # auto_confirmed=1 for the back-dated row. The subsequent re-insert
+        # must preserve that flag (F-2 fix).
+        gap_analysis.run(
+            WEEK_START, github_db=str(gh), expectations_db=str(exp),
+            config=_make_config(),
+        )
+
+        conn = sqlite3.connect(str(exp))
+        try:
+            row = conn.execute(
+                "SELECT auto_confirmed FROM expectation_gaps "
+                "WHERE unit_id = 'u_reg'",
+            ).fetchone()
+        finally:
+            conn.close()
+
+        assert row is not None
+        assert row[0] == 1, (
+            "F-2 regression: auto_confirmed was reset to 0 on second run"
+        )
 
 
 # ---------------------------------------------------------------------------

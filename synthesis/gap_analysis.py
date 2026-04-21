@@ -122,6 +122,7 @@ def compute_severity_direction(
     expected_effort: Optional[str],
     expected_outcome: Optional[str],
     skip_reason: Optional[str],
+    effort_gap_ratio: Optional[float] = None,
 ) -> Tuple[str, str]:
     """Return ``(severity, direction)`` from actual-outcome metrics.
 
@@ -139,12 +140,26 @@ def compute_severity_direction(
     * ``total_reprompts >= 10`` or ``review_cycles >= 5`` → severity
       ``major``, direction ``over`` (the user had to intervene far
       more than expected).
+    * ``effort_gap_ratio >= 2.0`` (actual exceeded 2x expected effort,
+      per AC criterion 4) OR ``review_cycles >= 3`` → severity
+      ``significant``, direction ``over``. When ``effort_gap_ratio`` is
+      not available, falls back to ``reprompts >= 6`` as a proxy.
     * ``total_reprompts >= 4`` or ``review_cycles >= 2`` → severity
       ``minor``, direction ``over``.
     * Otherwise → severity ``none``, direction ``match``.
 
     The thresholds are intentionally coarse — the epic's "ship skeleton
     over plan to perfection" decision prior. Tune from X-4 corrections.
+
+    Parameters
+    ----------
+    effort_gap_ratio:
+        Pre-computed ratio of actual to expected effort sessions
+        (``actual_sessions / expected_sessions``), as returned by
+        ``_compute_effort_gap_ratio``. When provided, the ``significant``
+        threshold is keyed off the ratio (>=2.0 means "exceeded 2x
+        expected effort" per the AC rubric). When ``None`` the legacy
+        reprompt-count proxy (``reprompts >= 6``) is used.
     """
     if skip_reason:
         return "none", "ambiguous"
@@ -158,10 +173,17 @@ def compute_severity_direction(
 
     if reprompts >= 10 or reviews >= 5:
         return "major", "over"
-    # "significant" — actual exceeded 2x expected effort (AC criterion 4):
-    # moderate-to-high reprompt load that indicates a clear 2x effort overrun
-    # without reaching the full multi-facet threshold of "major".
-    if reprompts >= 6 or reviews >= 3:
+    # "significant" — actual exceeded 2x expected effort (AC criterion 4).
+    # Primary signal: effort_gap_ratio >= 2.0 (uses the parsed expected
+    # session count from expected_effort text via _compute_effort_gap_ratio).
+    # Fallback: reprompts >= 6 when ratio is unavailable (unit row missing).
+    significant_by_ratio = (
+        effort_gap_ratio is not None and effort_gap_ratio >= 2.0
+    )
+    significant_by_proxy = (
+        effort_gap_ratio is None and reprompts >= 6
+    )
+    if significant_by_ratio or significant_by_proxy or reviews >= 3:
         return "significant", "over"
     if reprompts >= 4 or reviews >= 2:
         return "minor", "over"
@@ -328,6 +350,23 @@ def _load_unit_summaries(
     return {r[0]: r[1] for r in rows}
 
 
+def _load_auto_confirmed_map(
+    exp_conn: sqlite3.Connection, week_start: str
+) -> Dict[str, int]:
+    """Return a mapping of unit_id -> auto_confirmed for existing gap rows.
+
+    Called immediately before ``_replace_gap_rows`` so the delete does not
+    lose previously auto-confirmed state (F-2 fix: preserve ``auto_confirmed``
+    across re-runs).
+    """
+    rows = exp_conn.execute(
+        "SELECT unit_id, auto_confirmed FROM expectation_gaps "
+        "WHERE week_start = ?",
+        (week_start,),
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
 def _replace_gap_rows(
     exp_conn: sqlite3.Connection, week_start: str
 ) -> None:
@@ -351,13 +390,14 @@ def _insert_gap_row(
     severity: str,
     direction: str,
     failure_precondition: Optional[str],
+    auto_confirmed: int = 0,
 ) -> None:
     exp_conn.execute(
         "INSERT OR REPLACE INTO expectation_gaps "
         "(week_start, unit_id, commitment_point, scope_gap, effort_gap, "
         " effort_gap_ratio, outcome_gap, severity, direction, "
         " failure_precondition, computed_at, auto_confirmed) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), 0)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)",
         (
             week_start,
             unit_id,
@@ -369,6 +409,7 @@ def _insert_gap_row(
             severity,
             direction,
             failure_precondition,
+            auto_confirmed,
         ),
     )
 
@@ -463,6 +504,16 @@ def run(
         units_by_id = _load_units_by_id(gh_conn, week_start)
         summaries = _load_unit_summaries(gh_conn, week_start)
 
+        # F-2 fix: run the auto-confirm sweep BEFORE snapshotting so that any
+        # rows that aged past the 14-day window are already flipped to 1 when
+        # we read the snapshot. This preserves auto_confirmed=1 across re-runs
+        # rather than silently resetting it to 0 on each invocation.
+        _auto_confirm_sweep(exp_conn)
+
+        # Snapshot auto_confirmed after the sweep so the preserved map already
+        # reflects any newly-confirmed rows.
+        prior_auto_confirmed = _load_auto_confirmed_map(exp_conn, week_start)
+
         _replace_gap_rows(exp_conn, week_start)
 
         # Select adapter lazily: offline mode uses the heuristic only and
@@ -485,6 +536,15 @@ def run(
             unit = units_by_id.get(unit_id, {})
             summary = summaries.get(unit_id)
 
+            # Compute the numeric effort ratio unconditionally — it is a
+            # pure function of the units row and the expectation, independent
+            # of whether the LLM is available. We need it here (before the
+            # heuristic call) so F-6: effort_gap_ratio is passed into
+            # compute_severity_direction.
+            effort_gap_ratio: Optional[float] = _compute_effort_gap_ratio(
+                unit, exp
+            )
+
             base_severity, base_direction = compute_severity_direction(
                 status=unit.get("status"),
                 total_reprompts=unit.get("total_reprompts"),
@@ -493,6 +553,7 @@ def run(
                 expected_effort=exp.get("expected_effort"),
                 expected_outcome=exp.get("expected_outcome"),
                 skip_reason=exp.get("skip_reason"),
+                effort_gap_ratio=effort_gap_ratio,
             )
 
             severity = base_severity
@@ -501,13 +562,6 @@ def run(
             effort_gap_text: Optional[str] = None
             outcome_gap_text: Optional[str] = None
             failure_precondition: Optional[str] = None
-
-            # Compute the numeric effort ratio unconditionally — it is a
-            # pure function of the units row and the expectation, independent
-            # of whether the LLM is available.
-            effort_gap_ratio: Optional[float] = _compute_effort_gap_ratio(
-                unit, exp
-            )
 
             if adapter is not None:
                 user_text = _build_unit_input(exp, unit, summary)
@@ -560,6 +614,11 @@ def run(
                     severity, direction, unit
                 )
 
+            # F-2 fix: restore auto_confirmed from the pre-delete snapshot so
+            # that re-running gap_analysis does not silently un-confirm rows
+            # that were previously auto-confirmed by the sweep.
+            preserved_auto_confirmed = prior_auto_confirmed.get(unit_id, 0)
+
             _insert_gap_row(
                 exp_conn,
                 week_start=week_start,
@@ -572,13 +631,15 @@ def run(
                 severity=severity,
                 direction=direction,
                 failure_precondition=failure_precondition,
+                auto_confirmed=preserved_auto_confirmed,
             )
             written += 1
 
         exp_conn.commit()
 
-        # Auto-confirm sweep — on every run, regardless of whether new
-        # rows were written.
+        # Second sweep pass — catches any rows from other weeks that aged past
+        # the cutoff since the first sweep (run pre-snapshot above). Also a
+        # no-op for the rows we just inserted (computed_at=now). Idempotent.
         swept = _auto_confirm_sweep(exp_conn)
 
         logger.info(

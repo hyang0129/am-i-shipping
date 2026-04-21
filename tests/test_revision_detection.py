@@ -414,6 +414,80 @@ class TestPipelineRun:
         assert written == 0
         assert load_revision_rows(str(exp), WEEK_START) == []
 
+    def test_issue_rooted_unit_via_session_issue_attribution(self, tmp_path: Path):
+        """Regression: issue-rooted units whose sessions are linked only via
+        session_issue_attribution (not graph_edges) must still have revisions
+        detected when a reprompt is present.
+
+        This exercises the fallback path added to _load_unit_sessions in X-3,
+        mirroring the equivalent fallback already present in X-1's _build_unit_input.
+        """
+        gh, sess, exp = _init_dbs(tmp_path)
+
+        repo = "myorg/myrepo"
+        issue_number = 42
+        root_node_id = f"issue:{repo}#{issue_number}"
+        session_uuid = "session-issue-only"
+        unit_id = "u_issue"
+
+        # Seed the units row as issue-rooted, with NO graph_edges linking to
+        # any session node (this is the Shape A / issue-only topology).
+        conn = sqlite3.connect(str(gh))
+        try:
+            conn.execute(
+                "INSERT INTO units "
+                "(week_start, unit_id, root_node_type, root_node_id, "
+                " elapsed_days, dark_time_pct, total_reprompts, review_cycles, "
+                " status, outlier_flags, abandonment_flag) "
+                "VALUES (?, ?, 'issue', ?, 2.0, 0.1, 1, 0, 'open', '[]', 0)",
+                (WEEK_START, unit_id, root_node_id),
+            )
+            # Issue node only in graph_nodes — no session node in graph.
+            conn.execute(
+                "INSERT INTO graph_nodes (week_start, node_id, node_type, node_ref) "
+                "VALUES (?, ?, 'issue', ?)",
+                (WEEK_START, root_node_id, root_node_id),
+            )
+            # session_issue_attribution provides the session linkage.
+            conn.execute(
+                "INSERT INTO session_issue_attribution "
+                "(week_start, session_uuid, repo, issue_number, fraction, phase) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (WEEK_START, session_uuid, repo, issue_number, 1.0, "execution"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Seed the session with a reprompt turn.
+        _seed_session(
+            sess,
+            session_uuid=session_uuid,
+            reprompt_count=1,
+            turns=[
+                _turn("user", "text", "please implement feature X"),
+                _turn("assistant", "text", "sure, working on it"),
+                _turn("user", "text", "actually, also add unit tests"),
+            ],
+        )
+        _seed_expectation(exp, unit_id=unit_id, commitment_point="turn 0")
+
+        written = revision_detector.run(
+            WEEK_START,
+            github_db=str(gh),
+            sessions_db=str(sess),
+            expectations_db=str(exp),
+            config=_make_config(),
+        )
+        assert written >= 1, (
+            "Expected at least one revision row for issue-rooted unit whose "
+            "sessions are linked only via session_issue_attribution"
+        )
+        rows = load_revision_rows(str(exp), WEEK_START)
+        assert len(rows) >= 1
+        assert rows[0]["unit_id"] == unit_id
+        assert rows[0]["revision_trigger"] in REVISION_TRIGGER_ENUM
+
     def test_session_break_produces_row(self, tmp_path: Path):
         gh, sess, exp = _init_dbs(tmp_path)
         _seed_unit_and_graph(

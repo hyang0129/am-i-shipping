@@ -444,20 +444,20 @@ def _load_unit_sessions(
     Each dict: ``session_uuid``, ``raw_content_json``, ``reprompt_count``,
     ``session_started_at``, ``session_ended_at`` (as datetime or None).
     """
-    # Resolve the unit's component via the same graph walk used by X-1.
-    from synthesis.weekly import _unit_nodes
+    # Resolve the unit's session UUIDs via the shared helper, which handles
+    # both graph-edge linkage (PR/session-rooted units) and the
+    # session_issue_attribution fallback for issue-rooted units.
+    from synthesis.weekly import _resolve_unit_sessions
 
     row = gh_conn.execute(
-        "SELECT root_node_id FROM units WHERE week_start = ? AND unit_id = ?",
+        "SELECT root_node_id, root_node_type FROM units WHERE week_start = ? AND unit_id = ?",
         (week_start, unit_id),
     ).fetchone()
     root_node_id = row[0] if row else ""
-    component = _unit_nodes(gh_conn, week_start, root_node_id or "")
-    session_uuids = [
-        node_ref
-        for _nid, node_type, node_ref in component
-        if node_type == "session" and node_ref
-    ]
+    root_node_type = row[1] if row else ""
+    session_uuids = _resolve_unit_sessions(
+        gh_conn, week_start, root_node_id or "", root_node_type or ""
+    )
     if not session_uuids:
         return []
 

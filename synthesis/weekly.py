@@ -299,6 +299,66 @@ def _unit_nodes(
     )
 
 
+def _resolve_unit_sessions(
+    gh_conn: sqlite3.Connection,
+    week_start: str,
+    root_node_id: str,
+    root_node_type: str,
+) -> List[str]:
+    """Return session UUIDs for a unit, handling both graph-edge and issue-attribution linkage.
+
+    For PR-rooted and session-rooted units, session nodes appear as ``node_type='session'``
+    members of the graph component reachable via ``graph_edges``. For issue-rooted units,
+    session linkage lives instead in ``session_issue_attribution`` (session nodes are never
+    added to ``graph_edges`` for those units), so graph traversal yields zero sessions.
+
+    This helper replicates the fallback used by :func:`synthesis.expectations._build_unit_input`
+    so that both X-1 (expectations) and X-3 (revision_detector) resolve sessions identically.
+
+    Parameters
+    ----------
+    gh_conn:
+        Open connection to the collector DB (github.db). Must be readable.
+    week_start:
+        ``YYYY-MM-DD`` anchor matching the unit row.
+    root_node_id:
+        ``root_node_id`` from the ``units`` table (e.g. ``"issue:repo#42"``).
+    root_node_type:
+        ``root_node_type`` from the ``units`` table (e.g. ``"issue"``, ``"pr"``,
+        ``"session"``).
+
+    Returns
+    -------
+    List of session UUIDs (strings), possibly empty if no sessions are found.
+    """
+    component = _unit_nodes(gh_conn, week_start, root_node_id or "")
+    session_uuids: List[str] = [
+        node_ref
+        for _nid, node_type, node_ref in component
+        if node_type == "session" and node_ref
+    ]
+
+    # Issue-rooted units: session nodes are not in graph_edges; fall back to
+    # session_issue_attribution. Mirrors the same logic in
+    # synthesis.expectations._build_unit_input.
+    if not session_uuids and root_node_type == "issue" and root_node_id:
+        ref = root_node_id.removeprefix("issue:")
+        if "#" in ref:
+            _repo, _, _num = ref.rpartition("#")
+            try:
+                _issue_number = int(_num)
+                rows = gh_conn.execute(
+                    "SELECT session_uuid FROM session_issue_attribution "
+                    "WHERE week_start = ? AND repo = ? AND issue_number = ?",
+                    (week_start, _repo, _issue_number),
+                ).fetchall()
+                session_uuids = [r[0] for r in rows]
+            except (ValueError, sqlite3.OperationalError):
+                pass
+
+    return session_uuids
+
+
 def _load_session_transcripts(
     sessions_conn: sqlite3.Connection,
     session_uuids: List[str],
@@ -1085,6 +1145,7 @@ def run_synthesis(
 __all__ = [
     "run_synthesis",
     "water_fill_truncate",
+    "_resolve_unit_sessions",
     "TRANSCRIPT_BUDGET_BYTES",
     "MAX_UNITS_PER_PROMPT",
     "MAX_PROMPT_SOFT_WARN_BYTES",
