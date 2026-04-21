@@ -159,8 +159,7 @@ def build_few_shot_block(expectations_db: str) -> str:
 
     Auto-confirmed rows are excluded — they snapshot the original value
     unchanged and calibrating on them is the exact feared failure mode.
-    Exclusion is logged at INFO the first time the block is assembled
-    for a given run.
+    Exclusion is logged at INFO on each call.
     """
     conn = sqlite3.connect(str(expectations_db))
     try:

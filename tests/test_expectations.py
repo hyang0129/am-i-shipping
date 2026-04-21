@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import time
 import unittest.mock as mock
@@ -814,7 +815,7 @@ def test_issue_163_refine_session_includes_confirmation_turn(
     )
     # The structural candidate (interrupt / slash command) should NOT be the
     # only user turn visible to the LLM.
-    assert unit_input.count("turn ") > 3, (
+    assert len(re.findall(r"^turn \d+[:\s]", unit_input, re.MULTILINE)) >= 4, (
         "fewer turns than expected — all-user-turns expansion not working"
     )
 

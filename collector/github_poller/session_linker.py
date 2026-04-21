@@ -10,7 +10,7 @@ Using ``session_gh_events`` as the repo signal (instead of the old
 requires observed evidence that the session issued a ``gh`` command
 targeting the repo, rather than guessing from the local checkout path.
 This means local clone names (e.g. ``claude-rts`` for the GitHub repo
-``supreme-claudemander``) no longer cause missed links. See issue #83.
+``supreme-claudemander``) no longer cause missed links.
 
 When ``sessions.db`` does not exist or is empty, exits cleanly with
 zero rows inserted — it does not block the poller.

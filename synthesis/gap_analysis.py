@@ -355,7 +355,7 @@ def _load_auto_confirmed_map(
 ) -> Dict[str, int]:
     """Return a mapping of unit_id -> auto_confirmed for existing gap rows.
 
-    Called immediately before ``_replace_gap_rows`` so the delete does not
+    Called immediately before ``_delete_gap_rows_for_week`` so the delete does not
     lose previously auto-confirmed state (F-2 fix: preserve ``auto_confirmed``
     across re-runs).
     """
@@ -367,10 +367,10 @@ def _load_auto_confirmed_map(
     return {r[0]: r[1] for r in rows}
 
 
-def _replace_gap_rows(
+def _delete_gap_rows_for_week(
     exp_conn: sqlite3.Connection, week_start: str
 ) -> None:
-    """DELETE existing gap rows for the week (idempotent re-run)."""
+    """DELETE existing gap rows for the week (idempotent re-run). Caller must follow with inserts within the same transaction."""
     exp_conn.execute(
         "DELETE FROM expectation_gaps WHERE week_start = ?", (week_start,)
     )
@@ -514,7 +514,7 @@ def run(
         # reflects any newly-confirmed rows.
         prior_auto_confirmed = _load_auto_confirmed_map(exp_conn, week_start)
 
-        _replace_gap_rows(exp_conn, week_start)
+        _delete_gap_rows_for_week(exp_conn, week_start)
 
         # Select adapter lazily: offline mode uses the heuristic only and
         # never calls the LLM. Live mode calls the LLM for the facet
@@ -662,6 +662,11 @@ def _compute_effort_gap_ratio(
 
     * ``actual_sessions`` = ``total_reprompts + 1`` (each reprompt starts a
       new effective "session attempt"; the +1 accounts for the initial session).
+      **Proxy semantics**: ``total_reprompts + 1`` is a stand-in for an actual
+      session count. It approximates "how many distinct effort bursts occurred"
+      but is not the same as ``units.total_sessions`` (which is not currently
+      available in the query path used here). Using ``total_sessions`` directly
+      would be more accurate; this is tracked as a potential future improvement.
     * ``expected_sessions`` = 1 when ``expected_effort`` is NULL or does not
       contain an explicit session count, which is the typical case where the
       user's expectation was "one session". This keeps the ratio meaningful

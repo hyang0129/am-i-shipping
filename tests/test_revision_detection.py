@@ -23,6 +23,7 @@ from synthesis.revision_detector import (
     FACET_ENUM,
     REVISION_TRIGGER_ENUM,
     SESSION_BREAK_THRESHOLD_SECONDS,
+    _parse_commitment_turn_idx,
     classify_revision,
     detect_structural_triggers,
     load_revision_rows,
@@ -30,6 +31,25 @@ from synthesis.revision_detector import (
 
 
 WEEK_START = "2026-04-14"
+
+
+# ---------------------------------------------------------------------------
+# F-13 — _parse_commitment_turn_idx (tightened regex)
+# ---------------------------------------------------------------------------
+
+
+class TestParseCommitmentTurnIdx:
+    def test_standard_prefix(self):
+        # (a) "turn 12: 'ship v2'" → 12, not confused by the version number
+        assert _parse_commitment_turn_idx("turn 12: 'ship v2'") == 12
+
+    def test_turn_number_after_version(self):
+        # (b) "v2: turn 12" → 12, not 2 (the version digit must not win)
+        assert _parse_commitment_turn_idx("v2: turn 12") == 12
+
+    def test_no_turn_keyword_returns_none(self):
+        # (c) "no digits here" → None (no "turn N" pattern present)
+        assert _parse_commitment_turn_idx("no digits here") is None
 
 
 def _make_config(**overrides) -> SynthesisConfig:

@@ -523,14 +523,19 @@ def _assemble_unit_turns(
 
 
 def _parse_commitment_turn_idx(commitment_point: Optional[str]) -> Optional[int]:
-    """Extract a numeric turn index from X-1's free-text commitment_point."""
+    """Extract a numeric turn index from X-1's free-text commitment_point.
+
+    Matches the pattern ``turn <N>`` (case-insensitive) to avoid picking up
+    stray digit sequences (e.g. version numbers like "v2").  Returns ``None``
+    when no such pattern is found.
+    """
     if not commitment_point:
         return None
-    m = re.search(r"\d+", commitment_point)
+    m = re.search(r"turn\s+(\d+)", commitment_point, re.IGNORECASE)
     if not m:
         return None
     try:
-        return int(m.group(0))
+        return int(m.group(1))
     except ValueError:
         return None
 
@@ -677,14 +682,7 @@ def run(
         # signature requires a SynthesisConfig — synthesize one if the
         # caller did not provide it.
         if config is None:
-            config = SynthesisConfig(
-                anthropic_api_key_env="ANTHROPIC_API_KEY",
-                model="claude-sonnet-4-6",
-                output_dir="retrospectives",
-                week_start="monday",
-                abandonment_days=14,
-                outlier_sigma=2.0,
-            )
+            config = SynthesisConfig()
         try:
             adapter = _get_adapter(config)
         except Exception as exc:  # noqa: BLE001

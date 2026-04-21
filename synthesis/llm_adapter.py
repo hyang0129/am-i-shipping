@@ -152,6 +152,7 @@ def _version_sort_key(path: str) -> tuple[int, ...]:
     return (0,)
 
 
+# Searches VS Code extension-host paths; non-VSCode Linux systems fall through to PATH lookup.
 def _auto_discover_claude_linux() -> str | None:
     """Search known install locations for the claude binary on Linux/WSL."""
     home = os.path.expanduser("~")
