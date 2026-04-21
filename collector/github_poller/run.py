@@ -650,7 +650,7 @@ def _poll_repo(
     # 10b. Link issues to sessions
     issue_links = link_issues(repo, github_db, sessions_db)
     if issue_links:
-        logger.info("{}  linked {} issue-session pairs", repo, issue_links)
+        logger.info("{}  issue-session links on record: {}", repo, issue_links)
 
     # 11. Advance cursor
     advance_cursor(repo, github_db)

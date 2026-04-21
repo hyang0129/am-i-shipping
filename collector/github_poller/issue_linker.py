@@ -10,8 +10,11 @@ a session that ran ``gh issue create`` or ``gh issue comment`` for a repo
 already has an explicit row in ``session_gh_events`` with the issue number
 as ``ref``.
 
-When ``sessions.db`` does not exist or is empty, exits cleanly — does not
-block the poller.
+The ``sessions_db_path`` parameter is a **data-readiness interlock**: if
+``sessions.db`` does not yet exist (sessions not yet ingested), linking is
+skipped cleanly.  The file is never opened for reading here — all event data
+lives in ``github.db`` (``session_gh_events``).  The parameter is kept for
+call-site symmetry with ``session_linker.link_sessions``.
 """
 
 from __future__ import annotations
@@ -30,7 +33,11 @@ def link_issues(
 ) -> int:
     """Link sessions to issues for a given repo.
 
-    Returns total number of issue-session links for this repo.
+    ``sessions_db_path`` is checked only as a data-readiness interlock: if
+    sessions have not been ingested yet (file absent), linking is skipped.
+    The file is never read — all event data is in ``github_db``.
+
+    Returns cumulative number of issue-session links on record for this repo.
     """
     sessions_db_path = Path(sessions_db_path)
     github_db_path = Path(github_db_path)
@@ -47,6 +54,10 @@ def link_issues(
             FROM session_gh_events
             WHERE repo = ?
               AND event_type IN ('issue_create', 'issue_comment')
+              -- Belt-and-suspenders: exclude placeholder strings explicitly.
+              -- CAST(ref AS INTEGER) > 0 already filters them (non-numeric refs,
+              -- including 'pending', cast to 0), but the explicit guards are
+              -- kept for readability.
               AND ref != 'pending'
               AND ref != ''
               AND CAST(ref AS INTEGER) > 0
@@ -57,18 +68,20 @@ def link_issues(
         if not rows:
             return 0
 
+        # Late-binding semantics: issue_sessions may reference issues not yet
+        # present in the issues table (e.g. the issue hasn't been ingested yet).
+        # This is intentional — links are resolved lazily as issues arrive.
         for session_uuid, issue_number in rows:
-            try:
-                gh_conn.execute(
-                    """
-                    INSERT OR IGNORE INTO issue_sessions
-                        (repo, issue_number, session_uuid)
-                    VALUES (?, ?, ?)
-                    """,
-                    (repo, issue_number, session_uuid),
-                )
-            except sqlite3.IntegrityError:
-                pass
+            # INSERT OR IGNORE suppresses duplicate-key conflicts at the SQL
+            # layer; no Python-level try/except needed.
+            gh_conn.execute(
+                """
+                INSERT OR IGNORE INTO issue_sessions
+                    (repo, issue_number, session_uuid)
+                VALUES (?, ?, ?)
+                """,
+                (repo, issue_number, session_uuid),
+            )
         gh_conn.commit()
 
         count = gh_conn.execute(
@@ -79,7 +92,7 @@ def link_issues(
         gh_conn.close()
 
     logger.info(
-        "{}  issue-session links: {} events → {} total links",
+        "{}  issue-session links: {} events → {} total issue-session links on record",
         repo, len(rows), count,
     )
     return count
