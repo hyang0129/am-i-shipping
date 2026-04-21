@@ -60,6 +60,12 @@ class SessionRecord:
     session_started_at: Optional[str] = None
     session_ended_at: Optional[str] = None
     gh_events: list = field(default_factory=list)
+    # Issue #86: skill workflow invocations captured from
+    # <command-name>/xxx</command-name> tags in user-turn content. Each dict
+    # has keys skill_name, invoked_at, target_repo, target_ref,
+    # invocation_index. Populated in parse_session before content-block
+    # stripping (the tags live in user message text, not in tool_use blocks).
+    skill_invocations: list = field(default_factory=list)
 
 
 def _git_branch_from_dir(cwd: str) -> Optional[str]:
@@ -81,6 +87,121 @@ def _git_branch_from_dir(cwd: str) -> Optional[str]:
         return None
     except (subprocess.SubprocessError, OSError):
         return None
+
+
+# Issue #86: skill-tag regex. Claude Code wraps slash-command invocations in
+# ``<command-name>/xxx</command-name>`` tags that appear inside user-turn text
+# content. The tag payload is the raw slash-command with its leading slash;
+# we strip the slash when storing so downstream joins on "refine-issue" /
+# "resolve-issue" are cleaner. Matching is tolerant of optional whitespace
+# and an optional trailing ``-args``/body — we only pull the bare command
+# name. Only the primary skill name is captured; arguments that follow in
+# sibling <command-args> tags (if any) are ignored here.
+_SKILL_TAG_RE = re.compile(
+    r"<command-name>\s*/([a-zA-Z][a-zA-Z0-9_\-]*)\s*</command-name>",
+)
+
+
+def _iter_user_text_blocks(content: Any):
+    """Yield raw text strings from a user-turn content payload.
+
+    Handles both the plain-string form (``content="hi"``) and the
+    structured list form (``content=[{"type": "text", "text": "..."},
+    {"type": "tool_use", ...}]``). Non-text blocks are skipped. This
+    runs BEFORE ``_strip_content_blocks`` so skill tags embedded in
+    user prompt prose are visible even after stripping.
+    """
+    if isinstance(content, str):
+        yield content
+        return
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str):
+                    yield text
+
+
+def _extract_skill_invocations(
+    entry: dict, invocation_index_counter: list
+) -> list:
+    """Extract skill invocations from a single user-turn JSONL entry.
+
+    Returns a list of dicts ``{skill_name, invoked_at, target_repo=None,
+    target_ref=None, invocation_index}``. ``target_repo`` / ``target_ref``
+    are resolved later (after all gh_events are accumulated) — we can't
+    know them here because a later tool call may be what materialises
+    the repo/issue number.
+
+    ``invocation_index_counter`` is a mutable single-element list used as a
+    shared counter so repeated calls append monotonically-increasing indices.
+    This matters for the composite primary key ``(session_uuid, skill_name,
+    invocation_index)`` — two ``/refine-issue`` invocations in one session
+    must write distinct rows.
+    """
+    if entry.get("type") != "user":
+        return []
+    content = entry.get("message", {}).get("content", "")
+    created_at = entry.get("timestamp", "") or None
+
+    invocations = []
+    for text in _iter_user_text_blocks(content):
+        for match in _SKILL_TAG_RE.finditer(text):
+            skill_name = match.group(1)
+            idx = invocation_index_counter[0]
+            invocation_index_counter[0] += 1
+            invocations.append(
+                {
+                    "skill_name": skill_name,
+                    "invoked_at": created_at,
+                    "target_repo": None,
+                    "target_ref": None,
+                    "invocation_index": idx,
+                }
+            )
+    return invocations
+
+
+def _resolve_skill_targets(
+    skill_invocations: list, gh_events: list
+) -> None:
+    """Fill in ``target_repo`` / ``target_ref`` on skill invocations.
+
+    Strategy: for each skill invocation, pick the first resolved
+    (non-``pending``) ``issue_create`` / ``issue_comment`` / ``pr_create`` /
+    ``pr_comment`` gh_event in the same session whose ``created_at`` is >=
+    the invocation's ``invoked_at``. This is a coarse "whatever the skill
+    acted on" heuristic — if the skill was ``/refine-issue`` then the first
+    gh command that followed will almost always be the ``gh issue edit``
+    or ``gh issue comment`` for the target issue.
+
+    Mutates ``skill_invocations`` in place. When no matching gh_event is
+    found, both targets remain ``None``.
+    """
+    if not skill_invocations or not gh_events:
+        return
+    # Stable pre-sort of gh_events by created_at so we can walk forward.
+    sorted_events = sorted(
+        gh_events, key=lambda e: e.get("created_at") or ""
+    )
+    useful_types = {
+        "issue_create",
+        "issue_comment",
+        "pr_create",
+        "pr_comment",
+    }
+    for inv in skill_invocations:
+        inv_at = inv.get("invoked_at") or ""
+        for ev in sorted_events:
+            if ev.get("event_type") not in useful_types:
+                continue
+            if ev.get("ref") in (None, "", "pending"):
+                continue
+            if (ev.get("created_at") or "") < inv_at:
+                continue
+            inv["target_repo"] = ev.get("repo") or None
+            inv["target_ref"] = ev.get("ref") or None
+            break
 
 
 def _strip_content_blocks(content: Any) -> Any:
@@ -409,6 +530,11 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
     fast_mode_turns = 0
     gh_events_list: List[Dict[str, Any]] = []
     pending_creates: Dict[str, Any] = {}
+    # Issue #86: skill invocations detected from <command-name> tags in
+    # user-turn text. Counter is a single-element list so the shared state
+    # mutates across _extract_skill_invocations calls.
+    skill_invocations_list: List[Dict[str, Any]] = []
+    skill_invocation_counter: List[int] = [0]
 
     try:
         with open(filepath, "r", encoding="utf-8") as f:
@@ -490,6 +616,18 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
                     _extract_gh_events(entry, pending_creates)
                 )
 
+                # Issue #86: extract skill-command invocations from user-turn
+                # text BEFORE content-block stripping. Tags live in user text,
+                # not in tool_use blocks, so _strip_content_blocks preserves
+                # them — but the stripping runs later in this loop for
+                # raw_content_json, so we still have the full content here.
+                if entry_type == "user":
+                    skill_invocations_list.extend(
+                        _extract_skill_invocations(
+                            entry, skill_invocation_counter
+                        )
+                    )
+
                 # Accumulate token usage from assistant messages
                 if entry_type == "assistant":
                     usage = msg.get("usage", {})
@@ -565,6 +703,13 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
             seen_gh_keys.add(key)
             deduped_gh_events.append(ev)
 
+    # Issue #86: resolve skill invocation targets against the full gh_events
+    # list now that pending creates have been flushed. Uses the deduped list
+    # built below via ``deduped_gh_events``; since that dedup only collapses
+    # exact-key duplicates (not partial) and we only need ANY matching event,
+    # the raw ``gh_events_list`` is sufficient.
+    _resolve_skill_targets(skill_invocations_list, gh_events_list)
+
     return SessionRecord(
         session_uuid=session_uuid,
         turn_count=turn_count,
@@ -584,6 +729,7 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
         session_started_at=session_started_at,
         session_ended_at=session_ended_at,
         gh_events=deduped_gh_events,
+        skill_invocations=skill_invocations_list,
     )
 
 
