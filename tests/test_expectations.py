@@ -22,12 +22,16 @@ from am_i_shipping.db import (
     init_sessions_db,
 )
 from synthesis.expectations import (
+    _build_unit_input,
     _extract_turns,
     _parse_llm_response,
     _surrounding_user_text,
     detect_structural_commitment_point,
     run_extraction,
 )
+
+
+FIXTURES = Path(__file__).parent / "fixtures" / "synthesis"
 
 
 WEEK_START = "2026-04-14"
@@ -69,6 +73,7 @@ def _seed_unit(
     week_start: str = WEEK_START,
     unit_id: str,
     root_node_id: str = "",
+    root_node_type: str = "session",
 ) -> None:
     if not root_node_id:
         root_node_id = f"n-{unit_id}"
@@ -79,7 +84,7 @@ def _seed_unit(
             "(week_start, unit_id, root_node_type, root_node_id, "
             " elapsed_days, dark_time_pct, total_reprompts, "
             " review_cycles, status, outlier_flags, abandonment_flag) "
-            "VALUES (?, ?, 'session', ?, 1.0, 0.0, 0, 0, 'closed', '[]', 0)",
+            f"VALUES (?, ?, '{root_node_type}', ?, 1.0, 0.0, 0, 0, 'closed', '[]', 0)",
             (week_start, unit_id, root_node_id),
         )
         conn.commit()
@@ -706,3 +711,174 @@ def test_run_extraction_empty_week_is_noop(tmp_path: Path):
     )
     assert rc == 0
     assert _expectation_rows(exp, "2099-01-01") == []
+
+
+# ---------------------------------------------------------------------------
+# Real-session fixtures: issue #139 and #163
+# These cover the session_issue_attribution fallback and the all-user-turns
+# context fix for refine-issue sessions (issue #233).
+# ---------------------------------------------------------------------------
+
+
+def _seed_issue_unit(
+    gh_db: Path,
+    sess_db: Path,
+    *,
+    week_start: str = WEEK_START,
+    unit_id: str,
+    repo: str,
+    issue_number: int,
+    session_uuid: str,
+    raw_content_json: Any,
+) -> None:
+    """Seed an issue-rooted unit with its session via session_issue_attribution."""
+    root_node_id = f"issue:{repo}#{issue_number}"
+    _seed_unit(
+        gh_db,
+        week_start=week_start,
+        unit_id=unit_id,
+        root_node_id=root_node_id,
+        root_node_type="issue",
+    )
+    payload = (
+        raw_content_json
+        if isinstance(raw_content_json, str) or raw_content_json is None
+        else json.dumps(raw_content_json)
+    )
+    conn = sqlite3.connect(str(sess_db))
+    try:
+        conn.execute(
+            "INSERT INTO sessions (session_uuid, raw_content_json) VALUES (?, ?)",
+            (session_uuid, payload),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = sqlite3.connect(str(gh_db))
+    try:
+        conn.execute(
+            "INSERT INTO session_issue_attribution "
+            "(week_start, session_uuid, repo, issue_number, phase, fraction) "
+            "VALUES (?, ?, ?, ?, 'planning', 1.0)",
+            (week_start, session_uuid, repo, issue_number),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.fixture()
+def fixture_139() -> list:
+    return json.loads((FIXTURES / "session_issue_139.json").read_text())
+
+
+@pytest.fixture()
+def fixture_163() -> list:
+    return json.loads((FIXTURES / "session_issue_163.json").read_text())
+
+
+def test_issue_163_refine_session_includes_confirmation_turn(
+    tmp_path: Path, fixture_163: list
+):
+    """All user text turns are sent so the LLM can see 'yes this is good' (turn 15).
+
+    Before the fix, only ±2 turns around the structural candidate were sent,
+    which resolved to the /resolve-issue invocation and [Request interrupted by
+    user] — no planning content at all.
+    """
+    gh, sess, exp = _init_dbs(tmp_path)
+    _seed_issue_unit(
+        gh,
+        sess,
+        unit_id="46e3bb0455004d17",
+        repo="hyang0129/supreme-claudemander",
+        issue_number=163,
+        session_uuid="ad86311e-7d67-4a68-bdaa-8a06963d9fc9",
+        raw_content_json=fixture_163,
+    )
+
+    gh_conn = sqlite3.connect(str(gh))
+    sess_conn = sqlite3.connect(str(sess))
+    unit_input, input_bytes, candidate_idx, skip_reason = _build_unit_input(
+        gh_conn, sess_conn, "46e3bb0455004d17", WEEK_START
+    )
+    gh_conn.close()
+    sess_conn.close()
+
+    assert skip_reason == "", f"unexpected skip: {skip_reason}"
+    assert input_bytes > 0
+    # The full context must include the user confirmation turn.
+    assert "yes this is good" in unit_input, (
+        "confirmation turn missing from LLM input — context window too narrow"
+    )
+    # The structural candidate (interrupt / slash command) should NOT be the
+    # only user turn visible to the LLM.
+    assert unit_input.count("turn ") > 3, (
+        "fewer turns than expected — all-user-turns expansion not working"
+    )
+
+
+def test_issue_163_refine_session_extraction_produces_populated_row(
+    tmp_path: Path, fixture_163: list
+):
+    """End-to-end: issue-rooted refine-session unit produces a non-skipped row."""
+    gh, sess, exp = _init_dbs(tmp_path)
+    _seed_issue_unit(
+        gh,
+        sess,
+        unit_id="46e3bb0455004d17",
+        repo="hyang0129/supreme-claudemander",
+        issue_number=163,
+        session_uuid="ad86311e-7d67-4a68-bdaa-8a06963d9fc9",
+        raw_content_json=fixture_163,
+    )
+
+    adapter = _stub_adapter_json(expected_scope="profiles/main")
+    with mock.patch("synthesis.expectations._get_adapter", return_value=adapter):
+        rc = run_extraction(
+            _make_synthesis_config(),
+            github_db=str(gh),
+            sessions_db=str(sess),
+            expectations_db=str(exp),
+            week_start=WEEK_START,
+        )
+
+    assert rc == 0
+    rows = _expectation_rows(exp)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["skip_reason"] is None, f"expected populated row, got skip: {row['skip_reason']}"
+    assert row["expected_scope"] == "profiles/main"
+    assert len(adapter.calls) == 1
+    # Verify the adapter received context with the confirmation turn.
+    _, user_prompt, _, _ = adapter.calls[0]
+    assert "yes this is good" in user_prompt
+
+
+def test_issue_139_session_attribution_fallback(
+    tmp_path: Path, fixture_139: list
+):
+    """Issue #139: session found via attribution (not graph_nodes) → non-empty input."""
+    gh, sess, exp = _init_dbs(tmp_path)
+    _seed_issue_unit(
+        gh,
+        sess,
+        unit_id="45d36ccb02b9fb09",
+        repo="hyang0129/supreme-claudemander",
+        issue_number=139,
+        session_uuid="0dc66653-a8ce-456e-9a84-3ff29e0d5153",
+        raw_content_json=fixture_139,
+    )
+
+    gh_conn = sqlite3.connect(str(gh))
+    sess_conn = sqlite3.connect(str(sess))
+    unit_input, input_bytes, candidate_idx, skip_reason = _build_unit_input(
+        gh_conn, sess_conn, "45d36ccb02b9fb09", WEEK_START
+    )
+    gh_conn.close()
+    sess_conn.close()
+
+    # The session is short (7 messages) but must be found via attribution fallback.
+    assert skip_reason == "", f"unexpected skip: {skip_reason}"
+    assert input_bytes > 0

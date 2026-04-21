@@ -284,16 +284,35 @@ def _build_unit_input(
     """
     # Walk the unit's graph component to collect its session UUIDs.
     unit_row = gh_conn.execute(
-        "SELECT root_node_id FROM units WHERE week_start = ? AND unit_id = ?",
+        "SELECT root_node_id, root_node_type FROM units WHERE week_start = ? AND unit_id = ?",
         (week_start, unit_id),
     ).fetchone()
     root_node_id = unit_row[0] if unit_row else ""
+    root_node_type = unit_row[1] if unit_row else ""
     component = _unit_nodes(gh_conn, week_start, root_node_id or "")
     session_uuids: List[str] = [
         node_ref
         for _nid, node_type, node_ref in component
         if node_type == "session" and node_ref
     ]
+
+    # Issue-rooted units use session_issue_attribution (not graph_edges) for
+    # session linkage, so session nodes never appear in the graph component.
+    # Fall back to session_issue_attribution when graph traversal yields nothing.
+    if not session_uuids and root_node_type == "issue" and root_node_id:
+        ref = root_node_id.removeprefix("issue:")
+        if "#" in ref:
+            _repo, _, _num = ref.rpartition("#")
+            try:
+                _issue_number = int(_num)
+                rows = gh_conn.execute(
+                    "SELECT session_uuid FROM session_issue_attribution "
+                    "WHERE week_start = ? AND repo = ? AND issue_number = ?",
+                    (week_start, _repo, _issue_number),
+                ).fetchall()
+                session_uuids = [r[0] for r in rows]
+            except ValueError:
+                pass
 
     transcripts = _load_session_transcripts(sessions_conn, session_uuids)
     # Concatenate turns from every transcript in the unit, preserving order.
@@ -314,8 +333,6 @@ def _build_unit_input(
     if candidate_idx is None:
         return "", 0, None, "no_text_turns"
 
-    context = _surrounding_user_text(all_turns, candidate_idx, window=2)
-
     parts: List[str] = []
     parts.append(f"## Unit: {unit_id}")
     parts.append(f"## Week: {week_start}")
@@ -323,14 +340,13 @@ def _build_unit_input(
         f"## Structural commitment-point candidate: turn index {candidate_idx}"
     )
     parts.append("")
-    parts.append("### Candidate turn")
-    cand_text = all_turns[candidate_idx].get("text") or ""
-    parts.append(f"turn {candidate_idx}: {cand_text}")
-    parts.append("")
-    parts.append("### ±2 surrounding user text turns")
-    for turn_idx, text in context:
-        marker = " [CANDIDATE]" if turn_idx == candidate_idx else ""
-        parts.append(f"turn {turn_idx}{marker}: {text}")
+    parts.append(
+        "### All user text turns (full context — reassign the candidate if needed)"
+    )
+    for i, t in enumerate(all_turns):
+        if t["role"] == "user" and t["kind"] == "text" and t["text"].strip():
+            marker = " [STRUCTURAL CANDIDATE]" if i == candidate_idx else ""
+            parts.append(f"turn {i}{marker}: {t['text']}")
 
     assembled = "\n".join(parts)
     return assembled, len(assembled.encode()), candidate_idx, ""
