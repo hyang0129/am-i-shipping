@@ -55,6 +55,7 @@ from .fetch_timeline import fetch_and_store_issue_timelines
 from .gh_client import BudgetExhausted, GhCliError, calls_made, configure_limiter, graphql_points_used
 from .link_resolver import resolve_link
 from .push_counter import count_pushes_after_review
+from .issue_linker import link_issues
 from .session_linker import link_sessions
 from .store import (
     insert_issue_body_edit,
@@ -645,6 +646,11 @@ def _poll_repo(
     session_links = link_sessions(repo, github_db, sessions_db)
     if session_links:
         logger.info("{}  linked {} PR-session pairs", repo, session_links)
+
+    # 10b. Link issues to sessions
+    issue_links = link_issues(repo, github_db, sessions_db)
+    if issue_links:
+        logger.info("{}  linked {} issue-session pairs", repo, issue_links)
 
     # 11. Advance cursor
     advance_cursor(repo, github_db)
