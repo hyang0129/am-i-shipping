@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from am_i_shipping.config_loader import SynthesisConfig
 from synthesis.expectations import _extract_turns
 from synthesis.llm_adapter import _get_adapter
+from synthesis.weekly import _load_units
 
 
 logger = logging.getLogger(__name__)
@@ -613,6 +614,7 @@ def run(
     expectations_db: str,
     config: Optional[SynthesisConfig] = None,
     rebuild: bool = False,
+    repo: Optional[str] = None,
 ) -> int:
     """Detect expectation revisions for every unit in *week_start*.
 
@@ -663,10 +665,23 @@ def run(
         sessions_conn = gh_conn if _same else sqlite3.connect(str(sessions_db))
 
         expectations = _load_expectations(exp_conn, week_start)
+
+        # Issue #88: restrict to the targeted repo's unit set. Same
+        # strategy as gap_analysis.run — compute the unit set once via
+        # weekly's filter helper and drop expectation rows outside it.
+        if repo:
+            targeted_units = {
+                u["unit_id"] for u in _load_units(gh_conn, week_start, repo=repo)
+            }
+            expectations = [
+                e for e in expectations if e["unit_id"] in targeted_units
+            ]
+
         if not expectations:
+            repo_suffix = f" repo={repo}" if repo else ""
             logger.info(
-                "revision_detector: no expectations for week=%s; no-op",
-                week_start,
+                "revision_detector: no expectations for week=%s%s; no-op",
+                week_start, repo_suffix,
             )
             return 0
 
@@ -775,9 +790,27 @@ def run(
 
 
 def load_revision_rows(
-    expectations_db: str, week_start: str
+    expectations_db: str,
+    week_start: str,
+    *,
+    repo: Optional[str] = None,
+    github_db: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Return revision rows for *week_start*, ordered by unit + revision_index."""
+    """Return revision rows for *week_start*, ordered by unit + revision_index.
+
+    When *repo* is set (issue #88), rows are additionally filtered to
+    the targeted repo's unit set via :func:`synthesis.weekly._load_units`.
+    The caller must also pass *github_db* so the unit set can be
+    resolved — if *repo* is set without *github_db* this function raises
+    ``ValueError`` rather than silently returning cross-repo rows (F-2
+    cycle-1 fix).
+    """
+    if repo and not github_db:
+        raise ValueError(
+            "load_revision_rows: repo filter requires github_db to resolve "
+            "the targeted unit set (expectations.db does not carry the "
+            "repo column)"
+        )
     conn = sqlite3.connect(str(expectations_db))
     try:
         rows = conn.execute(
@@ -791,7 +824,7 @@ def load_revision_rows(
         return []
     finally:
         conn.close()
-    return [
+    results = [
         {
             "unit_id": r[0],
             "revision_index": r[1],
@@ -804,6 +837,18 @@ def load_revision_rows(
         }
         for r in rows
     ]
+
+    if repo and github_db:
+        gh_conn = sqlite3.connect(str(github_db))
+        try:
+            targeted = {
+                u["unit_id"]
+                for u in _load_units(gh_conn, week_start, repo=repo)
+            }
+        finally:
+            gh_conn.close()
+        results = [r for r in results if r["unit_id"] in targeted]
+    return results
 
 
 __all__ = [

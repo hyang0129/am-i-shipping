@@ -33,8 +33,9 @@ def write_retrospective(
     content: str,
     output_dir: Union[str, Path],
     week_start: str,
+    repo: Optional[str] = None,
 ) -> Optional[Path]:
-    """Atomically write *content* to ``<output_dir>/<week_start>.md``.
+    """Atomically write *content* to the retrospective output path.
 
     Parameters
     ----------
@@ -44,7 +45,16 @@ def write_retrospective(
     output_dir:
         Directory to write into. Created (with parents) if missing.
     week_start:
-        ``YYYY-MM-DD`` anchor. Used verbatim as the filename stem.
+        ``YYYY-MM-DD`` anchor. Used verbatim as the filename stem for the
+        full-weekly path.
+    repo:
+        Optional ``"owner/name"`` slug. When set (issue #88) the output
+        lands at ``<output_dir>/<week_start>/<owner>__<name>.md``
+        instead of ``<output_dir>/<week_start>.md`` so single-repo and
+        full-weekly runs coexist. The ``/`` in the slug is transliterated
+        to ``__`` so the filename is path-safe on every filesystem. The
+        refuse-to-overwrite guard naturally keys on ``(week, repo)``
+        because each combination maps to a distinct path.
 
     Returns
     -------
@@ -58,7 +68,10 @@ def write_retrospective(
     touching ``output_dir`` in any way. This matches ADR Decision 2:
     the synthesis call is downstream of this check in
     :func:`synthesis.weekly.run_synthesis`, so "file exists" also skips
-    the API call.
+    the API call. With the issue-#88 *repo* parameter, the guard
+    implicitly keys on ``(week, repo)`` — a single-repo run and a
+    full-weekly run for the same week do not block each other because
+    they target different filenames.
 
     Atomicity
     ---------
@@ -70,7 +83,15 @@ def write_retrospective(
     unlinked so a later run is not confused by stray ``.tmp`` droppings.
     """
     out_dir = Path(output_dir)
-    output_path = out_dir / f"{week_start}.md"
+    if repo:
+        # Issue #88: repo-scoped path. Owner/name segments are combined
+        # with ``__`` rather than keeping the ``/`` so the filename stays
+        # within a single directory level — simplifies mkdir + atomic
+        # rename (no nested mkdir after the week directory).
+        safe_slug = repo.replace("/", "__")
+        output_path = out_dir / week_start / f"{safe_slug}.md"
+    else:
+        output_path = out_dir / f"{week_start}.md"
 
     # --- Decision 2: refuse to overwrite -------------------------------
     if output_path.exists():
@@ -83,7 +104,10 @@ def write_retrospective(
     # --- ensure the output directory exists ----------------------------
     # We do this AFTER the exists check so a pre-existing file under an
     # already-existing directory is the cheap path (no mkdir syscall).
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # For the repo-scoped path (issue #88) the parent is
+    # ``<output_dir>/<week>/``; for the bare-week path it is
+    # ``<output_dir>/``. ``parents=True`` handles both.
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # --- atomic write via .tmp + rename --------------------------------
     tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")

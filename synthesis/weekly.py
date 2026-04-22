@@ -213,22 +213,131 @@ def water_fill_truncate(
 # ---------------------------------------------------------------------------
 
 
+def _repo_filter_sql(
+    repo: Optional[str],
+    week_start: Optional[str] = None,
+    *,
+    units_alias: str = "",
+) -> Tuple[str, List[str]]:
+    """Return ``(sql_fragment, params)`` for filtering ``units`` by repo.
+
+    Issue #88 — single-repo filter for the LLM pipeline stages.
+
+    When *repo* is ``None`` or empty, returns ``("", [])`` so callers can
+    concatenate the fragment unconditionally and leave the baseline
+    no-flag SQL byte-identical.
+
+    When *repo* is a ``"owner/name"`` slug, the fragment is an ``AND ...``
+    clause (parenthesised) matching:
+
+    * issue-rooted units whose ``root_node_id`` is literally
+      ``issue:<repo>#<N>``,
+    * PR-rooted units whose ``root_node_id`` is literally
+      ``pr:<repo>#<N>``, and
+    * session-rooted units whose ``session:<uuid>`` is attributed to the
+      target repo via ``session_issue_attribution``.
+
+    The session branch covers the defensive path: today's
+    ``unit_identifier`` drops session-only graph components so
+    ``root_node_type='session'`` is effectively empty in practice, but the
+    spec (refined issue #88) calls for the resolver because a future
+    change upstream could start emitting them. Sessions attributed only
+    to a PR (not an issue) would be missed — documented limitation,
+    acceptable for a dev-loop feature.
+
+    ``units_alias`` lets callers reference a joined/aliased ``units`` table
+    (e.g. ``"u"`` in the ``LEFT JOIN unit_summaries`` query). Pass ``""``
+    when the SELECT is a bare ``FROM units``.
+
+    ``week_start`` must be provided whenever ``repo`` is truthy — the
+    session-attribution subquery correlates on ``week_start`` and the
+    helper binds it directly so the caller does not have to remember a
+    placeholder convention. (F-1 collapse: previously a two-function API
+    that returned a sentinel string; now a single function that returns
+    a ready-to-bind param list.)
+
+    The trailing ``#%`` boundary on each LIKE pattern prevents
+    ``hyang0129/am-i-shipping`` from matching
+    ``hyang0129/am-i-shipping-sibling``. The slug is also LIKE-escaped
+    (``%``, ``_``, backslash) with an explicit ``ESCAPE '\\'`` clause
+    so a repo whose name legitimately contains ``_`` — e.g.
+    ``owner/my_repo`` — cannot be confused with ``owner/myXrepo``.
+    """
+    if not repo:
+        return "", []
+    if week_start is None:
+        raise ValueError(
+            "_repo_filter_sql: week_start is required when repo is set "
+            "(the session-attribution subquery correlates on week_start)"
+        )
+
+    prefix = f"{units_alias}." if units_alias else ""
+
+    # LIKE-escape the slug so %, _, or \\ inside an owner/name cannot
+    # turn into SQL LIKE metacharacters. ``ESCAPE '\\'`` below tells
+    # SQLite to treat our backslash as the literal-escape sentinel.
+    esc_repo = (
+        repo.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
+    issue_pat = f"issue:{esc_repo}#%"
+    pr_pat = f"pr:{esc_repo}#%"
+
+    # Inner subquery resolves session-rooted units via
+    # session_issue_attribution. We substr the root_node_id past the
+    # literal "session:" prefix to recover the uuid, then join against
+    # the attribution table on (week_start, session_uuid, repo).
+    #
+    # The subquery's ``u2.week_start = ?`` is bound to the *same*
+    # week_start the caller filters the outer query on. Binding it
+    # directly here (rather than correlating to an outer alias) keeps
+    # the helper independent of the caller's alias naming.
+    session_subquery = (
+        "SELECT u2.unit_id FROM units u2 "
+        "JOIN session_issue_attribution sia "
+        "  ON sia.week_start = u2.week_start "
+        " AND sia.session_uuid = substr(u2.root_node_id, length('session:') + 1) "
+        "WHERE u2.week_start = ? "
+        "  AND u2.root_node_type = 'session' "
+        "  AND sia.repo = ?"
+    )
+
+    fragment = (
+        f" AND ({prefix}root_node_id LIKE ? ESCAPE '\\' "
+        f"     OR {prefix}root_node_id LIKE ? ESCAPE '\\' "
+        f"     OR (({prefix}root_node_type = 'session') "
+        f"         AND {prefix}unit_id IN ({session_subquery})))"
+    )
+    # Param order matches the ?s above: issue LIKE, pr LIKE, session
+    # subquery's week_start, session subquery's repo. ``repo`` in the
+    # session branch is compared directly against ``session_issue_attribution.repo``
+    # — no LIKE, no escape needed.
+    return fragment, [issue_pat, pr_pat, week_start, repo]
+
+
 def _load_units(
     github_conn: sqlite3.Connection,
     week_start: str,
+    repo: Optional[str] = None,
 ) -> List[dict]:
     """Return one dict per ``units`` row for *week_start*.
 
     Includes ``outlier_flags`` (JSON string or NULL) and
     ``abandonment_flag`` (0/1 or NULL) from the cross-unit pass.
+
+    When *repo* is set, filter to units whose ``root_node_id`` is
+    scoped to that repo (issue:/pr: LIKE + session resolver). When
+    ``None`` (default), the query is byte-identical to the pre-#88
+    baseline.
     """
+    fragment, repo_params = _repo_filter_sql(repo, week_start)
+    params: List = [week_start, *repo_params]
     rows = github_conn.execute(
         "SELECT unit_id, root_node_type, root_node_id, "
         "       elapsed_days, dark_time_pct, total_reprompts, "
         "       review_cycles, status, outlier_flags, abandonment_flag "
-        "FROM units WHERE week_start = ? "
+        f"FROM units WHERE week_start = ?{fragment} "
         "ORDER BY unit_id",
-        (week_start,),
+        params,
     ).fetchall()
     return [
         {
@@ -735,6 +844,7 @@ def run_synthesis(
     week_start: str,
     dry_run: bool = False,
     expectations_db: Optional[Union[str, Path]] = None,
+    repo: Optional[str] = None,
 ) -> Optional[Path]:
     """End-to-end weekly synthesis for *week_start*.
 
@@ -784,10 +894,12 @@ def run_synthesis(
     sess_conn = gh_conn if _same else sqlite3.connect(str(sess_path))
 
     try:
-        units = _load_units(gh_conn, week_start)
+        units = _load_units(gh_conn, week_start, repo=repo)
         if not units:
+            repo_suffix = f" repo={repo}" if repo else ""
             logger.info(
-                "No units found for week_start=%s; skipping synthesis", week_start
+                "No units found for week_start=%s%s; skipping synthesis",
+                week_start, repo_suffix,
             )
             return None
 
@@ -937,11 +1049,14 @@ def run_synthesis(
                     github_db=str(gh_path),
                     expectations_db=str(expectations_db),
                     config=config,
+                    repo=repo,
                 )
                 gap_rows = gap_analysis.load_gap_rows(
                     str(expectations_db),
                     week_start,
                     min_severity=("major", "critical"),
+                    repo=repo,
+                    github_db=str(gh_path),
                 )
                 # Epic #27 — X-4 (#75): auto-confirm sweep fires on every
                 # ``am-synthesize --week`` invocation (AS-6). Any gap row
@@ -985,9 +1100,11 @@ def run_synthesis(
                     sessions_db=str(sess_path),
                     expectations_db=str(expectations_db),
                     config=config,
+                    repo=repo,
                 )
                 revision_rows = revision_detector.load_revision_rows(
-                    str(expectations_db), week_start
+                    str(expectations_db), week_start, repo=repo,
+                    github_db=str(gh_path),
                 )
             except sqlite3.OperationalError as exc:
                 logger.warning(
@@ -1122,7 +1239,9 @@ def run_synthesis(
         user_content = messages[0]["content"]
         markdown = _get_adapter(config).call(system_prompt, user_content, config.model, _MAX_OUTPUT_TOKENS).text
 
-        result = write_retrospective(markdown, config.output_dir, week_start)
+        result = write_retrospective(
+            markdown, config.output_dir, week_start, repo=repo
+        )
 
         # Record a successful synthesis run in health.json ONLY when the
         # retrospective was actually written this invocation. Refuse-to-
@@ -1146,6 +1265,7 @@ __all__ = [
     "run_synthesis",
     "water_fill_truncate",
     "_resolve_unit_sessions",
+    "_repo_filter_sql",
     "TRANSCRIPT_BUDGET_BYTES",
     "MAX_UNITS_PER_PROMPT",
     "MAX_PROMPT_SOFT_WARN_BYTES",

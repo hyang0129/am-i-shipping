@@ -36,7 +36,11 @@ from typing import List, Optional, Sequence, Tuple
 from am_i_shipping.config_loader import SynthesisConfig, load_config
 from am_i_shipping.db import init_github_db
 from synthesis.llm_adapter import _get_adapter
-from synthesis.weekly import _load_session_transcripts, _unit_nodes
+from synthesis.weekly import (
+    _load_session_transcripts,
+    _repo_filter_sql,
+    _unit_nodes,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -69,26 +73,54 @@ def _load_unsummarized_units(
     gh_conn: sqlite3.Connection,
     week_start: str,
     rebuild: bool = False,
+    repo: Optional[str] = None,
 ) -> List[dict]:
     """Return units for *week_start* that do not yet have a summary row.
 
     If *rebuild* is True, existing ``unit_summaries`` rows for the week
     are deleted before the query so every unit is treated as unsummarized.
+    When *rebuild* is combined with *repo*, only the targeted repo's
+    summary rows are deleted so a partial rebuild is possible.
+
+    When *repo* (``"owner/name"``) is set — issue #88 — the SELECT is
+    filtered via :func:`synthesis.weekly._repo_filter_sql` so only the
+    targeted repo's units are summarised. Without *repo*, the query is
+    byte-identical to the pre-#88 baseline.
     """
     if rebuild:
-        gh_conn.execute(
-            "DELETE FROM unit_summaries WHERE week_start = ?",
-            (week_start,),
-        )
+        # For a repo-scoped rebuild we still only want to clear rows
+        # belonging to that repo — otherwise a dev iteration would
+        # silently blow away every other repo's summaries for the week.
+        if repo:
+            fragment, repo_params = _repo_filter_sql(
+                repo, week_start, units_alias="u"
+            )
+            gh_conn.execute(
+                # Delete using a sub-select against ``units u`` so the
+                # repo predicate can be applied alongside the week key.
+                "DELETE FROM unit_summaries WHERE week_start = ? "
+                "AND unit_id IN ("
+                f"  SELECT u.unit_id FROM units u WHERE u.week_start = ?{fragment}"
+                ")",
+                [week_start, week_start, *repo_params],
+            )
+        else:
+            gh_conn.execute(
+                "DELETE FROM unit_summaries WHERE week_start = ?",
+                (week_start,),
+            )
         gh_conn.commit()
+
+    fragment, repo_params = _repo_filter_sql(repo, week_start, units_alias="u")
+    params: List = [week_start, *repo_params]
 
     rows = gh_conn.execute(
         "SELECT u.unit_id FROM units u "
         "LEFT JOIN unit_summaries s "
         "  ON u.week_start = s.week_start AND u.unit_id = s.unit_id "
-        "WHERE u.week_start = ? AND s.unit_id IS NULL "
+        f"WHERE u.week_start = ? AND s.unit_id IS NULL{fragment} "
         "ORDER BY u.unit_id",
-        (week_start,),
+        params,
     ).fetchall()
     return [{"unit_id": r[0]} for r in rows]
 
@@ -299,6 +331,7 @@ def run_summarization(
     sessions_db: str,
     week_start: str,
     rebuild: bool = False,
+    repo: Optional[str] = None,
 ) -> int:
     """Summarize all unsummarized units for *week_start*.
 
@@ -337,12 +370,16 @@ def run_summarization(
         sessions_conn = gh_conn if _same else sqlite3.connect(sessions_db)
 
         try:
-            units = _load_unsummarized_units(gh_conn, week_start, rebuild=rebuild)
+            units = _load_unsummarized_units(
+                gh_conn, week_start, rebuild=rebuild, repo=repo
+            )
 
             if not units:
+                repo_suffix = f" repo={repo}" if repo else ""
                 logger.info(
-                    "No unsummarized units for week_start=%s; nothing to do",
-                    week_start,
+                    "No unsummarized units for week_start=%s%s; "
+                    "nothing to do",
+                    week_start, repo_suffix,
                 )
                 return 0
 
@@ -437,6 +474,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default="config.yaml",
         help="Path to config.yaml (default: config.yaml in repo root).",
     )
+    parser.add_argument(
+        "--repo",
+        default=None,
+        help=(
+            "Filter to a single repo (owner/name, e.g. "
+            "'hyang0129/am-i-shipping'). Only units whose root_node_id "
+            "belongs to this repo are summarised. "
+            "Intended for dev-loop iteration; unit_summaries remain "
+            "partial for non-targeted repos."
+        ),
+    )
     return parser
 
 
@@ -460,6 +508,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         sessions_db=sessions_db,
         week_start=args.week,
         rebuild=args.rebuild_summaries,
+        repo=getattr(args, "repo", None),
     )
     sys.exit(result)
 

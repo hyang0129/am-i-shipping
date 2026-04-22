@@ -69,6 +69,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to config.yaml (default: config.yaml in repo root).",
     )
+    parser.add_argument(
+        "--repo",
+        default=None,
+        help=(
+            "Filter LLM stages to a single repo (owner/name, e.g. "
+            "'hyang0129/am-i-shipping'). Writes the retrospective to "
+            "retrospectives/<week>/<owner>__<name>.md so single-repo "
+            "and full-weekly runs for the same week coexist. "
+            "Intended for dev-loop iteration; unit_summaries and "
+            "expectations remain partial for non-targeted repos."
+        ),
+    )
 
     subparsers = parser.add_subparsers(dest="subcommand")
     add_coverage_subparser(subparsers)
@@ -138,14 +150,19 @@ def _run_weekly(args: argparse.Namespace) -> int:
             args.week,
             dry_run=args.dry_run,
             expectations_db=expectations_db,
+            repo=getattr(args, "repo", None),
         )
     except Exception:  # noqa: BLE001 — CLI is the top of the stack
         logging.exception("Synthesis failed")
         return 2
 
     if result is None and not args.dry_run:
+        repo_suffix = (
+            f" for repo={args.repo!r}" if getattr(args, "repo", None) else ""
+        )
         print(
-            "No retrospective written (no units for week, or file already exists)",
+            "No retrospective written (no units for week, or file already "
+            f"exists){repo_suffix}",
             file=sys.stderr,
         )
         return 0
