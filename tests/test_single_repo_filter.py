@@ -416,3 +416,147 @@ def test_run_synthesis_no_flag_writes_bare_week_path(
     # Flat path (no week directory) — unchanged from pre-#88 behavior.
     assert result.name == f"{WEEK}.md"
     assert result.parent.name == "retrospectives"
+
+
+# ---------------------------------------------------------------------------
+# F-4 cycle 1 — rebuild-preservation negative assertions
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_rebuild_with_repo_preserves_other_repos_rows(
+    two_repo_fixture: dict,
+) -> None:
+    """Negative invariant: ``--repo A --rebuild-summaries`` must NOT
+    delete repo B's summary rows for the same week (F-4)."""
+    cfg = _make_config(two_repo_fixture["tmp_path"])
+
+    # Seed a summary row for every unit in the fixture (both repos).
+    for uid in ("u-a-issue", "u-a-pr", "u-b-issue", "u-b-pr", "u-lookalike"):
+        _seed_unit_summary(two_repo_fixture["gh_db"], uid)
+
+    rc = run_summarization(
+        cfg,
+        github_db=str(two_repo_fixture["gh_db"]),
+        sessions_db=str(two_repo_fixture["sess_db"]),
+        week_start=WEEK,
+        rebuild=True,
+        repo=REPO_A,
+    )
+    assert rc == 0
+
+    conn = sqlite3.connect(str(two_repo_fixture["gh_db"]))
+    try:
+        rows = conn.execute(
+            "SELECT unit_id FROM unit_summaries WHERE week_start = ?",
+            (WEEK,),
+        ).fetchall()
+    finally:
+        conn.close()
+    ids = {r[0] for r in rows}
+    # Repo B's summaries (and the look-alike) must still be present.
+    assert "u-b-issue" in ids
+    assert "u-b-pr" in ids
+    assert "u-lookalike" in ids
+    # Repo A's rows are rewritten (either present after re-summarisation
+    # or not — what we assert here is that the *other* repos survived).
+
+
+def test_extract_expectations_rebuild_with_repo_preserves_other_repos_rows(
+    two_repo_fixture: dict,
+) -> None:
+    """Negative invariant for run_extraction (F-4). Seed expectations for
+    both repos, run rebuild scoped to repo A, confirm repo B survives."""
+    cfg = _make_config(two_repo_fixture["tmp_path"])
+
+    # Seed expectations rows directly — one per unit in both repos.
+    conn = sqlite3.connect(str(two_repo_fixture["exp_db"]))
+    try:
+        for uid in ("u-a-issue", "u-a-pr", "u-b-issue", "u-b-pr"):
+            conn.execute(
+                "INSERT INTO expectations "
+                "(week_start, unit_id, commitment_point, expected_scope, "
+                " expected_effort, expected_outcome, confidence, model, "
+                " input_bytes, skip_reason) "
+                "VALUES (?, ?, NULL, NULL, NULL, NULL, NULL, 'test', 0, NULL)",
+                (WEEK, uid),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    rc = run_extraction(
+        cfg,
+        github_db=str(two_repo_fixture["gh_db"]),
+        sessions_db=str(two_repo_fixture["sess_db"]),
+        expectations_db=str(two_repo_fixture["exp_db"]),
+        week_start=WEEK,
+        rebuild=True,
+        repo=REPO_A,
+    )
+    assert rc == 0
+
+    conn = sqlite3.connect(str(two_repo_fixture["exp_db"]))
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT unit_id FROM expectations WHERE week_start = ?",
+            (WEEK,),
+        ).fetchall()
+    finally:
+        conn.close()
+    ids = {r[0] for r in rows}
+    # Repo B's pre-existing rows must still be present after the
+    # repo-scoped rebuild — otherwise a dev iteration would silently
+    # wipe other repos' work.
+    assert "u-b-issue" in ids
+    assert "u-b-pr" in ids
+
+
+# ---------------------------------------------------------------------------
+# F-8 cycle 1 — alias-aware session resolver test (units_alias="u")
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_respects_repo_filter_for_session_rooted_unit(
+    two_repo_fixture: dict,
+) -> None:
+    """Exercise the ``units_alias='u'`` branch of the session resolver.
+
+    `_load_unsummarized_units` joins ``units u`` against ``unit_summaries``
+    and passes ``units_alias='u'``. The session subquery inside the
+    helper is written against its own alias (``u2``) and must remain
+    correct when the outer query uses a non-empty alias. Verified by
+    seeding a session-rooted unit + attribution row and confirming
+    ``run_summarization(..., repo=REPO_A)`` picks it up."""
+    gh_db = two_repo_fixture["gh_db"]
+    _seed_unit(
+        gh_db,
+        unit_id="u-a-session",
+        root_node_type="session",
+        root_node_id="session:xyz-789",
+    )
+    _seed_session_attribution(gh_db, session_uuid="xyz-789", repo=REPO_A, issue_number=1)
+
+    cfg = _make_config(two_repo_fixture["tmp_path"])
+    rc = run_summarization(
+        cfg,
+        github_db=str(gh_db),
+        sessions_db=str(two_repo_fixture["sess_db"]),
+        week_start=WEEK,
+        repo=REPO_A,
+    )
+    assert rc == 0
+
+    conn = sqlite3.connect(str(gh_db))
+    try:
+        rows = conn.execute(
+            "SELECT unit_id FROM unit_summaries WHERE week_start = ?",
+            (WEEK,),
+        ).fetchall()
+    finally:
+        conn.close()
+    ids = {r[0] for r in rows}
+    # Session-rooted unit must be present (resolver works under alias="u").
+    assert "u-a-session" in ids
+    # Repo B's units are not summarised.
+    assert "u-b-issue" not in ids
+    assert "u-b-pr" not in ids
