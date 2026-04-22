@@ -73,13 +73,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--repo",
         default=None,
         help=(
-            "Filter LLM stages to a single repo (e.g. "
-            "'hyang0129/am-i-shipping'). Writes "
-            "retrospectives/<week>/<owner>__<repo>.md instead of "
-            "retrospectives/<week>.md so single-repo and full-weekly "
-            "runs coexist. Intended for dev-loop iteration; "
-            "unit_summaries / expectations remain partial for "
-            "non-targeted repos in the week."
+            "Filter LLM stages to a single repo (owner/name, e.g. "
+            "'hyang0129/am-i-shipping'). Writes the retrospective to "
+            "retrospectives/<week>/<owner>__<name>.md so single-repo "
+            "and full-weekly runs for the same week coexist. "
+            "Intended for dev-loop iteration; unit_summaries and "
+            "expectations remain partial for non-targeted repos."
         ),
     )
 

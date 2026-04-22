@@ -375,10 +375,11 @@ def run_summarization(
             )
 
             if not units:
+                repo_suffix = f" repo={repo}" if repo else ""
                 logger.info(
-                    "No unsummarized units for week_start=%s repo=%s; "
+                    "No unsummarized units for week_start=%s%s; "
                     "nothing to do",
-                    week_start, repo,
+                    week_start, repo_suffix,
                 )
                 return 0
 
@@ -477,10 +478,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--repo",
         default=None,
         help=(
-            "Filter to a single repo (e.g. 'hyang0129/am-i-shipping'). "
-            "Only units whose root_node_id belongs to this repo are "
-            "summarised. Intended for dev-loop iteration; unit_summaries "
-            "remain partial for the week when the flag is set."
+            "Filter to a single repo (owner/name, e.g. "
+            "'hyang0129/am-i-shipping'). Only units whose root_node_id "
+            "belongs to this repo are summarised. "
+            "Intended for dev-loop iteration; unit_summaries remain "
+            "partial for non-targeted repos."
         ),
     )
     return parser

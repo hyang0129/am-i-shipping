@@ -24,7 +24,6 @@ reachable, but the resolver SQL must still hold.
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import replace
 from pathlib import Path
 
 import pytest

@@ -896,9 +896,10 @@ def run_synthesis(
     try:
         units = _load_units(gh_conn, week_start, repo=repo)
         if not units:
+            repo_suffix = f" repo={repo}" if repo else ""
             logger.info(
-                "No units found for week_start=%s repo=%s; skipping synthesis",
-                week_start, repo,
+                "No units found for week_start=%s%s; skipping synthesis",
+                week_start, repo_suffix,
             )
             return None
 

@@ -678,9 +678,10 @@ def run(
             ]
 
         if not expectations:
+            repo_suffix = f" repo={repo}" if repo else ""
             logger.info(
-                "revision_detector: no expectations for week=%s repo=%s; no-op",
-                week_start, repo,
+                "revision_detector: no expectations for week=%s%s; no-op",
+                week_start, repo_suffix,
             )
             return 0
 
