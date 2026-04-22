@@ -465,12 +465,25 @@ def _load_extracted_unit_ids(
 
 
 def _load_week_units(
-    gh_conn: sqlite3.Connection, week_start: str
+    gh_conn: sqlite3.Connection, week_start: str,
+    repo: Optional[str] = None,
 ) -> List[str]:
-    """Return all ``unit_id`` values in ``units`` for *week_start*, sorted."""
+    """Return all ``unit_id`` values in ``units`` for *week_start*, sorted.
+
+    When *repo* is set (issue #88), filter to units scoped to that repo
+    via :func:`synthesis.weekly._repo_filter_sql`. Without it the query
+    is byte-identical to the pre-#88 baseline.
+    """
+    from synthesis.weekly import _repo_filter_sql, _repo_filter_bind
+
+    fragment, _ = _repo_filter_sql(repo)
+    params: List = [week_start]
+    if fragment:
+        params.extend(_repo_filter_bind(repo, week_start))
     rows = gh_conn.execute(
-        "SELECT unit_id FROM units WHERE week_start = ? ORDER BY unit_id",
-        (week_start,),
+        f"SELECT unit_id FROM units WHERE week_start = ?{fragment} "
+        "ORDER BY unit_id",
+        params,
     ).fetchall()
     return [r[0] for r in rows]
 
@@ -525,6 +538,7 @@ def run_extraction(
     expectations_db: str,
     week_start: str,
     rebuild: bool = False,
+    repo: Optional[str] = None,
 ) -> int:
     """Extract expectations for every unit in *week_start*.
 
@@ -582,15 +596,31 @@ def run_extraction(
         sessions_conn = gh_conn if _same else sqlite3.connect(sessions_db)
 
         if rebuild:
-            exp_conn.execute(
-                "DELETE FROM expectations WHERE week_start = ?", (week_start,)
-            )
+            # When rebuild is combined with --repo, clear only the targeted
+            # repo's expectations rows. Sub-select against units in github.db
+            # via ATTACH is clumsy across two SQLite connections, so we
+            # compute the unit_id set in Python and issue a bounded DELETE.
+            if repo:
+                targeted = _load_week_units(gh_conn, week_start, repo=repo)
+                if targeted:
+                    placeholders = ",".join("?" * len(targeted))
+                    exp_conn.execute(
+                        "DELETE FROM expectations WHERE week_start = ? "
+                        f"AND unit_id IN ({placeholders})",
+                        [week_start] + targeted,
+                    )
+            else:
+                exp_conn.execute(
+                    "DELETE FROM expectations WHERE week_start = ?",
+                    (week_start,),
+                )
             exp_conn.commit()
 
-        all_units = _load_week_units(gh_conn, week_start)
+        all_units = _load_week_units(gh_conn, week_start, repo=repo)
         if not all_units:
             logger.info(
-                "No units for week_start=%s; nothing to extract", week_start
+                "No units for week_start=%s repo=%s; nothing to extract",
+                week_start, repo,
             )
             return 0
 
@@ -802,6 +832,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default="config.yaml",
         help="Path to config.yaml (default: config.yaml in repo root).",
     )
+    parser.add_argument(
+        "--repo",
+        default=None,
+        help=(
+            "Filter to a single repo (e.g. 'hyang0129/am-i-shipping'). "
+            "Only units whose root_node_id belongs to this repo are "
+            "extracted. Intended for dev-loop iteration; expectations "
+            "remain partial for the week when the flag is set."
+        ),
+    )
     return parser
 
 
@@ -827,6 +867,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         expectations_db=expectations_db,
         week_start=args.week,
         rebuild=args.rebuild,
+        repo=getattr(args, "repo", None),
     )
     sys.exit(result)
 

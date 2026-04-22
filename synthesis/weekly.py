@@ -213,22 +213,131 @@ def water_fill_truncate(
 # ---------------------------------------------------------------------------
 
 
+def _repo_filter_sql(
+    repo: Optional[str],
+    *,
+    units_alias: str = "",
+) -> Tuple[str, List[str]]:
+    """Return ``(sql_fragment, params)`` for filtering ``units`` by repo.
+
+    Issue #88 — single-repo filter for the LLM pipeline stages.
+
+    When *repo* is ``None`` or empty, returns ``("", [])`` so callers can
+    concatenate the fragment unconditionally and leave the baseline
+    no-flag SQL byte-identical.
+
+    When *repo* is a ``"owner/name"`` slug, the fragment is an ``AND ...``
+    clause (parenthesised) matching:
+
+    * issue-rooted units whose ``root_node_id`` is literally
+      ``issue:<repo>#<N>``,
+    * PR-rooted units whose ``root_node_id`` is literally
+      ``pr:<repo>#<N>``, and
+    * session-rooted units whose ``session:<uuid>`` is attributed to the
+      target repo via ``session_issue_attribution``.
+
+    The session branch covers the defensive path: today's
+    ``unit_identifier`` drops session-only graph components so
+    ``root_node_type='session'`` is effectively empty in practice, but the
+    spec (refined issue #88) calls for the resolver because a future
+    change upstream could start emitting them. Sessions attributed only
+    to a PR (not an issue) would be missed — documented limitation,
+    acceptable for a dev-loop feature.
+
+    ``units_alias`` lets callers reference a joined/aliased ``units`` table
+    (e.g. ``"u"`` in the ``LEFT JOIN unit_summaries`` query). Pass ``""``
+    when the SELECT is a bare ``FROM units``.
+
+    The trailing ``#%`` boundary on each LIKE pattern prevents
+    ``hyang0129/am-i-shipping`` from matching
+    ``hyang0129/am-i-shipping-sibling``.
+    """
+    if not repo:
+        return "", []
+
+    prefix = f"{units_alias}." if units_alias else ""
+    issue_pat = f"issue:{repo}#%"
+    pr_pat = f"pr:{repo}#%"
+
+    # Inner subquery resolves session-rooted units via
+    # session_issue_attribution. We substr the root_node_id past the
+    # literal "session:" prefix to recover the uuid, then join against
+    # the attribution table on (week_start, session_uuid, repo).
+    #
+    # The subquery is intentionally scoped by the *outer* week_start
+    # (via a correlated column). Callers always filter on week_start in
+    # the outer WHERE, so the subquery's ``u2.week_start = ?`` is fed
+    # the same value — we keep the binding explicit rather than
+    # correlating to avoid a dependency on the outer alias naming.
+    #
+    # Tied to :data:`synthesis.weekly._repo_filter_sql` — any change to
+    # the shape here must match the callers in gap_analysis / expectations /
+    # summarize / weekly at once.
+    session_subquery = (
+        "SELECT u2.unit_id FROM units u2 "
+        "JOIN session_issue_attribution sia "
+        "  ON sia.week_start = u2.week_start "
+        " AND sia.session_uuid = substr(u2.root_node_id, length('session:') + 1) "
+        "WHERE u2.week_start = ? "
+        "  AND u2.root_node_type = 'session' "
+        "  AND sia.repo = ?"
+    )
+
+    fragment = (
+        f" AND ({prefix}root_node_id LIKE ? "
+        f"     OR {prefix}root_node_id LIKE ? "
+        f"     OR (({prefix}root_node_type = 'session') "
+        f"         AND {prefix}unit_id IN ({session_subquery})))"
+    )
+    # Param order matches the ?s above: issue LIKE, pr LIKE, session
+    # subquery's week_start, session subquery's repo.
+    # NOTE — the caller is responsible for binding its own ``week_start``
+    # placeholder earlier in the query; this helper contributes the
+    # four placeholders above in order.
+    # session_week_start is duplicated from the outer bind by the caller
+    # via the ``session_week_start`` helper below. Keep them in lock-step.
+    return fragment, [issue_pat, pr_pat, "__SESSION_WEEK_PLACEHOLDER__", repo]
+
+
+def _repo_filter_bind(
+    repo: Optional[str],
+    week_start: str,
+) -> List[str]:
+    """Return the concrete parameter list for :func:`_repo_filter_sql`.
+
+    Handles the ``session_week_start`` substitution so callers do not
+    have to remember the placeholder convention.
+    """
+    _, params = _repo_filter_sql(repo)
+    return [week_start if p == "__SESSION_WEEK_PLACEHOLDER__" else p for p in params]
+
+
 def _load_units(
     github_conn: sqlite3.Connection,
     week_start: str,
+    repo: Optional[str] = None,
 ) -> List[dict]:
     """Return one dict per ``units`` row for *week_start*.
 
     Includes ``outlier_flags`` (JSON string or NULL) and
     ``abandonment_flag`` (0/1 or NULL) from the cross-unit pass.
+
+    When *repo* is set, filter to units whose ``root_node_id`` is
+    scoped to that repo (issue:/pr: LIKE + session resolver). When
+    ``None`` (default), the query is byte-identical to the pre-#88
+    baseline.
     """
+    fragment, _params_placeholder = _repo_filter_sql(repo)
+    params: List = [week_start]
+    if fragment:
+        params.extend(_repo_filter_bind(repo, week_start))
     rows = github_conn.execute(
         "SELECT unit_id, root_node_type, root_node_id, "
         "       elapsed_days, dark_time_pct, total_reprompts, "
         "       review_cycles, status, outlier_flags, abandonment_flag "
-        "FROM units WHERE week_start = ? "
+        f"FROM units WHERE week_start = ?{fragment} "
         "ORDER BY unit_id",
-        (week_start,),
+        params,
     ).fetchall()
     return [
         {
@@ -735,6 +844,7 @@ def run_synthesis(
     week_start: str,
     dry_run: bool = False,
     expectations_db: Optional[Union[str, Path]] = None,
+    repo: Optional[str] = None,
 ) -> Optional[Path]:
     """End-to-end weekly synthesis for *week_start*.
 
@@ -784,10 +894,11 @@ def run_synthesis(
     sess_conn = gh_conn if _same else sqlite3.connect(str(sess_path))
 
     try:
-        units = _load_units(gh_conn, week_start)
+        units = _load_units(gh_conn, week_start, repo=repo)
         if not units:
             logger.info(
-                "No units found for week_start=%s; skipping synthesis", week_start
+                "No units found for week_start=%s repo=%s; skipping synthesis",
+                week_start, repo,
             )
             return None
 
@@ -937,11 +1048,13 @@ def run_synthesis(
                     github_db=str(gh_path),
                     expectations_db=str(expectations_db),
                     config=config,
+                    repo=repo,
                 )
                 gap_rows = gap_analysis.load_gap_rows(
                     str(expectations_db),
                     week_start,
                     min_severity=("major", "critical"),
+                    repo=repo,
                 )
                 # Epic #27 — X-4 (#75): auto-confirm sweep fires on every
                 # ``am-synthesize --week`` invocation (AS-6). Any gap row
@@ -985,9 +1098,11 @@ def run_synthesis(
                     sessions_db=str(sess_path),
                     expectations_db=str(expectations_db),
                     config=config,
+                    repo=repo,
                 )
                 revision_rows = revision_detector.load_revision_rows(
-                    str(expectations_db), week_start
+                    str(expectations_db), week_start, repo=repo,
+                    github_db=str(gh_path),
                 )
             except sqlite3.OperationalError as exc:
                 logger.warning(
@@ -1122,7 +1237,9 @@ def run_synthesis(
         user_content = messages[0]["content"]
         markdown = _get_adapter(config).call(system_prompt, user_content, config.model, _MAX_OUTPUT_TOKENS).text
 
-        result = write_retrospective(markdown, config.output_dir, week_start)
+        result = write_retrospective(
+            markdown, config.output_dir, week_start, repo=repo
+        )
 
         # Record a successful synthesis run in health.json ONLY when the
         # retrospective was actually written this invocation. Refuse-to-
@@ -1146,6 +1263,8 @@ __all__ = [
     "run_synthesis",
     "water_fill_truncate",
     "_resolve_unit_sessions",
+    "_repo_filter_sql",
+    "_repo_filter_bind",
     "TRANSCRIPT_BUDGET_BYTES",
     "MAX_UNITS_PER_PROMPT",
     "MAX_PROMPT_SOFT_WARN_BYTES",

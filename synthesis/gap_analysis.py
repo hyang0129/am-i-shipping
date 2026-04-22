@@ -447,6 +447,7 @@ def run(
     github_db: str,
     expectations_db: str,
     config: Optional[SynthesisConfig] = None,
+    repo: Optional[str] = None,
 ) -> int:
     """Compute gap rows for every unit with an expectations row in *week_start*.
 
@@ -493,6 +494,24 @@ def run(
 
     try:
         expectations = _load_expectations(exp_conn, week_start)
+
+        # Issue #88: restrict to the targeted repo's unit set.
+        # When *repo* is None the set is None (meaning "no filter").
+        # Otherwise we resolve the unit_id set once via weekly's filter
+        # helper (which knows how to apply the session resolver) and
+        # drop every expectation row whose unit_id is not in the set.
+        # This is simpler than rewriting the expectations SELECT to
+        # cross-join units, and cheap because expectations-per-week is
+        # O(units-per-week).
+        if repo:
+            from synthesis.weekly import _load_units
+            targeted_units = {
+                u["unit_id"] for u in _load_units(gh_conn, week_start, repo=repo)
+            }
+            expectations = [
+                e for e in expectations if e["unit_id"] in targeted_units
+            ]
+
         if not expectations:
             logger.info(
                 "No expectations rows for week=%s; gap pass is a no-op",
@@ -835,12 +854,21 @@ def load_gap_rows(
     week_start: str,
     *,
     min_severity: Optional[tuple[str, ...]] = None,
+    repo: Optional[str] = None,
+    github_db: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return gap rows for *week_start*, optionally filtered by severity.
 
     *min_severity* is a tuple of severities to include (e.g.
     ``("major", "critical")`` for retrospective rendering). ``None``
     returns every row.
+
+    When *repo* is set (issue #88), an additional Python-side filter
+    restricts rows to unit_ids that belong to that repo. Because
+    ``expectations.db`` does not carry the repo column, the caller must
+    also supply *github_db* so the helper can resolve the unit set via
+    :func:`synthesis.weekly._load_units`. If *github_db* is missing, the
+    repo filter is silently ignored (degraded rather than misleading).
     """
     conn = sqlite3.connect(str(expectations_db))
     try:
@@ -864,7 +892,7 @@ def load_gap_rows(
                 f"ORDER BY unit_id",
                 [week_start, *min_severity],
             ).fetchall()
-        return [
+        results = [
             {
                 "unit_id": r[0],
                 "commitment_point": r[1],
@@ -880,6 +908,20 @@ def load_gap_rows(
         ]
     finally:
         conn.close()
+
+    if repo and github_db:
+        from synthesis.weekly import _load_units
+
+        gh_conn = sqlite3.connect(str(github_db))
+        try:
+            targeted = {
+                u["unit_id"]
+                for u in _load_units(gh_conn, week_start, repo=repo)
+            }
+        finally:
+            gh_conn.close()
+        results = [r for r in results if r["unit_id"] in targeted]
+    return results
 
 
 __all__ = [
