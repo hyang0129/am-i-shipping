@@ -215,6 +215,7 @@ def water_fill_truncate(
 
 def _repo_filter_sql(
     repo: Optional[str],
+    week_start: Optional[str] = None,
     *,
     units_alias: str = "",
 ) -> Tuple[str, List[str]]:
@@ -248,31 +249,48 @@ def _repo_filter_sql(
     (e.g. ``"u"`` in the ``LEFT JOIN unit_summaries`` query). Pass ``""``
     when the SELECT is a bare ``FROM units``.
 
+    ``week_start`` must be provided whenever ``repo`` is truthy — the
+    session-attribution subquery correlates on ``week_start`` and the
+    helper binds it directly so the caller does not have to remember a
+    placeholder convention. (F-1 collapse: previously a two-function API
+    that returned a sentinel string; now a single function that returns
+    a ready-to-bind param list.)
+
     The trailing ``#%`` boundary on each LIKE pattern prevents
     ``hyang0129/am-i-shipping`` from matching
-    ``hyang0129/am-i-shipping-sibling``.
+    ``hyang0129/am-i-shipping-sibling``. The slug is also LIKE-escaped
+    (``%``, ``_``, backslash) with an explicit ``ESCAPE '\\'`` clause
+    so a repo whose name legitimately contains ``_`` — e.g.
+    ``owner/my_repo`` — cannot be confused with ``owner/myXrepo``.
     """
     if not repo:
         return "", []
+    if week_start is None:
+        raise ValueError(
+            "_repo_filter_sql: week_start is required when repo is set "
+            "(the session-attribution subquery correlates on week_start)"
+        )
 
     prefix = f"{units_alias}." if units_alias else ""
-    issue_pat = f"issue:{repo}#%"
-    pr_pat = f"pr:{repo}#%"
+
+    # LIKE-escape the slug so %, _, or \\ inside an owner/name cannot
+    # turn into SQL LIKE metacharacters. ``ESCAPE '\\'`` below tells
+    # SQLite to treat our backslash as the literal-escape sentinel.
+    esc_repo = (
+        repo.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
+    issue_pat = f"issue:{esc_repo}#%"
+    pr_pat = f"pr:{esc_repo}#%"
 
     # Inner subquery resolves session-rooted units via
     # session_issue_attribution. We substr the root_node_id past the
     # literal "session:" prefix to recover the uuid, then join against
     # the attribution table on (week_start, session_uuid, repo).
     #
-    # The subquery is intentionally scoped by the *outer* week_start
-    # (via a correlated column). Callers always filter on week_start in
-    # the outer WHERE, so the subquery's ``u2.week_start = ?`` is fed
-    # the same value — we keep the binding explicit rather than
-    # correlating to avoid a dependency on the outer alias naming.
-    #
-    # Tied to :data:`synthesis.weekly._repo_filter_sql` — any change to
-    # the shape here must match the callers in gap_analysis / expectations /
-    # summarize / weekly at once.
+    # The subquery's ``u2.week_start = ?`` is bound to the *same*
+    # week_start the caller filters the outer query on. Binding it
+    # directly here (rather than correlating to an outer alias) keeps
+    # the helper independent of the caller's alias naming.
     session_subquery = (
         "SELECT u2.unit_id FROM units u2 "
         "JOIN session_issue_attribution sia "
@@ -284,32 +302,16 @@ def _repo_filter_sql(
     )
 
     fragment = (
-        f" AND ({prefix}root_node_id LIKE ? "
-        f"     OR {prefix}root_node_id LIKE ? "
+        f" AND ({prefix}root_node_id LIKE ? ESCAPE '\\' "
+        f"     OR {prefix}root_node_id LIKE ? ESCAPE '\\' "
         f"     OR (({prefix}root_node_type = 'session') "
         f"         AND {prefix}unit_id IN ({session_subquery})))"
     )
     # Param order matches the ?s above: issue LIKE, pr LIKE, session
-    # subquery's week_start, session subquery's repo.
-    # NOTE — the caller is responsible for binding its own ``week_start``
-    # placeholder earlier in the query; this helper contributes the
-    # four placeholders above in order.
-    # session_week_start is duplicated from the outer bind by the caller
-    # via the ``session_week_start`` helper below. Keep them in lock-step.
-    return fragment, [issue_pat, pr_pat, "__SESSION_WEEK_PLACEHOLDER__", repo]
-
-
-def _repo_filter_bind(
-    repo: Optional[str],
-    week_start: str,
-) -> List[str]:
-    """Return the concrete parameter list for :func:`_repo_filter_sql`.
-
-    Handles the ``session_week_start`` substitution so callers do not
-    have to remember the placeholder convention.
-    """
-    _, params = _repo_filter_sql(repo)
-    return [week_start if p == "__SESSION_WEEK_PLACEHOLDER__" else p for p in params]
+    # subquery's week_start, session subquery's repo. ``repo`` in the
+    # session branch is compared directly against ``session_issue_attribution.repo``
+    # — no LIKE, no escape needed.
+    return fragment, [issue_pat, pr_pat, week_start, repo]
 
 
 def _load_units(
@@ -327,10 +329,8 @@ def _load_units(
     ``None`` (default), the query is byte-identical to the pre-#88
     baseline.
     """
-    fragment, _params_placeholder = _repo_filter_sql(repo)
-    params: List = [week_start]
-    if fragment:
-        params.extend(_repo_filter_bind(repo, week_start))
+    fragment, repo_params = _repo_filter_sql(repo, week_start)
+    params: List = [week_start, *repo_params]
     rows = github_conn.execute(
         "SELECT unit_id, root_node_type, root_node_id, "
         "       elapsed_days, dark_time_pct, total_reprompts, "
@@ -1055,6 +1055,7 @@ def run_synthesis(
                     week_start,
                     min_severity=("major", "critical"),
                     repo=repo,
+                    github_db=str(gh_path),
                 )
                 # Epic #27 — X-4 (#75): auto-confirm sweep fires on every
                 # ``am-synthesize --week`` invocation (AS-6). Any gap row
@@ -1264,7 +1265,6 @@ __all__ = [
     "water_fill_truncate",
     "_resolve_unit_sessions",
     "_repo_filter_sql",
-    "_repo_filter_bind",
     "TRANSCRIPT_BUDGET_BYTES",
     "MAX_UNITS_PER_PROMPT",
     "MAX_PROMPT_SOFT_WARN_BYTES",

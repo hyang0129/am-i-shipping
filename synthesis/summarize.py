@@ -36,7 +36,11 @@ from typing import List, Optional, Sequence, Tuple
 from am_i_shipping.config_loader import SynthesisConfig, load_config
 from am_i_shipping.db import init_github_db
 from synthesis.llm_adapter import _get_adapter
-from synthesis.weekly import _load_session_transcripts, _unit_nodes
+from synthesis.weekly import (
+    _load_session_transcripts,
+    _repo_filter_sql,
+    _unit_nodes,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -83,24 +87,22 @@ def _load_unsummarized_units(
     targeted repo's units are summarised. Without *repo*, the query is
     byte-identical to the pre-#88 baseline.
     """
-    from synthesis.weekly import _repo_filter_sql, _repo_filter_bind
-
     if rebuild:
         # For a repo-scoped rebuild we still only want to clear rows
         # belonging to that repo — otherwise a dev iteration would
         # silently blow away every other repo's summaries for the week.
         if repo:
-            fragment, _placeholders = _repo_filter_sql(repo, units_alias="u")
-            params: List = [week_start]
-            params.extend(_repo_filter_bind(repo, week_start))
+            fragment, repo_params = _repo_filter_sql(
+                repo, week_start, units_alias="u"
+            )
             gh_conn.execute(
-                # Delete using an EXISTS filter against ``units u`` so the
+                # Delete using a sub-select against ``units u`` so the
                 # repo predicate can be applied alongside the week key.
                 "DELETE FROM unit_summaries WHERE week_start = ? "
                 "AND unit_id IN ("
                 f"  SELECT u.unit_id FROM units u WHERE u.week_start = ?{fragment}"
                 ")",
-                [week_start] + params,
+                [week_start, week_start, *repo_params],
             )
         else:
             gh_conn.execute(
@@ -109,10 +111,8 @@ def _load_unsummarized_units(
             )
         gh_conn.commit()
 
-    fragment, _placeholders = _repo_filter_sql(repo, units_alias="u")
-    params: List = [week_start]
-    if fragment:
-        params.extend(_repo_filter_bind(repo, week_start))
+    fragment, repo_params = _repo_filter_sql(repo, week_start, units_alias="u")
+    params: List = [week_start, *repo_params]
 
     rows = gh_conn.execute(
         "SELECT u.unit_id FROM units u "

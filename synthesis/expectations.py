@@ -56,7 +56,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from am_i_shipping.config_loader import SynthesisConfig, load_config
 from am_i_shipping.db import init_expectations_db, init_github_db
 from synthesis.llm_adapter import _get_adapter
-from synthesis.weekly import _load_session_transcripts, _resolve_unit_sessions, _unit_nodes
+from synthesis.weekly import (
+    _load_session_transcripts,
+    _load_units,
+    _repo_filter_sql,
+    _resolve_unit_sessions,
+    _unit_nodes,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -474,12 +480,8 @@ def _load_week_units(
     via :func:`synthesis.weekly._repo_filter_sql`. Without it the query
     is byte-identical to the pre-#88 baseline.
     """
-    from synthesis.weekly import _repo_filter_sql, _repo_filter_bind
-
-    fragment, _ = _repo_filter_sql(repo)
-    params: List = [week_start]
-    if fragment:
-        params.extend(_repo_filter_bind(repo, week_start))
+    fragment, repo_params = _repo_filter_sql(repo, week_start)
+    params: List = [week_start, *repo_params]
     rows = gh_conn.execute(
         f"SELECT unit_id FROM units WHERE week_start = ?{fragment} "
         "ORDER BY unit_id",

@@ -186,11 +186,40 @@ def test_repo_filter_sql_is_noop_without_repo() -> None:
 
 
 def test_repo_filter_sql_pins_slug_boundary() -> None:
-    _, params = _repo_filter_sql(REPO_A)
+    _, params = _repo_filter_sql(REPO_A, WEEK)
     # Param patterns must end in ``#%`` so a sibling repo slug cannot match.
     like_params = [p for p in params if p.startswith(("issue:", "pr:"))]
     assert len(like_params) == 2
     assert all(p.endswith("#%") for p in like_params)
+
+
+def test_repo_filter_sql_requires_week_start_when_repo_set() -> None:
+    """F-1 cycle 1: helper must fail loudly if caller forgets week_start.
+
+    The old two-function API used a sentinel string that silently
+    surfaced as a bad bind if the caller skipped ``_repo_filter_bind``.
+    The collapsed API makes week_start a required positional whenever
+    repo is truthy.
+    """
+    with pytest.raises(ValueError, match="week_start is required"):
+        _repo_filter_sql(REPO_A)
+
+
+def test_repo_filter_sql_escapes_like_metachars() -> None:
+    """F-3 cycle 1: underscore / percent in a repo name must not leak as
+    LIKE wildcards. A repo called ``owner/my_repo`` must not match a
+    unit id ``issue:owner/myXrepo#1``."""
+    from synthesis.weekly import _repo_filter_sql as _filter
+
+    _, params = _filter("owner/my_repo", WEEK)
+    like_params = [p for p in params if p.startswith(("issue:", "pr:"))]
+    # The ``_`` was escaped to ``\_`` (so the LIKE treats it literally).
+    assert all("\\_" in p for p in like_params)
+
+    # A literal ``%`` in the slug is also escaped.
+    _, pct_params = _filter("owner/50%repo", WEEK)
+    pct_like = [p for p in pct_params if p.startswith(("issue:", "pr:"))]
+    assert all("\\%" in p for p in pct_like)
 
 
 def test_load_units_filters_by_repo(two_repo_fixture: dict) -> None:

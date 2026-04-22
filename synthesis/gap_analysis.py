@@ -42,7 +42,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from am_i_shipping.config_loader import SynthesisConfig
 from synthesis.llm_adapter import _get_adapter
-from synthesis.weekly import _resolve_unit_sessions
+from synthesis.weekly import _load_units, _resolve_unit_sessions
 
 
 logger = logging.getLogger(__name__)
@@ -504,7 +504,6 @@ def run(
         # cross-join units, and cheap because expectations-per-week is
         # O(units-per-week).
         if repo:
-            from synthesis.weekly import _load_units
             targeted_units = {
                 u["unit_id"] for u in _load_units(gh_conn, week_start, repo=repo)
             }
@@ -867,9 +866,17 @@ def load_gap_rows(
     restricts rows to unit_ids that belong to that repo. Because
     ``expectations.db`` does not carry the repo column, the caller must
     also supply *github_db* so the helper can resolve the unit set via
-    :func:`synthesis.weekly._load_units`. If *github_db* is missing, the
-    repo filter is silently ignored (degraded rather than misleading).
+    :func:`synthesis.weekly._load_units`. If *repo* is set without
+    *github_db*, this function raises ``ValueError`` — a silent degrade
+    would return cross-repo rows under a contract that implies
+    repo-scoping, so we fail loudly instead (F-2 cycle-1 fix).
     """
+    if repo and not github_db:
+        raise ValueError(
+            "load_gap_rows: repo filter requires github_db to resolve "
+            "the targeted unit set (expectations.db does not carry the "
+            "repo column)"
+        )
     conn = sqlite3.connect(str(expectations_db))
     try:
         if min_severity is None:
@@ -910,8 +917,6 @@ def load_gap_rows(
         conn.close()
 
     if repo and github_db:
-        from synthesis.weekly import _load_units
-
         gh_conn = sqlite3.connect(str(github_db))
         try:
             targeted = {
