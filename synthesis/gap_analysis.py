@@ -448,6 +448,7 @@ def run(
     expectations_db: str,
     config: Optional[SynthesisConfig] = None,
     repo: Optional[str] = None,
+    unit_ids: Optional[List[str]] = None,
 ) -> int:
     """Compute gap rows for every unit with an expectations row in *week_start*.
 
@@ -510,6 +511,10 @@ def run(
             expectations = [
                 e for e in expectations if e["unit_id"] in targeted_units
             ]
+
+        if unit_ids:
+            uid_set = set(unit_ids)
+            expectations = [e for e in expectations if e["unit_id"] in uid_set]
 
         if not expectations:
             logger.info(

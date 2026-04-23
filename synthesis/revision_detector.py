@@ -615,6 +615,7 @@ def run(
     config: Optional[SynthesisConfig] = None,
     rebuild: bool = False,
     repo: Optional[str] = None,
+    unit_ids: Optional[List[str]] = None,
 ) -> int:
     """Detect expectation revisions for every unit in *week_start*.
 
@@ -676,6 +677,10 @@ def run(
             expectations = [
                 e for e in expectations if e["unit_id"] in targeted_units
             ]
+
+        if unit_ids:
+            uid_set = set(unit_ids)
+            expectations = [e for e in expectations if e["unit_id"] in uid_set]
 
         if not expectations:
             repo_suffix = f" repo={repo}" if repo else ""

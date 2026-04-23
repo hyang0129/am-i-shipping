@@ -74,6 +74,8 @@ def _load_unsummarized_units(
     week_start: str,
     rebuild: bool = False,
     repo: Optional[str] = None,
+    unit_ids: Optional[List[str]] = None,
+    limit: Optional[int] = None,
 ) -> List[dict]:
     """Return units for *week_start* that do not yet have a summary row.
 
@@ -115,14 +117,47 @@ def _load_unsummarized_units(
     params: List = [week_start, *repo_params]
 
     rows = gh_conn.execute(
-        "SELECT u.unit_id FROM units u "
+        "SELECT u.unit_id, u.abandonment_flag, u.outlier_flags, u.elapsed_days "
+        "FROM units u "
         "LEFT JOIN unit_summaries s "
         "  ON u.week_start = s.week_start AND u.unit_id = s.unit_id "
         f"WHERE u.week_start = ? AND s.unit_id IS NULL{fragment} "
         "ORDER BY u.unit_id",
         params,
     ).fetchall()
-    return [{"unit_id": r[0]} for r in rows]
+
+    units = [
+        {
+            "unit_id": r[0],
+            "abandonment_flag": r[1],
+            "outlier_flags": r[2],
+            "elapsed_days": r[3],
+        }
+        for r in rows
+    ]
+
+    # Issue #90: explicit unit_id list takes precedence over limit.
+    if unit_ids:
+        uid_set = set(unit_ids)
+        unknown = [uid for uid in unit_ids if uid not in {u["unit_id"] for u in units}]
+        if unknown:
+            raise ValueError(
+                f"Unknown or already-summarized unit_ids for week_start={week_start!r}: {unknown}. "
+                "Check that the ids exist in units for this week and have no summary yet "
+                "(or pass --rebuild-summaries to re-summarize existing rows)."
+            )
+        units = [u for u in units if u["unit_id"] in uid_set]
+    elif limit is not None:
+        def _priority_key(u: dict) -> tuple:
+            abandoned = 1 if u.get("abandonment_flag") == 1 else 0
+            flags = u.get("outlier_flags")
+            has_outliers = 1 if (flags is not None and flags != "[]") else 0
+            elapsed = u.get("elapsed_days") or 0.0
+            return (-abandoned, -has_outliers, -elapsed, u["unit_id"])
+        units.sort(key=_priority_key)
+        units = units[:limit]
+
+    return units
 
 
 def _build_unit_input(
@@ -332,6 +367,8 @@ def run_summarization(
     week_start: str,
     rebuild: bool = False,
     repo: Optional[str] = None,
+    unit_ids: Optional[List[str]] = None,
+    limit: Optional[int] = None,
 ) -> int:
     """Summarize all unsummarized units for *week_start*.
 
@@ -371,7 +408,8 @@ def run_summarization(
 
         try:
             units = _load_unsummarized_units(
-                gh_conn, week_start, rebuild=rebuild, repo=repo
+                gh_conn, week_start, rebuild=rebuild, repo=repo,
+                unit_ids=unit_ids, limit=limit,
             )
 
             if not units:
@@ -485,6 +523,30 @@ def _build_parser() -> argparse.ArgumentParser:
             "partial for non-targeted repos."
         ),
     )
+    parser.add_argument(
+        "--unit-id",
+        dest="unit_ids",
+        action="append",
+        default=None,
+        metavar="UNIT_ID",
+        help=(
+            "Summarize only this unit_id. Repeatable: "
+            "--unit-id A --unit-id B. Takes precedence over --limit. "
+            "Errors if any supplied id is absent from units for the week "
+            "(or already has a summary and --rebuild-summaries is not set)."
+        ),
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Summarize at most N units, selected by the same priority order "
+            "am-synthesize uses (abandonment_flag first, then outlier_flags, "
+            "then elapsed_days desc). Ignored when --unit-id is supplied."
+        ),
+    )
     return parser
 
 
@@ -509,6 +571,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         week_start=args.week,
         rebuild=args.rebuild_summaries,
         repo=getattr(args, "repo", None),
+        unit_ids=getattr(args, "unit_ids", None),
+        limit=getattr(args, "limit", None),
     )
     sys.exit(result)
 

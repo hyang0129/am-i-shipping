@@ -81,6 +81,30 @@ def _build_parser() -> argparse.ArgumentParser:
             "expectations remain partial for non-targeted repos."
         ),
     )
+    parser.add_argument(
+        "--unit-id",
+        dest="unit_ids",
+        action="append",
+        default=None,
+        metavar="UNIT_ID",
+        help=(
+            "Restrict all LLM stages to this unit_id. Repeatable: "
+            "--unit-id A --unit-id B. Takes precedence over --limit. "
+            "Useful when unit_summaries exist for only a subset of the week."
+        ),
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Restrict all LLM stages to at most N units, selected by the "
+            "same priority order as the internal truncation (abandonment_flag "
+            "first, then outlier_flags, then elapsed_days desc). Ignored "
+            "when --unit-id is supplied."
+        ),
+    )
 
     subparsers = parser.add_subparsers(dest="subcommand")
     add_coverage_subparser(subparsers)
@@ -151,6 +175,8 @@ def _run_weekly(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             expectations_db=expectations_db,
             repo=getattr(args, "repo", None),
+            unit_ids=getattr(args, "unit_ids", None),
+            limit=getattr(args, "limit", None),
         )
     except Exception:  # noqa: BLE001 — CLI is the top of the stack
         logging.exception("Synthesis failed")

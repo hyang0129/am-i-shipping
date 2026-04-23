@@ -845,6 +845,8 @@ def run_synthesis(
     dry_run: bool = False,
     expectations_db: Optional[Union[str, Path]] = None,
     repo: Optional[str] = None,
+    unit_ids: Optional[List[str]] = None,
+    limit: Optional[int] = None,
 ) -> Optional[Path]:
     """End-to-end weekly synthesis for *week_start*.
 
@@ -903,6 +905,18 @@ def run_synthesis(
             )
             return None
 
+        # Issue #90: unit_ids / limit filter.
+        # unit_ids (explicit list) takes precedence over limit.
+        if unit_ids:
+            known = {u["unit_id"] for u in units}
+            unknown = [uid for uid in unit_ids if uid not in known]
+            if unknown:
+                raise ValueError(
+                    f"Unknown unit_ids for week_start={week_start!r}: {unknown}. "
+                    "Check that the ids exist in units for this week (and repo if --repo is set)."
+                )
+            units = [u for u in units if u["unit_id"] in set(unit_ids)]
+
         # --- Issue #54 P-2: prioritise + cap unit count ---------------
         # Prompt-size safety rail. Units are ordered so that the most
         # signal-bearing ones survive a truncation:
@@ -945,6 +959,9 @@ def run_synthesis(
             return (-abandoned, -has_outliers, -elapsed, unit_id)
 
         units.sort(key=_priority_key)
+
+        if limit is not None and unit_ids is None:
+            units = units[:limit]
 
         if len(units) > MAX_UNITS_PER_PROMPT:
             logger.warning(
@@ -1050,6 +1067,7 @@ def run_synthesis(
                     expectations_db=str(expectations_db),
                     config=config,
                     repo=repo,
+                    unit_ids=unit_ids,
                 )
                 gap_rows = gap_analysis.load_gap_rows(
                     str(expectations_db),
@@ -1101,6 +1119,7 @@ def run_synthesis(
                     expectations_db=str(expectations_db),
                     config=config,
                     repo=repo,
+                    unit_ids=unit_ids,
                 )
                 revision_rows = revision_detector.load_revision_rows(
                     str(expectations_db), week_start, repo=repo,
