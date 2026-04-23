@@ -480,8 +480,10 @@ def _load_week_units(
     """Return all ``unit_id`` values in ``units`` for *week_start*, sorted.
 
     When *repo* is set (issue #88), filter to units scoped to that repo
-    via :func:`synthesis.weekly._repo_filter_sql`. Without it the query
-    is byte-identical to the pre-#88 baseline.
+    via :func:`synthesis.weekly._repo_filter_sql`. Without it the function
+    returns the same ``unit_id`` list in the same order as the pre-#88
+    baseline; the SELECT now pulls extra columns to support the priority
+    sort when *limit* is active.
 
     When *unit_ids* is set (issue #90), filter to exactly those ids
     (validated against the DB). When *limit* is set and *unit_ids* is
@@ -635,15 +637,15 @@ def run_extraction(
             # the targeted rows. Sub-select against units in github.db via
             # ATTACH is clumsy across two SQLite connections, so we compute
             # the unit_id set in Python and issue a bounded DELETE.
-            if unit_ids:
-                placeholders = ",".join("?" * len(unit_ids))
-                exp_conn.execute(
-                    "DELETE FROM expectations WHERE week_start = ? "
-                    f"AND unit_id IN ({placeholders})",
-                    [week_start] + list(unit_ids),
+            #
+            # Pre-validate before any DELETE fires: _load_week_units raises
+            # ValueError for unknown ids (including ids outside the requested
+            # repo) and returns the repo-intersected list. This prevents a
+            # cross-repo clobber when --unit-id belongs to a different repo.
+            if unit_ids or repo:
+                targeted = _load_week_units(
+                    gh_conn, week_start, repo=repo, unit_ids=unit_ids, limit=None
                 )
-            elif repo:
-                targeted = _load_week_units(gh_conn, week_start, repo=repo)
                 if targeted:
                     placeholders = ",".join("?" * len(targeted))
                     exp_conn.execute(
