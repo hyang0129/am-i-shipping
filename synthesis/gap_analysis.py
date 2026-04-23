@@ -860,6 +860,7 @@ def load_gap_rows(
     min_severity: Optional[tuple[str, ...]] = None,
     repo: Optional[str] = None,
     github_db: Optional[str] = None,
+    unit_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Return gap rows for *week_start*, optionally filtered by severity.
 
@@ -931,6 +932,11 @@ def load_gap_rows(
         finally:
             gh_conn.close()
         results = [r for r in results if r["unit_id"] in targeted]
+
+    if unit_ids is not None:
+        uid_set = set(unit_ids)
+        results = [r for r in results if r["unit_id"] in uid_set]
+
     return results
 
 

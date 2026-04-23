@@ -963,6 +963,19 @@ def run_synthesis(
         if limit is not None and unit_ids is None:
             units = units[:limit]
 
+        # Issue #90 cycle-2: whenever the user scoped the pipeline via
+        # --unit-id or --limit, downstream gap/revision passes must see
+        # the same scoped set — both in writes (gap_analysis.run /
+        # revision_detector.run, which overwrite sibling tables but
+        # iterate over the full `expectations` table by default) and
+        # reads (load_gap_rows / load_revision_rows, which otherwise
+        # return stale rows left from prior non-scoped runs). When no
+        # scoping was requested, leave this None so behavior is
+        # byte-identical to the pre-#90 baseline.
+        scoped_unit_ids: Optional[List[str]] = None
+        if unit_ids is not None or limit is not None:
+            scoped_unit_ids = [u["unit_id"] for u in units]
+
         if len(units) > MAX_UNITS_PER_PROMPT:
             logger.warning(
                 "Unit count %d exceeds MAX_UNITS_PER_PROMPT=%d for "
@@ -1067,7 +1080,7 @@ def run_synthesis(
                     expectations_db=str(expectations_db),
                     config=config,
                     repo=repo,
-                    unit_ids=unit_ids,
+                    unit_ids=scoped_unit_ids,
                 )
                 gap_rows = gap_analysis.load_gap_rows(
                     str(expectations_db),
@@ -1075,6 +1088,7 @@ def run_synthesis(
                     min_severity=("major", "critical"),
                     repo=repo,
                     github_db=str(gh_path),
+                    unit_ids=scoped_unit_ids,
                 )
                 # Epic #27 — X-4 (#75): auto-confirm sweep fires on every
                 # ``am-synthesize --week`` invocation (AS-6). Any gap row
@@ -1119,11 +1133,12 @@ def run_synthesis(
                     expectations_db=str(expectations_db),
                     config=config,
                     repo=repo,
-                    unit_ids=unit_ids,
+                    unit_ids=scoped_unit_ids,
                 )
                 revision_rows = revision_detector.load_revision_rows(
                     str(expectations_db), week_start, repo=repo,
                     github_db=str(gh_path),
+                    unit_ids=scoped_unit_ids,
                 )
             except sqlite3.OperationalError as exc:
                 logger.warning(
