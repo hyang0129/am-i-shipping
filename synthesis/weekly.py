@@ -948,17 +948,7 @@ def run_synthesis(
         # any unit with a real elapsed value. ``unit_id`` is the
         # ``units`` PRIMARY KEY (non-NULL by schema) so no ``or ""``
         # fallback is needed.
-        def _priority_key(u: dict) -> tuple:
-            abandoned = 1 if u.get("abandonment_flag") == 1 else 0
-            flags = u.get("outlier_flags")
-            has_outliers = 1 if (flags is not None and flags != "[]") else 0
-            elapsed = u.get("elapsed_days") or 0.0
-            unit_id = u["unit_id"]
-            # Negate the fields we want DESC so a plain ``sorted`` ASC
-            # yields the right order with unit_id as the final ASC key.
-            return (-abandoned, -has_outliers, -elapsed, unit_id)
-
-        units.sort(key=_priority_key)
+        units.sort(key=unit_priority_key)
 
         if limit is not None and unit_ids is None:
             units = units[:limit]
@@ -1299,11 +1289,25 @@ def run_synthesis(
         gh_conn.close()
 
 
+def unit_priority_key(unit: dict) -> tuple:
+    """Priority order for --limit / MAX_UNITS_PER_PROMPT truncation.
+
+    Abandoned first, then units with outlier flags, then longest-running
+    (elapsed_days desc), tie-break on unit_id for stability.
+    """
+    abandoned = 1 if unit.get("abandonment_flag") == 1 else 0
+    flags = unit.get("outlier_flags")
+    has_outliers = 1 if (flags is not None and flags != "[]") else 0
+    elapsed = unit.get("elapsed_days") or 0.0
+    return (-abandoned, -has_outliers, -elapsed, unit.get("unit_id") or "")
+
+
 __all__ = [
     "run_synthesis",
     "water_fill_truncate",
     "_resolve_unit_sessions",
     "_repo_filter_sql",
+    "unit_priority_key",
     "TRANSCRIPT_BUDGET_BYTES",
     "MAX_UNITS_PER_PROMPT",
     "MAX_PROMPT_SOFT_WARN_BYTES",

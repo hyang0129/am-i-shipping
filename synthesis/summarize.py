@@ -40,6 +40,7 @@ from synthesis.weekly import (
     _load_session_transcripts,
     _repo_filter_sql,
     _unit_nodes,
+    unit_priority_key,
 )
 
 
@@ -139,22 +140,40 @@ def _load_unsummarized_units(
     # Issue #90: explicit unit_id list takes precedence over limit.
     if unit_ids:
         uid_set = set(unit_ids)
-        unknown = [uid for uid in unit_ids if uid not in {u["unit_id"] for u in units}]
-        if unknown:
-            raise ValueError(
-                f"Unknown or already-summarized unit_ids for week_start={week_start!r}: {unknown}. "
-                "Check that the ids exist in units for this week and have no summary yet "
-                "(or pass --rebuild-summaries to re-summarize existing rows)."
+        # The current SELECT uses LEFT JOIN … WHERE s.unit_id IS NULL, so
+        # units already has a summary are absent from `units`. To give a
+        # precise error we run a second lightweight query to tell apart
+        # ids that are truly unknown (not in `units` at all) from ids
+        # that exist in `units` but were already summarized.
+        present_in_result = {u["unit_id"] for u in units}
+        missing_from_result = [uid for uid in unit_ids if uid not in present_in_result]
+        if missing_from_result:
+            # Check which of the missing ids actually exist in `units`.
+            placeholders = ",".join("?" * len(missing_from_result))
+            extra_fragment, extra_params = _repo_filter_sql(
+                repo, week_start, units_alias=""
             )
+            existing_rows = gh_conn.execute(
+                f"SELECT unit_id FROM units WHERE week_start = ? "
+                f"AND unit_id IN ({placeholders}){extra_fragment}",
+                [week_start, *missing_from_result, *extra_params],
+            ).fetchall()
+            existing_ids = {r[0] for r in existing_rows}
+            already_summarized = [uid for uid in missing_from_result if uid in existing_ids]
+            truly_unknown = [uid for uid in missing_from_result if uid not in existing_ids]
+            parts = []
+            if truly_unknown:
+                parts.append(
+                    f"Unknown unit_ids (not in units for week_start={week_start!r}): {truly_unknown}."
+                )
+            if already_summarized:
+                parts.append(
+                    f"Already summarized unit_ids (pass --rebuild-summaries to re-summarize): {already_summarized}."
+                )
+            raise ValueError(" ".join(parts))
         units = [u for u in units if u["unit_id"] in uid_set]
     elif limit is not None:
-        def _priority_key(u: dict) -> tuple:
-            abandoned = 1 if u.get("abandonment_flag") == 1 else 0
-            flags = u.get("outlier_flags")
-            has_outliers = 1 if (flags is not None and flags != "[]") else 0
-            elapsed = u.get("elapsed_days") or 0.0
-            return (-abandoned, -has_outliers, -elapsed, u["unit_id"])
-        units.sort(key=_priority_key)
+        units.sort(key=unit_priority_key)
         units = units[:limit]
 
     return units
@@ -482,6 +501,13 @@ def run_summarization(
 # ---------------------------------------------------------------------------
 
 
+def _positive_int(v: str) -> int:
+    n = int(v)
+    if n < 1:
+        raise argparse.ArgumentTypeError("--limit must be a positive integer")
+    return n
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="am-summarize-units",
@@ -523,7 +549,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "partial for non-targeted repos."
         ),
     )
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
         "--unit-id",
         dest="unit_ids",
         action="append",
@@ -531,20 +558,20 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="UNIT_ID",
         help=(
             "Summarize only this unit_id. Repeatable: "
-            "--unit-id A --unit-id B. Takes precedence over --limit. "
+            "--unit-id A --unit-id B. Mutually exclusive with --limit. "
             "Errors if any supplied id is absent from units for the week "
             "(or already has a summary and --rebuild-summaries is not set)."
         ),
     )
-    parser.add_argument(
+    group.add_argument(
         "--limit",
-        type=int,
+        type=_positive_int,
         default=None,
         metavar="N",
         help=(
             "Summarize at most N units, selected by the same priority order "
             "am-synthesize uses (abandonment_flag first, then outlier_flags, "
-            "then elapsed_days desc). Ignored when --unit-id is supplied."
+            "then elapsed_days desc). Mutually exclusive with --unit-id."
         ),
     )
     return parser

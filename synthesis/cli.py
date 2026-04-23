@@ -37,6 +37,13 @@ from synthesis.coverage import add_coverage_subparser, run_coverage
 from synthesis.weekly import run_synthesis
 
 
+def _positive_int(v: str) -> int:
+    n = int(v)
+    if n < 1:
+        raise argparse.ArgumentTypeError("--limit must be a positive integer")
+    return n
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="am-synthesize",
@@ -81,7 +88,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "expectations remain partial for non-targeted repos."
         ),
     )
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
         "--unit-id",
         dest="unit_ids",
         action="append",
@@ -89,20 +97,20 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="UNIT_ID",
         help=(
             "Restrict all LLM stages to this unit_id. Repeatable: "
-            "--unit-id A --unit-id B. Takes precedence over --limit. "
+            "--unit-id A --unit-id B. Mutually exclusive with --limit. "
             "Useful when unit_summaries exist for only a subset of the week."
         ),
     )
-    parser.add_argument(
+    group.add_argument(
         "--limit",
-        type=int,
+        type=_positive_int,
         default=None,
         metavar="N",
         help=(
             "Restrict all LLM stages to at most N units, selected by the "
             "same priority order as the internal truncation (abandonment_flag "
-            "first, then outlier_flags, then elapsed_days desc). Ignored "
-            "when --unit-id is supplied."
+            "first, then outlier_flags, then elapsed_days desc). Mutually "
+            "exclusive with --unit-id."
         ),
     )
 

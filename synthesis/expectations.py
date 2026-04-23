@@ -62,6 +62,7 @@ from synthesis.weekly import (
     _repo_filter_sql,
     _resolve_unit_sessions,
     _unit_nodes,
+    unit_priority_key,
 )
 
 
@@ -511,14 +512,17 @@ def _load_week_units(
         return [uid for uid in all_ids if uid in set(unit_ids)]
 
     if limit is not None:
-        def _priority_key(r: tuple) -> tuple:
-            abandoned = 1 if r[1] == 1 else 0
-            flags = r[2]
-            has_outliers = 1 if (flags is not None and flags != "[]") else 0
-            elapsed = r[3] or 0.0
-            return (-abandoned, -has_outliers, -elapsed, r[0])
-        rows_sorted = sorted(rows, key=_priority_key)
-        return [r[0] for r in rows_sorted[:limit]]
+        rows_as_dicts = [
+            {
+                "unit_id": r[0],
+                "abandonment_flag": r[1],
+                "outlier_flags": r[2],
+                "elapsed_days": r[3],
+            }
+            for r in rows
+        ]
+        rows_as_dicts.sort(key=unit_priority_key)
+        return [d["unit_id"] for d in rows_as_dicts[:limit]]
 
     return all_ids
 
@@ -846,6 +850,13 @@ def run_extraction(
 # ---------------------------------------------------------------------------
 
 
+def _positive_int(v: str) -> int:
+    n = int(v)
+    if n < 1:
+        raise argparse.ArgumentTypeError("--limit must be a positive integer")
+    return n
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="am-extract-expectations",
@@ -890,7 +901,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "partial for non-targeted repos."
         ),
     )
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
         "--unit-id",
         dest="unit_ids",
         action="append",
@@ -898,20 +910,20 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="UNIT_ID",
         help=(
             "Extract expectations for only this unit_id. Repeatable: "
-            "--unit-id A --unit-id B. Takes precedence over --limit. "
+            "--unit-id A --unit-id B. Mutually exclusive with --limit. "
             "Errors if any supplied id is absent from units for the week."
         ),
     )
-    parser.add_argument(
+    group.add_argument(
         "--limit",
-        type=int,
+        type=_positive_int,
         default=None,
         metavar="N",
         help=(
             "Extract expectations for at most N units, selected by the same "
             "priority order am-synthesize uses (abandonment_flag first, then "
-            "outlier_flags, then elapsed_days desc). Ignored when --unit-id "
-            "is supplied."
+            "outlier_flags, then elapsed_days desc). Mutually exclusive with "
+            "--unit-id."
         ),
     )
     return parser
