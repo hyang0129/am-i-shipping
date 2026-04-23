@@ -369,12 +369,31 @@ def _load_auto_confirmed_map(
 
 
 def _delete_gap_rows_for_week(
-    exp_conn: sqlite3.Connection, week_start: str
+    exp_conn: sqlite3.Connection,
+    week_start: str,
+    unit_ids: Optional[List[str]] = None,
 ) -> None:
-    """DELETE existing gap rows for the week (idempotent re-run). Caller must follow with inserts within the same transaction."""
-    exp_conn.execute(
-        "DELETE FROM expectation_gaps WHERE week_start = ?", (week_start,)
-    )
+    """DELETE existing gap rows for the week (idempotent re-run). Caller must follow with inserts within the same transaction.
+
+    When *unit_ids* is non-empty, only the rows for those specific unit_ids are
+    deleted, leaving sibling units' gap rows untouched. This is required when
+    ``gap_analysis.run`` is called with a scoped unit_ids list (e.g. from
+    ``weekly.run_synthesis`` with ``--unit-id`` or ``--limit``) so that the
+    scoped pass does not silently destroy gap rows for units outside the scope.
+
+    When *unit_ids* is ``None`` (the default), behavior is byte-identical to
+    the original unscoped DELETE — all rows for the week are removed.
+    """
+    if unit_ids:
+        placeholders = ",".join("?" * len(unit_ids))
+        exp_conn.execute(
+            f"DELETE FROM expectation_gaps WHERE week_start = ? AND unit_id IN ({placeholders})",
+            [week_start, *unit_ids],
+        )
+    else:
+        exp_conn.execute(
+            "DELETE FROM expectation_gaps WHERE week_start = ?", (week_start,)
+        )
     exp_conn.commit()
 
 
@@ -448,6 +467,7 @@ def run(
     expectations_db: str,
     config: Optional[SynthesisConfig] = None,
     repo: Optional[str] = None,
+    unit_ids: Optional[List[str]] = None,
 ) -> int:
     """Compute gap rows for every unit with an expectations row in *week_start*.
 
@@ -511,6 +531,10 @@ def run(
                 e for e in expectations if e["unit_id"] in targeted_units
             ]
 
+        if unit_ids:
+            uid_set = set(unit_ids)
+            expectations = [e for e in expectations if e["unit_id"] in uid_set]
+
         if not expectations:
             logger.info(
                 "No expectations rows for week=%s; gap pass is a no-op",
@@ -533,7 +557,14 @@ def run(
         # reflects any newly-confirmed rows.
         prior_auto_confirmed = _load_auto_confirmed_map(exp_conn, week_start)
 
-        _delete_gap_rows_for_week(exp_conn, week_start)
+        # Compute the effective unit_ids scope for the DELETE: when either
+        # the repo or unit_ids filter is active, restrict the DELETE to only
+        # the units that will be re-inserted so sibling units' gap rows are
+        # not silently destroyed.
+        effective_unit_ids: Optional[List[str]] = None
+        if repo or unit_ids:
+            effective_unit_ids = [e["unit_id"] for e in expectations]
+        _delete_gap_rows_for_week(exp_conn, week_start, unit_ids=effective_unit_ids)
 
         # Select adapter lazily: offline mode uses the heuristic only and
         # never calls the LLM. Live mode calls the LLM for the facet
@@ -855,6 +886,7 @@ def load_gap_rows(
     min_severity: Optional[tuple[str, ...]] = None,
     repo: Optional[str] = None,
     github_db: Optional[str] = None,
+    unit_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Return gap rows for *week_start*, optionally filtered by severity.
 
@@ -926,6 +958,11 @@ def load_gap_rows(
         finally:
             gh_conn.close()
         results = [r for r in results if r["unit_id"] in targeted]
+
+    if unit_ids is not None:
+        uid_set = set(unit_ids)
+        results = [r for r in results if r["unit_id"] in uid_set]
+
     return results
 
 

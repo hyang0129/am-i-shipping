@@ -40,6 +40,7 @@ from synthesis.weekly import (
     _load_session_transcripts,
     _repo_filter_sql,
     _unit_nodes,
+    unit_priority_key,
 )
 
 
@@ -74,6 +75,8 @@ def _load_unsummarized_units(
     week_start: str,
     rebuild: bool = False,
     repo: Optional[str] = None,
+    unit_ids: Optional[List[str]] = None,
+    limit: Optional[int] = None,
 ) -> List[dict]:
     """Return units for *week_start* that do not yet have a summary row.
 
@@ -115,14 +118,65 @@ def _load_unsummarized_units(
     params: List = [week_start, *repo_params]
 
     rows = gh_conn.execute(
-        "SELECT u.unit_id FROM units u "
+        "SELECT u.unit_id, u.abandonment_flag, u.outlier_flags, u.elapsed_days "
+        "FROM units u "
         "LEFT JOIN unit_summaries s "
         "  ON u.week_start = s.week_start AND u.unit_id = s.unit_id "
         f"WHERE u.week_start = ? AND s.unit_id IS NULL{fragment} "
         "ORDER BY u.unit_id",
         params,
     ).fetchall()
-    return [{"unit_id": r[0]} for r in rows]
+
+    units = [
+        {
+            "unit_id": r[0],
+            "abandonment_flag": r[1],
+            "outlier_flags": r[2],
+            "elapsed_days": r[3],
+        }
+        for r in rows
+    ]
+
+    # Issue #90: explicit unit_id list takes precedence over limit.
+    if unit_ids:
+        uid_set = set(unit_ids)
+        # The current SELECT uses LEFT JOIN … WHERE s.unit_id IS NULL, so
+        # units already has a summary are absent from `units`. To give a
+        # precise error we run a second lightweight query to tell apart
+        # ids that are truly unknown (not in `units` at all) from ids
+        # that exist in `units` but were already summarized.
+        present_in_result = {u["unit_id"] for u in units}
+        missing_from_result = [uid for uid in unit_ids if uid not in present_in_result]
+        if missing_from_result:
+            # Check which of the missing ids actually exist in `units`.
+            placeholders = ",".join("?" * len(missing_from_result))
+            extra_fragment, extra_params = _repo_filter_sql(
+                repo, week_start, units_alias=""
+            )
+            existing_rows = gh_conn.execute(
+                f"SELECT unit_id FROM units WHERE week_start = ? "
+                f"AND unit_id IN ({placeholders}){extra_fragment}",
+                [week_start, *missing_from_result, *extra_params],
+            ).fetchall()
+            existing_ids = {r[0] for r in existing_rows}
+            already_summarized = [uid for uid in missing_from_result if uid in existing_ids]
+            truly_unknown = [uid for uid in missing_from_result if uid not in existing_ids]
+            parts = []
+            if truly_unknown:
+                parts.append(
+                    f"Unknown unit_ids (not in units for week_start={week_start!r}): {truly_unknown}."
+                )
+            if already_summarized:
+                parts.append(
+                    f"Already summarized unit_ids (pass --rebuild-summaries to re-summarize): {already_summarized}."
+                )
+            raise ValueError(" ".join(parts))
+        units = [u for u in units if u["unit_id"] in uid_set]
+    elif limit is not None:
+        units.sort(key=unit_priority_key)
+        units = units[:limit]
+
+    return units
 
 
 def _build_unit_input(
@@ -332,6 +386,8 @@ def run_summarization(
     week_start: str,
     rebuild: bool = False,
     repo: Optional[str] = None,
+    unit_ids: Optional[List[str]] = None,
+    limit: Optional[int] = None,
 ) -> int:
     """Summarize all unsummarized units for *week_start*.
 
@@ -371,7 +427,8 @@ def run_summarization(
 
         try:
             units = _load_unsummarized_units(
-                gh_conn, week_start, rebuild=rebuild, repo=repo
+                gh_conn, week_start, rebuild=rebuild, repo=repo,
+                unit_ids=unit_ids, limit=limit,
             )
 
             if not units:
@@ -444,6 +501,13 @@ def run_summarization(
 # ---------------------------------------------------------------------------
 
 
+def _positive_int(v: str) -> int:
+    n = int(v)
+    if n < 1:
+        raise argparse.ArgumentTypeError("--limit must be a positive integer")
+    return n
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="am-summarize-units",
@@ -485,6 +549,31 @@ def _build_parser() -> argparse.ArgumentParser:
             "partial for non-targeted repos."
         ),
     )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--unit-id",
+        dest="unit_ids",
+        action="append",
+        default=None,
+        metavar="UNIT_ID",
+        help=(
+            "Summarize only this unit_id. Repeatable: "
+            "--unit-id A --unit-id B. Mutually exclusive with --limit. "
+            "Errors if any supplied id is absent from units for the week "
+            "(or already has a summary and --rebuild-summaries is not set)."
+        ),
+    )
+    group.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help=(
+            "Summarize at most N units, selected by the same priority order "
+            "am-synthesize uses (abandonment_flag first, then outlier_flags, "
+            "then elapsed_days desc). Mutually exclusive with --unit-id."
+        ),
+    )
     return parser
 
 
@@ -509,6 +598,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         week_start=args.week,
         rebuild=args.rebuild_summaries,
         repo=getattr(args, "repo", None),
+        unit_ids=getattr(args, "unit_ids", None),
+        limit=getattr(args, "limit", None),
     )
     sys.exit(result)
 

@@ -62,6 +62,7 @@ from synthesis.weekly import (
     _repo_filter_sql,
     _resolve_unit_sessions,
     _unit_nodes,
+    unit_priority_key,
 )
 
 
@@ -471,23 +472,59 @@ def _load_extracted_unit_ids(
 
 
 def _load_week_units(
-    gh_conn: sqlite3.Connection, week_start: str,
+    gh_conn: sqlite3.Connection,
+    week_start: str,
     repo: Optional[str] = None,
+    unit_ids: Optional[List[str]] = None,
+    limit: Optional[int] = None,
 ) -> List[str]:
     """Return all ``unit_id`` values in ``units`` for *week_start*, sorted.
 
     When *repo* is set (issue #88), filter to units scoped to that repo
-    via :func:`synthesis.weekly._repo_filter_sql`. Without it the query
-    is byte-identical to the pre-#88 baseline.
+    via :func:`synthesis.weekly._repo_filter_sql`. Without it the function
+    returns the same ``unit_id`` list in the same order as the pre-#88
+    baseline; the SELECT now pulls extra columns to support the priority
+    sort when *limit* is active.
+
+    When *unit_ids* is set (issue #90), filter to exactly those ids
+    (validated against the DB). When *limit* is set and *unit_ids* is
+    not, take the top-N by the same priority order am-synthesize uses.
     """
     fragment, repo_params = _repo_filter_sql(repo, week_start)
     params: List = [week_start, *repo_params]
     rows = gh_conn.execute(
-        f"SELECT unit_id FROM units WHERE week_start = ?{fragment} "
+        "SELECT unit_id, abandonment_flag, outlier_flags, elapsed_days "
+        f"FROM units WHERE week_start = ?{fragment} "
         "ORDER BY unit_id",
         params,
     ).fetchall()
-    return [r[0] for r in rows]
+
+    all_ids = [r[0] for r in rows]
+
+    if unit_ids:
+        known = set(all_ids)
+        unknown = [uid for uid in unit_ids if uid not in known]
+        if unknown:
+            raise ValueError(
+                f"Unknown unit_ids for week_start={week_start!r}: {unknown}. "
+                "Check that the ids exist in units for this week (and repo if --repo is set)."
+            )
+        return [uid for uid in all_ids if uid in set(unit_ids)]
+
+    if limit is not None:
+        rows_as_dicts = [
+            {
+                "unit_id": r[0],
+                "abandonment_flag": r[1],
+                "outlier_flags": r[2],
+                "elapsed_days": r[3],
+            }
+            for r in rows
+        ]
+        rows_as_dicts.sort(key=unit_priority_key)
+        return [d["unit_id"] for d in rows_as_dicts[:limit]]
+
+    return all_ids
 
 
 def _store_expectation(
@@ -541,6 +578,8 @@ def run_extraction(
     week_start: str,
     rebuild: bool = False,
     repo: Optional[str] = None,
+    unit_ids: Optional[List[str]] = None,
+    limit: Optional[int] = None,
 ) -> int:
     """Extract expectations for every unit in *week_start*.
 
@@ -598,12 +637,19 @@ def run_extraction(
         sessions_conn = gh_conn if _same else sqlite3.connect(sessions_db)
 
         if rebuild:
-            # When rebuild is combined with --repo, clear only the targeted
-            # repo's expectations rows. Sub-select against units in github.db
-            # via ATTACH is clumsy across two SQLite connections, so we
-            # compute the unit_id set in Python and issue a bounded DELETE.
-            if repo:
-                targeted = _load_week_units(gh_conn, week_start, repo=repo)
+            # When rebuild is combined with --repo / --unit-id, clear only
+            # the targeted rows. Sub-select against units in github.db via
+            # ATTACH is clumsy across two SQLite connections, so we compute
+            # the unit_id set in Python and issue a bounded DELETE.
+            #
+            # Pre-validate before any DELETE fires: _load_week_units raises
+            # ValueError for unknown ids (including ids outside the requested
+            # repo) and returns the repo-intersected list. This prevents a
+            # cross-repo clobber when --unit-id belongs to a different repo.
+            if unit_ids or repo:
+                targeted = _load_week_units(
+                    gh_conn, week_start, repo=repo, unit_ids=unit_ids, limit=None
+                )
                 if targeted:
                     placeholders = ",".join("?" * len(targeted))
                     exp_conn.execute(
@@ -618,7 +664,9 @@ def run_extraction(
                 )
             exp_conn.commit()
 
-        all_units = _load_week_units(gh_conn, week_start, repo=repo)
+        all_units = _load_week_units(
+            gh_conn, week_start, repo=repo, unit_ids=unit_ids, limit=limit
+        )
         if not all_units:
             repo_suffix = f" repo={repo}" if repo else ""
             logger.info(
@@ -802,6 +850,13 @@ def run_extraction(
 # ---------------------------------------------------------------------------
 
 
+def _positive_int(v: str) -> int:
+    n = int(v)
+    if n < 1:
+        raise argparse.ArgumentTypeError("--limit must be a positive integer")
+    return n
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="am-extract-expectations",
@@ -846,6 +901,31 @@ def _build_parser() -> argparse.ArgumentParser:
             "partial for non-targeted repos."
         ),
     )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--unit-id",
+        dest="unit_ids",
+        action="append",
+        default=None,
+        metavar="UNIT_ID",
+        help=(
+            "Extract expectations for only this unit_id. Repeatable: "
+            "--unit-id A --unit-id B. Mutually exclusive with --limit. "
+            "Errors if any supplied id is absent from units for the week."
+        ),
+    )
+    group.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help=(
+            "Extract expectations for at most N units, selected by the same "
+            "priority order am-synthesize uses (abandonment_flag first, then "
+            "outlier_flags, then elapsed_days desc). Mutually exclusive with "
+            "--unit-id."
+        ),
+    )
     return parser
 
 
@@ -872,6 +952,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         week_start=args.week,
         rebuild=args.rebuild,
         repo=getattr(args, "repo", None),
+        unit_ids=getattr(args, "unit_ids", None),
+        limit=getattr(args, "limit", None),
     )
     sys.exit(result)
 

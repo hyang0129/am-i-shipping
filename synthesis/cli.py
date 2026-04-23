@@ -37,6 +37,13 @@ from synthesis.coverage import add_coverage_subparser, run_coverage
 from synthesis.weekly import run_synthesis
 
 
+def _positive_int(v: str) -> int:
+    n = int(v)
+    if n < 1:
+        raise argparse.ArgumentTypeError("--limit must be a positive integer")
+    return n
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="am-synthesize",
@@ -79,6 +86,31 @@ def _build_parser() -> argparse.ArgumentParser:
             "and full-weekly runs for the same week coexist. "
             "Intended for dev-loop iteration; unit_summaries and "
             "expectations remain partial for non-targeted repos."
+        ),
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--unit-id",
+        dest="unit_ids",
+        action="append",
+        default=None,
+        metavar="UNIT_ID",
+        help=(
+            "Restrict all LLM stages to this unit_id. Repeatable: "
+            "--unit-id A --unit-id B. Mutually exclusive with --limit. "
+            "Useful when unit_summaries exist for only a subset of the week."
+        ),
+    )
+    group.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help=(
+            "Restrict all LLM stages to at most N units, selected by the "
+            "same priority order as the internal truncation (abandonment_flag "
+            "first, then outlier_flags, then elapsed_days desc). Mutually "
+            "exclusive with --unit-id."
         ),
     )
 
@@ -151,6 +183,8 @@ def _run_weekly(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             expectations_db=expectations_db,
             repo=getattr(args, "repo", None),
+            unit_ids=getattr(args, "unit_ids", None),
+            limit=getattr(args, "limit", None),
         )
     except Exception:  # noqa: BLE001 — CLI is the top of the stack
         logging.exception("Synthesis failed")

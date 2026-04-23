@@ -615,6 +615,7 @@ def run(
     config: Optional[SynthesisConfig] = None,
     rebuild: bool = False,
     repo: Optional[str] = None,
+    unit_ids: Optional[List[str]] = None,
 ) -> int:
     """Detect expectation revisions for every unit in *week_start*.
 
@@ -677,6 +678,10 @@ def run(
                 e for e in expectations if e["unit_id"] in targeted_units
             ]
 
+        if unit_ids:
+            uid_set = set(unit_ids)
+            expectations = [e for e in expectations if e["unit_id"] in uid_set]
+
         if not expectations:
             repo_suffix = f" repo={repo}" if repo else ""
             logger.info(
@@ -686,10 +691,24 @@ def run(
             return 0
 
         if rebuild:
-            exp_conn.execute(
-                "DELETE FROM expectation_revisions WHERE week_start = ?",
-                (week_start,),
-            )
+            # Issue F-1-2: restrict the DELETE to the targeted unit set when
+            # either ``repo`` or ``unit_ids`` is active.  A scoped rebuild must
+            # not silently destroy revision rows for units outside the scope.
+            # When neither filter is active, keep the week-wide DELETE for
+            # backward compatibility (same pattern as gap_analysis F-1-1).
+            if repo or unit_ids:
+                effective_unit_ids = [e["unit_id"] for e in expectations]
+                placeholders = ",".join("?" * len(effective_unit_ids))
+                exp_conn.execute(
+                    f"DELETE FROM expectation_revisions WHERE week_start = ?"
+                    f" AND unit_id IN ({placeholders})",
+                    [week_start, *effective_unit_ids],
+                )
+            else:
+                exp_conn.execute(
+                    "DELETE FROM expectation_revisions WHERE week_start = ?",
+                    (week_start,),
+                )
             exp_conn.commit()
 
         # Resolve the LLM adapter once. ``_get_adapter`` accepts None for
@@ -795,6 +814,7 @@ def load_revision_rows(
     *,
     repo: Optional[str] = None,
     github_db: Optional[str] = None,
+    unit_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Return revision rows for *week_start*, ordered by unit + revision_index.
 
@@ -848,6 +868,11 @@ def load_revision_rows(
         finally:
             gh_conn.close()
         results = [r for r in results if r["unit_id"] in targeted]
+
+    if unit_ids is not None:
+        uid_set = set(unit_ids)
+        results = [r for r in results if r["unit_id"] in uid_set]
+
     return results
 
 
