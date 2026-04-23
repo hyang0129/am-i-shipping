@@ -501,6 +501,71 @@ class TestAbandonmentFlag:
             conn.close()
         assert row[0] == 1
 
+    def test_issue_closed_recently_is_not_abandoned(self, tmp_path: Path) -> None:
+        """Issue created 30 days ago, closed 5 days ago → abandonment_flag=0."""
+        db_path = _make_db(tmp_path)
+        now = PINNED_NOW
+        conn = sqlite3.connect(str(db_path))
+        try:
+            _insert_unit(conn, unit_id="u-closed", root_node_id="n-closed-issue")
+            # graph_nodes row: created_at is 30 days ago (old)
+            old_ts = (now - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            # but node_ref points to an issue closed 5 days ago
+            recent_ts = (now - timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            conn.execute(
+                "INSERT INTO graph_nodes (week_start, node_id, node_type, node_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (WEEK_START, "n-closed-issue", "issue", "testrepo/repo#1", old_ts),
+            )
+            conn.execute(
+                "INSERT INTO issues (repo, issue_number, created_at, closed_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("testrepo/repo", 1, old_ts, recent_ts, recent_ts),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        compute_flags(str(db_path), WEEK_START, now=now)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT abandonment_flag FROM units WHERE unit_id = ?", ("u-closed",)
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == 0  # closed recently → not abandoned
+
+    def test_issue_old_no_update_is_abandoned(self, tmp_path: Path) -> None:
+        """Issue created 30 days ago, never updated, never closed → abandonment_flag=1."""
+        db_path = _make_db(tmp_path)
+        now = PINNED_NOW
+        conn = sqlite3.connect(str(db_path))
+        try:
+            _insert_unit(conn, unit_id="u-old-open", root_node_id="n-old-issue")
+            old_ts = (now - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            conn.execute(
+                "INSERT INTO graph_nodes (week_start, node_id, node_type, node_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (WEEK_START, "n-old-issue", "issue", "testrepo/repo#2", old_ts),
+            )
+            conn.execute(
+                "INSERT INTO issues (repo, issue_number, created_at, closed_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("testrepo/repo", 2, old_ts, None, None),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        compute_flags(str(db_path), WEEK_START, now=now)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT abandonment_flag FROM units WHERE unit_id = ?", ("u-old-open",)
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == 1  # no recent activity → abandoned
+
     def test_abandonment_days_override(self, tmp_path: Path) -> None:
         """Passing abandonment_days=7 flags a 10-day-old event."""
         db_path = _make_db(tmp_path)
