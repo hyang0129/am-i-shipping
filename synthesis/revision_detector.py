@@ -691,10 +691,24 @@ def run(
             return 0
 
         if rebuild:
-            exp_conn.execute(
-                "DELETE FROM expectation_revisions WHERE week_start = ?",
-                (week_start,),
-            )
+            # Issue F-1-2: restrict the DELETE to the targeted unit set when
+            # either ``repo`` or ``unit_ids`` is active.  A scoped rebuild must
+            # not silently destroy revision rows for units outside the scope.
+            # When neither filter is active, keep the week-wide DELETE for
+            # backward compatibility (same pattern as gap_analysis F-1-1).
+            if repo or unit_ids:
+                effective_unit_ids = [e["unit_id"] for e in expectations]
+                placeholders = ",".join("?" * len(effective_unit_ids))
+                exp_conn.execute(
+                    f"DELETE FROM expectation_revisions WHERE week_start = ?"
+                    f" AND unit_id IN ({placeholders})",
+                    [week_start, *effective_unit_ids],
+                )
+            else:
+                exp_conn.execute(
+                    "DELETE FROM expectation_revisions WHERE week_start = ?",
+                    (week_start,),
+                )
             exp_conn.commit()
 
         # Resolve the LLM adapter once. ``_get_adapter`` accepts None for
