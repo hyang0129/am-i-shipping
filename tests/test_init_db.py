@@ -420,3 +420,88 @@ class TestSessionGhEventsTable:
                 )
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Issue #98 — state_reason column migration
+# ---------------------------------------------------------------------------
+
+
+class TestStateReasonMigration:
+    """state_reason TEXT column is added to the issues table by _GITHUB_MIGRATIONS."""
+
+    def test_fresh_db_has_state_reason_column(self, tmp_path):
+        """Fresh DB created by init_github_db includes state_reason on issues."""
+        from am_i_shipping.db import init_github_db, EXPECTED_GITHUB_TABLES
+
+        db_path = tmp_path / "github.db"
+        init_github_db(str(db_path))
+
+        assert_schema(db_path, {"issues": EXPECTED_GITHUB_TABLES["issues"]})
+
+    def test_migration_adds_state_reason_to_legacy_db(self, tmp_path):
+        """Running init_github_db on a DB without state_reason adds the column.
+
+        Simulates a pre-migration database by creating issues without the
+        state_reason column, then re-running init_github_db to trigger the
+        migration.
+        """
+        from am_i_shipping.db import init_github_db, EXPECTED_GITHUB_TABLES
+
+        db_path = tmp_path / "github.db"
+
+        # Create a bare-minimum DB without state_reason
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS issues (
+                    repo            TEXT NOT NULL,
+                    issue_number    INTEGER NOT NULL,
+                    title           TEXT,
+                    type_label      TEXT,
+                    state           TEXT,
+                    body            TEXT,
+                    comments_json   TEXT,
+                    created_at      TEXT,
+                    closed_at       TEXT,
+                    updated_at      TEXT,
+                    PRIMARY KEY (repo, issue_number)
+                )
+            """)
+            # Insert a legacy row (no state_reason)
+            conn.execute(
+                "INSERT INTO issues (repo, issue_number, title, state) "
+                "VALUES (?, ?, ?, ?)",
+                ("test/repo", 1, "Legacy issue", "closed"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Re-run init_github_db — should apply all migrations including state_reason
+        init_github_db(str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(issues)").fetchall()}
+            # Legacy row should still exist
+            row = conn.execute(
+                "SELECT state_reason FROM issues WHERE issue_number = 1"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        assert "state_reason" in cols, "state_reason column must exist after migration"
+        assert row is not None, "legacy row must survive migration"
+        # Pre-existing rows get NULL for the new column
+        assert row[0] is None, (
+            f"Pre-migration rows should have state_reason=NULL, got {row[0]!r}"
+        )
+
+    def test_expected_github_tables_includes_state_reason(self):
+        """EXPECTED_GITHUB_TABLES['issues'] includes 'state_reason'."""
+        from am_i_shipping.db import EXPECTED_GITHUB_TABLES
+
+        assert "state_reason" in EXPECTED_GITHUB_TABLES["issues"], (
+            "EXPECTED_GITHUB_TABLES['issues'] must list 'state_reason'"
+        )

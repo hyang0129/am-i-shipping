@@ -568,7 +568,7 @@ Required Markdown sections (exact headings, in order)
    `units` table.
 3. `## Outlier Units`             — units flagged by the cross-unit pass
    (`outlier_flags` non-empty). For each, note which metric(s) breached.
-4. `## Abandoned Units`           — units with `abandonment_flag = 1`.
+4. `## Abandoned Units`           — units with `status = "abandoned"`.
    Do not prescribe follow-up; surface the signal.
 5. `## Dark Time`                 — fraction of each unit's wall-clock
    span during which no session was active. Highlight the top-2.
@@ -613,7 +613,8 @@ Metric column legend
 * `total_reprompts`   — sum of `sessions.reprompt_count` in the unit.
 * `review_cycles`     — len(review_comments_json) or push_count fallback.
 * `outlier_flags`     — JSON list of metric names > median + 2sigma.
-* `abandonment_flag`  — 1 if no event within 14 days.
+* `abandonment_flag`  — legacy column (kept for backward compat); use `status` instead.
+* `status`            — one of open/shipped/completed-no-pr/not-planned/closed-unknown/abandoned.
 
 Thresholds
 ----------
@@ -1294,8 +1295,15 @@ def unit_priority_key(unit: dict) -> tuple:
 
     Abandoned first, then units with outlier flags, then longest-running
     (elapsed_days desc), tie-break on unit_id for stability.
+
+    Issue #98: ``status == "abandoned"`` is now the canonical abandoned
+    signal.  ``abandonment_flag`` is kept for backward compatibility but
+    is no longer written as 1 by cross_unit.py.  We check both to stay
+    correct for DBs produced before the migration.
     """
-    abandoned = 1 if unit.get("abandonment_flag") == 1 else 0
+    is_abandoned_by_status = 1 if unit.get("status") == "abandoned" else 0
+    is_abandoned_by_flag = 1 if unit.get("abandonment_flag") == 1 else 0
+    abandoned = 1 if (is_abandoned_by_status or is_abandoned_by_flag) else 0
     flags = unit.get("outlier_flags")
     has_outliers = 1 if (flags is not None and flags != "[]") else 0
     elapsed = unit.get("elapsed_days") or 0.0
