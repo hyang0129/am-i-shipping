@@ -50,7 +50,7 @@ def fetch_issues(
         "--repo", repo,
         "--state", state,
         "--limit", str(limit),
-        "--json", "number,title,labels,createdAt,closedAt,state,body,updatedAt",
+        "--json", "number,title,labels,createdAt,closedAt,state,body,updatedAt,stateReason",
     ]
     if since:
         args.extend(["--search", f"updated:>{since}"])
@@ -64,6 +64,12 @@ def fetch_issues(
         type_label = _extract_type_label(issue.get("labels", []))
         comments = fetch_issue_comments(repo, issue["number"]) if include_comments else []
 
+        # ``stateReason`` is one of "COMPLETED", "NOT_PLANNED", "REOPENED",
+        # or absent/null for pre-2022 issues.  Normalise to empty string so
+        # downstream code can use a simple falsiness check for "unknown".
+        raw_reason = issue.get("stateReason")
+        state_reason = raw_reason if raw_reason else ""
+
         results.append({
             "number": issue["number"],
             "title": issue.get("title", ""),
@@ -74,6 +80,7 @@ def fetch_issues(
             "state": issue.get("state", "").upper(),
             "body": issue.get("body", ""),
             "comments": comments,
+            "state_reason": state_reason,
         })
 
     return results

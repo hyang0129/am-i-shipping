@@ -809,3 +809,318 @@ class TestIssue68PhaseExecutionBranch:
             f"issue_comment (no issue_create) must yield phase='execution' (AS-8), "
             f"got {rows[0][0]!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #98 — 6-status taxonomy: shipped / completed-no-pr / not-planned /
+#              closed-unknown / abandoned / open
+# ---------------------------------------------------------------------------
+
+
+def _seed_status_fixture(
+    tmp_path: Path,
+    *,
+    issue_state: str = "closed",
+    state_reason: str = "",
+    merged_at: str | None = None,
+    has_pr_closes_issue_edge: bool = False,
+    last_issue_activity: str = "2025-01-10T10:00:00Z",
+    now: datetime | None = None,
+    issue_number: int = 900,
+    pr_number: int = 800,
+    week: str = "2025-01-06",
+) -> tuple:
+    """Return (gh_path, week, now) with a single unit seeded according to params.
+
+    The unit always has one issue node and (when merged_at or
+    has_pr_closes_issue_edge is set) one PR node connected via a
+    ``pr_closes_issue`` edge.
+    """
+    from am_i_shipping.db import init_github_db, init_sessions_db
+
+    gh_path = tmp_path / "github.db"
+    sess_path = tmp_path / "sessions.db"
+    init_github_db(gh_path)
+    init_sessions_db(sess_path)
+
+    repo = "test/repo"
+    issue_node_id = f"issue:{repo}#{issue_number}"
+    pr_node_id = f"pr:{repo}#{pr_number}"
+
+    if now is None:
+        now = datetime(2025, 1, 20, 0, 0, 0)  # 10 days after last_issue_activity
+
+    conn = sqlite3.connect(str(gh_path))
+    try:
+        # Seed issue
+        conn.execute(
+            "INSERT INTO issues "
+            "(repo, issue_number, title, type_label, state, body, "
+            " comments_json, created_at, closed_at, updated_at, state_reason) "
+            "VALUES (?, ?, ?, ?, ?, '', '[]', ?, ?, ?, ?)",
+            (
+                repo, issue_number, "Test issue", "feature",
+                issue_state,
+                "2025-01-01T10:00:00Z",
+                "2025-01-09T10:00:00Z" if issue_state == "closed" else None,
+                last_issue_activity,
+                state_reason,
+            ),
+        )
+        # Seed graph nodes: issue + possibly PR
+        conn.execute(
+            "INSERT INTO graph_nodes "
+            "(week_start, node_id, node_type, node_ref, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (week, issue_node_id, "issue", f"{repo}#{issue_number}",
+             "2025-01-01T10:00:00Z"),
+        )
+        nodes = [issue_node_id]
+
+        if merged_at is not None or has_pr_closes_issue_edge:
+            # Seed PR
+            conn.execute(
+                "INSERT INTO pull_requests "
+                "(repo, pr_number, head_ref, title, body, comments_json, "
+                " review_comments_json, review_comment_count, push_count, "
+                " created_at, merged_at, updated_at) "
+                "VALUES (?, ?, 'branch', 'PR title', '', '[]', '[]', 0, 0, "
+                " '2025-01-08T10:00:00Z', ?, '2025-01-09T10:00:00Z')",
+                (repo, pr_number, merged_at),
+            )
+            conn.execute(
+                "INSERT INTO graph_nodes "
+                "(week_start, node_id, node_type, node_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (week, pr_node_id, "pr", f"{repo}#{pr_number}",
+                 "2025-01-08T10:00:00Z"),
+            )
+            nodes.append(pr_node_id)
+            # Add pr_closes_issue edge if requested
+            if has_pr_closes_issue_edge:
+                conn.execute(
+                    "INSERT INTO graph_edges "
+                    "(week_start, src_node_id, dst_node_id, edge_type) "
+                    "VALUES (?, ?, ?, ?)",
+                    (week, pr_node_id, issue_node_id, "pr_closes_issue"),
+                )
+            # Always connect PR to issue with a generic edge so they end up
+            # in the same component
+            conn.execute(
+                "INSERT OR IGNORE INTO graph_edges "
+                "(week_start, src_node_id, dst_node_id, edge_type) "
+                "VALUES (?, ?, ?, ?)",
+                (week, pr_node_id, issue_node_id, "closes"),
+            )
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    return gh_path, sess_path, week, now
+
+
+class TestIssue98StatusTaxonomy:
+    """Six-status taxonomy produced by _summarise_unit (issue #98)."""
+
+    @pytest.mark.parametrize("state_reason", ["COMPLETED", ""])
+    def test_shipped_with_merged_pr_and_pr_closes_issue_edge(
+        self, tmp_path, state_reason
+    ):
+        """shipped: closed + (COMPLETED or empty) + pr_closes_issue edge to merged PR."""
+        gh_path, sess_path, week, now = _seed_status_fixture(
+            tmp_path,
+            issue_state="closed",
+            state_reason=state_reason,
+            merged_at="2025-01-09T15:00:00Z",
+            has_pr_closes_issue_edge=True,
+        )
+        inserted = identify_units(gh_path, sess_path, week, now=now)
+        assert inserted == 1
+
+        conn = sqlite3.connect(str(gh_path))
+        try:
+            status = conn.execute(
+                "SELECT status FROM units WHERE week_start = ?", (week,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert status == "shipped", (
+            f"Expected 'shipped' for closed+state_reason={state_reason!r}+merged PR, "
+            f"got {status!r}"
+        )
+
+    def test_shipped_legacy_empty_reason_component_pr_merged(self, tmp_path):
+        """shipped (legacy): closed + empty state_reason + component PR has merged_at.
+
+        When there is no pr_closes_issue edge but the component contains a
+        merged PR, _has_merged_linked_pr falls back to checking component PRs.
+        """
+        gh_path, sess_path, week, now = _seed_status_fixture(
+            tmp_path,
+            issue_state="closed",
+            state_reason="",
+            merged_at="2025-01-09T15:00:00Z",
+            has_pr_closes_issue_edge=False,  # no explicit pr_closes_issue edge
+        )
+        inserted = identify_units(gh_path, sess_path, week, now=now)
+        assert inserted == 1
+
+        conn = sqlite3.connect(str(gh_path))
+        try:
+            status = conn.execute(
+                "SELECT status FROM units WHERE week_start = ?", (week,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert status == "shipped", (
+            f"Expected 'shipped' for legacy closed issue with merged component PR, "
+            f"got {status!r}"
+        )
+
+    def test_completed_no_pr_with_state_reason_completed(self, tmp_path):
+        """completed-no-pr: closed + COMPLETED + no merged linked PR."""
+        gh_path, sess_path, week, now = _seed_status_fixture(
+            tmp_path,
+            issue_state="closed",
+            state_reason="COMPLETED",
+            merged_at=None,
+            has_pr_closes_issue_edge=False,
+        )
+        inserted = identify_units(gh_path, sess_path, week, now=now)
+        assert inserted == 1
+
+        conn = sqlite3.connect(str(gh_path))
+        try:
+            status = conn.execute(
+                "SELECT status FROM units WHERE week_start = ?", (week,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert status == "completed-no-pr", (
+            f"Expected 'completed-no-pr' for closed+COMPLETED+no merged PR, "
+            f"got {status!r}"
+        )
+
+    def test_completed_no_pr_with_unmerged_linked_pr(self, tmp_path):
+        """completed-no-pr (b): COMPLETED + pr_closes_issue edge to unmerged PR."""
+        gh_path, sess_path, week, now = _seed_status_fixture(
+            tmp_path,
+            issue_state="closed",
+            state_reason="COMPLETED",
+            merged_at=None,  # PR not merged
+            has_pr_closes_issue_edge=True,
+        )
+        inserted = identify_units(gh_path, sess_path, week, now=now)
+        assert inserted == 1
+
+        conn = sqlite3.connect(str(gh_path))
+        try:
+            status = conn.execute(
+                "SELECT status FROM units WHERE week_start = ?", (week,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert status == "completed-no-pr", (
+            f"Expected 'completed-no-pr' for COMPLETED+unmerged PR, got {status!r}"
+        )
+
+    @pytest.mark.parametrize("has_merged_pr", [False, True])
+    def test_not_planned_regardless_of_pr(self, tmp_path, has_merged_pr):
+        """not-planned: NOT_PLANNED takes precedence regardless of PR linkage."""
+        gh_path, sess_path, week, now = _seed_status_fixture(
+            tmp_path,
+            issue_state="closed",
+            state_reason="NOT_PLANNED",
+            merged_at="2025-01-09T15:00:00Z" if has_merged_pr else None,
+            has_pr_closes_issue_edge=has_merged_pr,
+        )
+        inserted = identify_units(gh_path, sess_path, week, now=now)
+        assert inserted == 1
+
+        conn = sqlite3.connect(str(gh_path))
+        try:
+            status = conn.execute(
+                "SELECT status FROM units WHERE week_start = ?", (week,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert status == "not-planned", (
+            f"Expected 'not-planned' for NOT_PLANNED (has_merged_pr={has_merged_pr}), "
+            f"got {status!r}"
+        )
+
+    def test_closed_unknown_legacy_no_pr(self, tmp_path):
+        """closed-unknown: closed + empty state_reason + no merged linked PR."""
+        gh_path, sess_path, week, now = _seed_status_fixture(
+            tmp_path,
+            issue_state="closed",
+            state_reason="",
+            merged_at=None,
+            has_pr_closes_issue_edge=False,
+        )
+        inserted = identify_units(gh_path, sess_path, week, now=now)
+        assert inserted == 1
+
+        conn = sqlite3.connect(str(gh_path))
+        try:
+            status = conn.execute(
+                "SELECT status FROM units WHERE week_start = ?", (week,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert status == "closed-unknown", (
+            f"Expected 'closed-unknown' for legacy closed+no merged PR, got {status!r}"
+        )
+
+    def test_abandoned_open_stale(self, tmp_path):
+        """abandoned: open issue with no activity > 14 days."""
+        # last_issue_activity: 2025-01-01 (19 days before now=2025-01-20)
+        gh_path, sess_path, week, now = _seed_status_fixture(
+            tmp_path,
+            issue_state="open",
+            state_reason="",
+            merged_at=None,
+            has_pr_closes_issue_edge=False,
+            last_issue_activity="2025-01-01T10:00:00Z",
+            now=datetime(2025, 1, 20, 0, 0, 0),
+        )
+        inserted = identify_units(gh_path, sess_path, week, now=now)
+        assert inserted == 1
+
+        conn = sqlite3.connect(str(gh_path))
+        try:
+            status = conn.execute(
+                "SELECT status FROM units WHERE week_start = ?", (week,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert status == "abandoned", (
+            f"Expected 'abandoned' for open stale unit, got {status!r}"
+        )
+
+    def test_open_recent_activity(self, tmp_path):
+        """open: open issue with activity within 14 days → status is 'open', not abandoned."""
+        # last_issue_activity: 2025-01-15 (5 days before now=2025-01-20)
+        gh_path, sess_path, week, now = _seed_status_fixture(
+            tmp_path,
+            issue_state="open",
+            state_reason="",
+            merged_at=None,
+            has_pr_closes_issue_edge=False,
+            last_issue_activity="2025-01-15T10:00:00Z",
+            now=datetime(2025, 1, 20, 0, 0, 0),
+        )
+        inserted = identify_units(gh_path, sess_path, week, now=now)
+        assert inserted == 1
+
+        conn = sqlite3.connect(str(gh_path))
+        try:
+            status = conn.execute(
+                "SELECT status FROM units WHERE week_start = ?", (week,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert status == "open", (
+            f"Expected 'open' for open unit with recent activity, got {status!r}"
+        )

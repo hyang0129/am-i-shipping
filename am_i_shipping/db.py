@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS issues (
     created_at      TEXT,
     closed_at       TEXT,
     updated_at      TEXT,
+    state_reason    TEXT,
     PRIMARY KEY (repo, issue_number)
 );
 """
@@ -588,6 +589,12 @@ _GITHUB_MIGRATIONS = [
     # same row as the underlying metrics.
     "ALTER TABLE units ADD COLUMN outlier_flags TEXT",
     "ALTER TABLE units ADD COLUMN abandonment_flag INTEGER",
+    # Issue #98: GitHub stateReason taxonomy. ``state_reason`` is one of
+    # "COMPLETED", "NOT_PLANNED", "REOPENED", or empty string for pre-2022
+    # issues. NULL default — rows inserted before this migration have no
+    # value and are treated as ``closed-unknown`` by ``_summarise_unit``
+    # when there is no merged linked PR.
+    "ALTER TABLE issues ADD COLUMN state_reason TEXT",
 ]
 
 APPSWITCH_SCHEMA = """
@@ -646,6 +653,7 @@ EXPECTED_GITHUB_TABLES: dict[str, set[str]] = {
         "created_at",
         "closed_at",
         "updated_at",
+        "state_reason",
     },
     "pull_requests": {
         "repo",

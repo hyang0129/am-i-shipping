@@ -232,17 +232,22 @@ def _summarise_unit(
             session_rows.append((started, ended, rc))
             session_reprompt_map[uuid] = int(rc or 0)
 
-    issue_rows: list[tuple[str, Optional[str], Optional[str], Optional[str]]] = []
-    # (state, created_at, closed_at, updated_at)
+    issue_rows: list[tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]] = []
+    # (state, created_at, closed_at, updated_at, state_reason)
     for repo, num in issue_refs:
         cur = github_conn.execute(
-            "SELECT state, created_at, closed_at, updated_at "
+            "SELECT state, created_at, closed_at, updated_at, state_reason "
             "FROM issues WHERE repo = ? AND issue_number = ?",
             (repo, num),
         )
         row = cur.fetchone()
         if row is not None:
-            issue_rows.append(row)
+            # Gracefully handle DBs without the state_reason column yet
+            # (e.g. pre-migration fixtures). Pad with None if needed.
+            if len(row) < 5:
+                issue_rows.append((*row, None))  # type: ignore[arg-type]
+            else:
+                issue_rows.append(row)
 
     pr_rows: list[tuple[Optional[str], Optional[str], Optional[str]]] = []
     # (created_at, merged_at, updated_at)
@@ -285,7 +290,7 @@ def _summarise_unit(
     for started, ended, _rc in session_rows:
         all_timestamps.append(started)
         all_timestamps.append(ended)
-    for state, created, closed, updated in issue_rows:
+    for state, created, closed, updated, _state_reason in issue_rows:
         all_timestamps.extend((created, closed, updated))
     for created, merged, updated in pr_rows:
         all_timestamps.extend((created, merged, updated))
@@ -338,17 +343,26 @@ def _summarise_unit(
         reprompts = 0
 
     # --- status -------------------------------------------------------
+    # 6-status taxonomy (issue #98):
+    #   open           — any anchor issue is still open
+    #   shipped        — all closed, COMPLETED (or legacy empty) + merged linked PR
+    #   completed-no-pr — all closed, COMPLETED + no merged linked PR
+    #   not-planned    — all closed, NOT_PLANNED (regardless of PR linkage)
+    #   closed-unknown — all closed, empty/NULL state_reason + no merged linked PR
+    #   abandoned      — any open (or recent-PR) unit with no activity > N days
+    #
+    # ``open`` check: any anchor issue still open, OR any unmerged PR with
+    # recent activity (same heuristic as before — no ``state`` col on PRs).
     has_open = False
     for state, *_ in issue_rows:
         if (state or "").lower() == "open":
             has_open = True
             break
-    if not has_open:
-        # A PR without merged_at that is referenced here is either
-        # closed-unmerged or still open. We can't tell from the
-        # pull_requests table (no ``state`` column in the schema), so we
-        # treat missing ``merged_at`` as "open-ish" only when updated_at
-        # is recent; otherwise it's stale/abandoned.
+    if not has_open and not issue_rows:
+        # PR-only unit (no anchor issues): treat an unmerged PR with recent
+        # activity as "open-ish" since there is no issue to tell us the true
+        # state.  When there ARE closed anchor issues, the issue state wins —
+        # we do not let an unmerged component PR override a closed issue.
         for created, merged, updated in pr_rows:
             if merged:
                 continue
@@ -359,13 +373,9 @@ def _summarise_unit(
                 has_open = True
                 break
 
-    status = "closed"
     if has_open:
-        status = "open"
-    else:
-        # Abandonment check: last activity older than N days AND unit
-        # has any non-session content (singleton sessions don't qualify
-        # as "abandoned" — they just completed).
+        # Abandonment check applies to open units too: if the unit is
+        # open but has had no activity for > N days, mark abandoned.
         last_activity: Optional[datetime] = None
         for ts in all_timestamps:
             parsed = metrics.parse_ts(ts)
@@ -380,6 +390,89 @@ def _summarise_unit(
             and now - last_activity > timedelta(days=abandonment_days)
         ):
             status = "abandoned"
+        else:
+            status = "open"
+    else:
+        # All issues closed. Determine the most specific closed status.
+        # For each closed issue check the state_reason and whether a
+        # merged linked PR exists via the pr_closes_issue graph edges.
+        #
+        # Helper: does a merged linked PR exist for any anchor issue in
+        # the unit?  We look up ``pr_closes_issue`` edges in graph_edges
+        # (joining through pull_requests to check merged_at).  The
+        # graph_edges query is only run when we have issue_refs AND a
+        # week_start, because graph edges are week-partitioned.
+        def _has_merged_linked_pr() -> bool:
+            if not issue_refs or not week_start:
+                # Fall back: check if any PR in the component itself is merged.
+                return any(merged for (_c, merged, _u) in pr_rows if merged)
+            # Build the set of issue node IDs for the unit's anchor issues.
+            issue_node_ids = {
+                f"issue:{repo}#{num}" for repo, num in issue_refs
+            }
+            # Find PR node IDs that have a pr_closes_issue edge pointing
+            # at one of our anchor issue nodes.
+            placeholders = ",".join("?" * len(issue_node_ids))
+            try:
+                linked_pr_node_ids = {
+                    row[0]
+                    for row in github_conn.execute(
+                        f"SELECT src_node_id FROM graph_edges "
+                        f"WHERE week_start = ? AND edge_type = 'pr_closes_issue' "
+                        f"AND dst_node_id IN ({placeholders})",
+                        [week_start, *issue_node_ids],
+                    ).fetchall()
+                }
+            except sqlite3.OperationalError:
+                # graph_edges table absent in test fixtures — fall back.
+                return any(merged for (_c, merged, _u) in pr_rows if merged)
+
+            if not linked_pr_node_ids:
+                # No pr_closes_issue edges — check component PRs directly.
+                return any(merged for (_c, merged, _u) in pr_rows if merged)
+
+            # Check if any of the linked PRs has merged_at set.
+            for pr_node_id in linked_pr_node_ids:
+                parsed = _parse_repo_number(pr_node_id.replace("pr:", "", 1))
+                if parsed is None:
+                    continue
+                pr_repo, pr_num = parsed
+                row = github_conn.execute(
+                    "SELECT merged_at FROM pull_requests "
+                    "WHERE repo = ? AND pr_number = ?",
+                    (pr_repo, pr_num),
+                ).fetchone()
+                if row and row[0]:
+                    return True
+            return False
+
+        # Determine dominant state_reason across anchor issues.
+        # Priority: NOT_PLANNED > COMPLETED > empty (legacy)
+        has_not_planned = False
+        has_completed = False
+        for _state, _created, _closed, _updated, sr in issue_rows:
+            sr_upper = (sr or "").upper()
+            if sr_upper == "NOT_PLANNED":
+                has_not_planned = True
+            elif sr_upper == "COMPLETED":
+                has_completed = True
+
+        if has_not_planned:
+            # NOT_PLANNED takes precedence regardless of PR linkage.
+            status = "not-planned"
+        else:
+            # Evaluate merged-PR linkage once (avoid double call).
+            has_linked_merged_pr = _has_merged_linked_pr()
+            if has_linked_merged_pr:
+                # A merged linked PR means "shipped" — covers both COMPLETED
+                # and legacy empty stateReason issues.
+                status = "shipped"
+            elif has_completed:
+                # Explicitly COMPLETED but no merged linked PR.
+                status = "completed-no-pr"
+            else:
+                # All closed, empty/NULL state_reason, no merged linked PR.
+                status = "closed-unknown"
 
     return {
         "elapsed_days": elapsed,

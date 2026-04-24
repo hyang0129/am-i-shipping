@@ -107,6 +107,53 @@ class TestUpsertIssue:
         with pytest.raises(ValueError, match="issue number is required"):
             upsert_issue("owner/repo", issue, db)
 
+    def test_state_reason_persisted(self, tmp_path):
+        """Issue #98: upsert_issue stores state_reason in the issues table."""
+        db = tmp_path / "github.db"
+        upsert_issue("owner/repo", _make_issue(state_reason="COMPLETED"), db)
+
+        conn = sqlite3.connect(str(db))
+        try:
+            row = conn.execute(
+                "SELECT state_reason FROM issues WHERE issue_number = 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+        assert row[0] == "COMPLETED"
+
+    def test_state_reason_updated_on_re_upsert(self, tmp_path):
+        """Issue #98: re-upserting with a different state_reason updates the value."""
+        db = tmp_path / "github.db"
+        upsert_issue("owner/repo", _make_issue(state_reason=""), db)
+        upsert_issue("owner/repo", _make_issue(state_reason="NOT_PLANNED"), db)
+
+        conn = sqlite3.connect(str(db))
+        try:
+            row = conn.execute(
+                "SELECT state_reason FROM issues WHERE issue_number = 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == "NOT_PLANNED"
+
+    def test_state_reason_absent_defaults_to_empty_string(self, tmp_path):
+        """Issue #98: issue dict without state_reason key → stored as empty string."""
+        db = tmp_path / "github.db"
+        issue = _make_issue()  # no state_reason key
+        upsert_issue("owner/repo", issue, db)
+
+        conn = sqlite3.connect(str(db))
+        try:
+            row = conn.execute(
+                "SELECT state_reason FROM issues WHERE issue_number = 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+        # Missing key defaults to "" via .get("state_reason", "")
+        assert row[0] == ""
+
 
 class TestUpsertPR:
     def test_insert_creates_row(self, tmp_path):

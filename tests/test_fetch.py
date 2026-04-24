@@ -207,6 +207,47 @@ class TestCommentIds:
         results = fetch_issues("owner/repo")
         assert results[0]["updated_at"] == "2024-01-20T16:00:00Z"
 
+    @patch("collector.github_poller.fetch_issues.gh_api")
+    @patch("collector.github_poller.fetch_issues.run_gh_json")
+    @pytest.mark.parametrize(
+        "state_reason_raw,expected_state_reason",
+        [
+            ("COMPLETED", "COMPLETED"),
+            ("NOT_PLANNED", "NOT_PLANNED"),
+            ("REOPENED", "REOPENED"),
+            ("", ""),
+            (None, ""),  # null from pre-2022 issues normalised to ""
+        ],
+    )
+    def test_state_reason_carried_through(
+        self, mock_list, mock_api, state_reason_raw, expected_state_reason
+    ):
+        """Issue #98: stateReason is fetched and normalised to state_reason key."""
+        fixture = [{**ISSUE_FIXTURE[0], "stateReason": state_reason_raw}]
+        mock_list.return_value = fixture
+        mock_api.return_value = []
+
+        results = fetch_issues("owner/repo")
+        assert "state_reason" in results[0], "state_reason key must be present"
+        assert results[0]["state_reason"] == expected_state_reason, (
+            f"Expected state_reason={expected_state_reason!r} for raw "
+            f"stateReason={state_reason_raw!r}, got {results[0]['state_reason']!r}"
+        )
+
+    @patch("collector.github_poller.fetch_issues.gh_api")
+    @patch("collector.github_poller.fetch_issues.run_gh_json")
+    def test_state_reason_absent_becomes_empty_string(self, mock_list, mock_api):
+        """Issue #98: when stateReason is absent from payload, state_reason is ''."""
+        fixture = [{k: v for k, v in ISSUE_FIXTURE[0].items() if k != "stateReason"}]
+        mock_list.return_value = fixture
+        mock_api.return_value = []
+
+        results = fetch_issues("owner/repo")
+        assert results[0].get("state_reason") == "", (
+            f"Missing stateReason must produce state_reason='', "
+            f"got {results[0].get('state_reason')!r}"
+        )
+
     @patch("collector.github_poller.fetch_prs.gh_api")
     @patch("collector.github_poller.fetch_prs.run_gh_json")
     def test_pr_review_comment_has_id(self, mock_list, mock_api):

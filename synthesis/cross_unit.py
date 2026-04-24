@@ -329,12 +329,12 @@ def compute_flags(
             flagged.sort()
             outlier_flags_json = json.dumps(flagged)
 
-            # Abandonment flag: 1 if no node event within cutoff.
-            latest = _latest_node_ts(root_node_id, nodes, adj)
-            if latest is None or latest < cutoff:
-                abandonment_flag = 1
-            else:
-                abandonment_flag = 0
+            # Issue #98: ``abandonment_flag`` is retired as the source of
+            # truth for abandoned units.  ``status == "abandoned"`` from
+            # ``_summarise_unit`` is now the canonical signal.  The column
+            # is kept for backward compatibility but is always written as 0
+            # so downstream consumers fall through to ``status``.
+            abandonment_flag = 0
 
             cur = conn.execute(
                 "UPDATE units "

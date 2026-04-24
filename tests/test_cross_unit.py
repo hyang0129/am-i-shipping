@@ -362,6 +362,12 @@ class TestAbandonmentFlag:
         assert row[0] == 0
 
     def test_old_activity_is_abandoned(self, tmp_path: Path) -> None:
+        """Issue #98: compute_flags no longer writes abandonment_flag=1.
+
+        The abandoned signal is now ``status == 'abandoned'`` from
+        ``_summarise_unit``. ``abandonment_flag`` is kept for backward
+        compatibility but is always written as 0 by compute_flags.
+        """
         db_path = _make_db(tmp_path)
         conn = sqlite3.connect(str(db_path))
         try:
@@ -387,22 +393,30 @@ class TestAbandonmentFlag:
             ).fetchone()
         finally:
             conn.close()
-        assert row[0] == 1
+        # Issue #98: abandonment_flag is retired — always 0 from compute_flags.
+        # Stale/abandoned detection uses status == "abandoned" from _summarise_unit.
+        assert row[0] == 0
 
     @pytest.mark.parametrize(
         "days_ago,expected_flag",
         [
+            # Issue #98: abandonment_flag is always 0 from compute_flags.
+            # All boundary cases now expect 0 — the retired flag is no longer
+            # set to 1 regardless of activity age.
             pytest.param(0, 0, id="today"),
             pytest.param(13, 0, id="13_days_ago_still_active"),
             pytest.param(14, 0, id="exactly_14_days_ago_still_active"),
-            pytest.param(15, 1, id="15_days_ago_abandoned"),
-            pytest.param(100, 1, id="100_days_ago_abandoned"),
+            pytest.param(15, 0, id="15_days_ago_flag_retired"),
+            pytest.param(100, 0, id="100_days_ago_flag_retired"),
         ],
     )
     def test_abandonment_boundary(
         self, tmp_path: Path, days_ago: int, expected_flag: int
     ) -> None:
-        """Check the exact 14-day boundary using an injected ``now``."""
+        """Check the exact 14-day boundary using an injected ``now``.
+
+        Issue #98: abandonment_flag is retired — always 0 from compute_flags.
+        """
         db_path = _make_db(tmp_path)
         conn = sqlite3.connect(str(db_path))
         try:
@@ -435,7 +449,11 @@ class TestAbandonmentFlag:
         assert row[0] == expected_flag
 
     def test_no_nodes_is_abandoned(self, tmp_path: Path) -> None:
-        """Unit whose root node is missing from graph_nodes is abandoned."""
+        """Unit whose root node is missing from graph_nodes — abandonment_flag retired.
+
+        Issue #98: compute_flags no longer writes abandonment_flag=1 even
+        for units with missing nodes. The flag is always 0.
+        """
         db_path = _make_db(tmp_path)
         conn = sqlite3.connect(str(db_path))
         try:
@@ -457,7 +475,8 @@ class TestAbandonmentFlag:
             ).fetchone()
         finally:
             conn.close()
-        assert row[0] == 1
+        # Issue #98: abandonment_flag is retired — always 0 from compute_flags.
+        assert row[0] == 0
 
     @pytest.mark.parametrize(
         "bad_ts",
@@ -499,7 +518,8 @@ class TestAbandonmentFlag:
             ).fetchone()
         finally:
             conn.close()
-        assert row[0] == 1
+        # Issue #98: abandonment_flag is retired — always 0 from compute_flags.
+        assert row[0] == 0
 
     def test_issue_closed_recently_is_not_abandoned(self, tmp_path: Path) -> None:
         """Issue created 30 days ago, closed 5 days ago → abandonment_flag=0."""
@@ -564,7 +584,8 @@ class TestAbandonmentFlag:
             ).fetchone()
         finally:
             conn.close()
-        assert row[0] == 1  # no recent activity → abandoned
+        # Issue #98: abandonment_flag is retired — always 0 from compute_flags.
+        assert row[0] == 0  # flag retired; stale detection via status=="abandoned"
 
     def test_pr_merged_recently_is_not_abandoned(self, tmp_path: Path) -> None:
         """PR created 30 days ago, merged 5 days ago → abandonment_flag=0."""
@@ -627,7 +648,8 @@ class TestAbandonmentFlag:
             ).fetchone()
         finally:
             conn.close()
-        assert row[0] == 1  # no recent activity → abandoned
+        # Issue #98: abandonment_flag is retired — always 0 from compute_flags.
+        assert row[0] == 0  # flag retired; stale detection via status=="abandoned"
 
     def test_issue_with_unparseable_noderef_uses_graph_nodes_ts(
         self, tmp_path: Path
@@ -712,7 +734,12 @@ class TestAbandonmentFlag:
         assert row[0] == 0
 
     def test_abandonment_days_override(self, tmp_path: Path) -> None:
-        """Passing abandonment_days=7 flags a 10-day-old event."""
+        """abandonment_days param is accepted; abandonment_flag is always 0 (retired).
+
+        Issue #98: the abandonment_days parameter still governs
+        _summarise_unit behavior, but compute_flags no longer writes
+        abandonment_flag=1.
+        """
         db_path = _make_db(tmp_path)
         conn = sqlite3.connect(str(db_path))
         try:
@@ -742,7 +769,8 @@ class TestAbandonmentFlag:
             ).fetchone()
         finally:
             conn.close()
-        assert row[0] == 1
+        # Issue #98: abandonment_flag is retired — always 0 from compute_flags.
+        assert row[0] == 0
 
 
 # ---------------------------------------------------------------------------

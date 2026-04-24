@@ -55,8 +55,9 @@ def upsert_issue(
             """
             INSERT INTO issues (
                 repo, issue_number, title, type_label, state,
-                body, comments_json, created_at, closed_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                body, comments_json, created_at, closed_at, updated_at,
+                state_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(repo, issue_number) DO UPDATE SET
                 title = excluded.title,
                 type_label = excluded.type_label,
@@ -65,7 +66,8 @@ def upsert_issue(
                 comments_json = excluded.comments_json,
                 created_at = excluded.created_at,
                 closed_at = excluded.closed_at,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                state_reason = excluded.state_reason
             """,
             (
                 repo,
@@ -78,6 +80,7 @@ def upsert_issue(
                 issue.get("created_at"),
                 issue.get("closed_at"),
                 issue.get("updated_at"),
+                issue.get("state_reason", ""),
             ),
         )
         if own_conn:
