@@ -19,3 +19,17 @@ Manual cleanup (equivalent SQL, for reference):
     DELETE FROM graph_edges WHERE week_start = 'all';
     DELETE FROM units       WHERE week_start = 'all';
 """
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _force_offline_llm(monkeypatch: pytest.MonkeyPatch):
+    """Force the offline ``_FakeAdapter`` for every test.
+
+    Production defaults to live; tests must opt out so they never hit
+    the network or burn API credit. A test that needs live behaviour
+    can ``monkeypatch.delenv("AMIS_SYNTHESIS_OFFLINE", raising=False)``
+    inside its own body.
+    """
+    monkeypatch.setenv("AMIS_SYNTHESIS_OFFLINE", "1")

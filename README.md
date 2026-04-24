@@ -118,8 +118,8 @@ prescribe recommendations; that is a separate layer.
   and `data/sessions.db`
 - Apportions a 512 KB transcript budget across the week's sessions (see
   `synthesis/weekly.py::water_fill_truncate`)
-- Calls the Anthropic API (or an offline fake when `AMIS_SYNTHESIS_LIVE`
-  is unset) to render the retrospective
+- Calls the Anthropic API (or an offline fake when `AMIS_SYNTHESIS_OFFLINE=1`
+  is set) to render the retrospective
 - Writes `retrospectives/YYYY-MM-DD.md` atomically; refuses to overwrite
   an existing file so your hand-written answers under "Clarifying
   Questions" survive a re-run
@@ -144,7 +144,8 @@ am-synthesize --week YYYY-MM-DD --dry-run
 
 | Variable | Purpose |
 |----------|---------|
-| `AMIS_SYNTHESIS_LIVE=1` | Use the real Anthropic API instead of the offline fake client. Requires `ANTHROPIC_API_KEY` (or whichever name `config.synthesis.anthropic_api_key_env` resolves to). |
+| `AMIS_SYNTHESIS_OFFLINE=1` | Force the offline fake client instead of the real Anthropic API. Default is live. Tests opt into this via the `tests/conftest.py` autouse fixture so they never hit the network. |
+| `LLM_PROVIDER` | `claude-cli` (default) shells out to the authenticated `claude` CLI; `anthropic` calls the SDK directly and requires `ANTHROPIC_API_KEY` (or whichever name `config.synthesis.anthropic_api_key_env` resolves to). |
 | `AMIS_FORCE_SYNTHESIS=1` | Run `am-synthesize` inside `run_collectors.sh` / `.ps1` even when today is not Sunday. Useful for ad-hoc re-runs or catching up after a missed Sunday. |
 
 ### Where output goes

@@ -26,7 +26,7 @@ Design priors inherited from the epic intent:
 The module is intentionally I/O-parameterised (``input_fn`` /
 ``output_fn``) so tests drive the loop without a real TTY, and the LLM
 adapter is the same ``_get_adapter`` abstraction the rest of synthesis
-uses. In offline mode (``AMIS_SYNTHESIS_LIVE`` unset) the fake client
+uses. In offline mode (``AMIS_SYNTHESIS_OFFLINE=1``) the fake client
 returns canned text that does not parse as a correction turn; the
 module treats unparseable agent output as "confirm, no change" so the
 offline smoke-test path still writes rows.

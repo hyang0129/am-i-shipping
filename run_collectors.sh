@@ -72,7 +72,7 @@ run_collector "GitHub Poller"  -m collector.github_poller.run
 # WARNING and does NOT increment FAIL_COUNT. The overall scheduler's
 # exit code should reflect the daily collectors' health; synthesis is a
 # once-a-week add-on that may legitimately skip (missing API key,
-# AMIS_SYNTHESIS_LIVE=1 without credentials, empty DB, etc.). Only
+# live mode without credentials, empty DB, etc.). Only
 # daily-collector failures should flip the scheduler red. See F-5 in the
 # PR-48 review-fix cycle.
 if [ "$(date +%u)" = "7" ] || [ "${AMIS_FORCE_SYNTHESIS:-0}" = "1" ]; then

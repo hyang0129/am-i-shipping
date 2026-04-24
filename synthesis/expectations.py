@@ -38,8 +38,9 @@ Architecture notes
   the graph-walk + session-lookup helpers the rest of the synthesis
   pipeline shares.
 * Reuses :func:`synthesis.llm_adapter._get_adapter` for offline/live
-  client selection. ``AMIS_SYNTHESIS_LIVE`` unset (the default in tests)
-  routes to :class:`FakeAnthropicClient`.
+  client selection. ``AMIS_SYNTHESIS_OFFLINE=1`` (the default in tests
+  via the conftest autouse fixture) routes to
+  :class:`FakeAnthropicClient`. Production defaults to live.
 """
 
 from __future__ import annotations

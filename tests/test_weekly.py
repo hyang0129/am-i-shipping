@@ -160,10 +160,12 @@ def _insert_unit_summaries(
 def _scrub_live_env(monkeypatch: pytest.MonkeyPatch):
     """Guarantee offline mode across every test in this module.
 
-    Some environments may have AMIS_SYNTHESIS_LIVE or ANTHROPIC_API_KEY
-    exported. Scrub both so no test accidentally tries a real API call.
+    Some environments may export ANTHROPIC_API_KEY. The repo-wide
+    conftest fixture sets AMIS_SYNTHESIS_OFFLINE=1; this fixture
+    re-asserts it and also strips the API key so no test accidentally
+    tries a real API call.
     """
-    monkeypatch.delenv("AMIS_SYNTHESIS_LIVE", raising=False)
+    monkeypatch.setenv("AMIS_SYNTHESIS_OFFLINE", "1")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     yield
 
