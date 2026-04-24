@@ -44,8 +44,10 @@ pytestmark = pytest.mark.skipif(
 def _no_live_llm(monkeypatch):
     """Force FakeAnthropicClient unless AMIS_FORCE_LIVE=1 is set."""
     if os.environ.get("AMIS_FORCE_LIVE") != "1":
-        monkeypatch.delenv("AMIS_SYNTHESIS_LIVE", raising=False)
+        monkeypatch.setenv("AMIS_SYNTHESIS_OFFLINE", "1")
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    else:
+        monkeypatch.delenv("AMIS_SYNTHESIS_OFFLINE", raising=False)
 
 
 @pytest.fixture()

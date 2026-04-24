@@ -26,7 +26,7 @@ Behavioral invariants (from the refined spec):
 * **Idempotent re-runs.** Upsert on ``(week_start, unit_id,
   revision_index)`` — re-running without ``--rebuild`` does not insert
   duplicates; existing ``detected_at`` is preserved on no-op re-runs.
-* **Offline parity.** With ``AMIS_SYNTHESIS_LIVE`` unset, the fake
+* **Offline parity.** With ``AMIS_SYNTHESIS_OFFLINE=1``, the fake
   adapter returns canned Markdown. The classifier coerces that into a
   low-confidence revision so the pipeline still exercises the row-write
   path end-to-end in tests.
@@ -712,7 +712,7 @@ def run(
             exp_conn.commit()
 
         # Resolve the LLM adapter once. ``_get_adapter`` accepts None for
-        # offline mode via the AMIS_SYNTHESIS_LIVE env check, but its
+        # offline mode via the AMIS_SYNTHESIS_OFFLINE env check, but its
         # signature requires a SynthesisConfig — synthesize one if the
         # caller did not provide it.
         if config is None:

@@ -3,20 +3,21 @@
 Ported from ``video_agent_long/tools/llm_adapter.py``. Routes synthesis
 LLM calls through one of three backends selected at runtime:
 
-* **offline** (``AMIS_SYNTHESIS_LIVE`` unset / falsy) →
-  :class:`_FakeAdapter` — wraps :class:`FakeAnthropicClient`; no API
-  calls, deterministic output, no credentials required.
+* **claude-cli** (default; ``LLM_PROVIDER`` unset or ``claude-cli``) →
+  :class:`ClaudeCliAdapter` — shells out to the ``claude`` CLI via
+  ``subprocess``. Uses the authenticated session inside the running
+  Claude Code instance; does NOT require ``ANTHROPIC_API_KEY`` in the
+  subprocess environment (the key is stripped to prevent leakage).
 
-* **claude-cli** (``AMIS_SYNTHESIS_LIVE=1``, ``LLM_PROVIDER=claude-cli``,
-  the default when live) → :class:`ClaudeCliAdapter` — shells out to the
-  ``claude`` CLI via ``subprocess``. Uses the authenticated session inside
-  the running Claude Code instance; does NOT require ``ANTHROPIC_API_KEY``
-  in the subprocess environment (the key is stripped to prevent leakage).
+* **anthropic** (``LLM_PROVIDER=anthropic``) → :class:`AnthropicAdapter`
+  — calls the Anthropic SDK directly. The system prompt is wrapped in a
+  ``cache_control: ephemeral`` block so repeated weekly synthesis runs
+  pay a cache-read price on the static context.
 
-* **anthropic** (``AMIS_SYNTHESIS_LIVE=1``, ``LLM_PROVIDER=anthropic``) →
-  :class:`AnthropicAdapter` — calls the Anthropic SDK directly. The system
-  prompt is wrapped in a ``cache_control: ephemeral`` block so repeated
-  weekly synthesis runs pay a cache-read price on the static context.
+* **offline** (``AMIS_SYNTHESIS_OFFLINE=1``) → :class:`_FakeAdapter` —
+  wraps :class:`FakeAnthropicClient`; no API calls, deterministic
+  output, no credentials required. Tests opt into this; production
+  defaults to live.
 
 Call-site interface is uniform across all three backends::
 
@@ -26,8 +27,11 @@ Call-site interface is uniform across all three backends::
 
 Environment variables
 ---------------------
-``AMIS_SYNTHESIS_LIVE``
-    Any truthy string enables live mode. Unset or empty → offline.
+``AMIS_SYNTHESIS_OFFLINE``
+    Any truthy string forces the offline ``_FakeAdapter``. Unset or
+    empty → live mode (the default). Tests set this to avoid hitting
+    the network; the suite-level autouse fixture in ``tests/conftest.py``
+    sets it for every test by default.
 ``LLM_PROVIDER``
     ``claude-cli`` (default) or ``anthropic``. Only read in live mode.
 ``LINUX_CLAUDE_CLI_PATH``
@@ -350,16 +354,16 @@ class _FakeAdapter:
 
 
 def _get_adapter(config: "SynthesisConfig") -> LLMAdapter:
-    """Return the appropriate adapter based on ``AMIS_SYNTHESIS_LIVE`` and ``LLM_PROVIDER``.
+    """Return the appropriate adapter based on ``AMIS_SYNTHESIS_OFFLINE`` and ``LLM_PROVIDER``.
 
-    Offline (``AMIS_SYNTHESIS_LIVE`` unset / falsy):
+    Offline (``AMIS_SYNTHESIS_OFFLINE=1``):
         Returns :class:`_FakeAdapter` regardless of ``LLM_PROVIDER``.
 
-    Live (``AMIS_SYNTHESIS_LIVE=1``):
+    Live (``AMIS_SYNTHESIS_OFFLINE`` unset / falsy — the default):
         ``LLM_PROVIDER=claude-cli`` (default) → :class:`ClaudeCliAdapter`
         ``LLM_PROVIDER=anthropic``            → :class:`AnthropicAdapter`
     """
-    if not os.environ.get("AMIS_SYNTHESIS_LIVE"):
+    if os.environ.get("AMIS_SYNTHESIS_OFFLINE"):
         return _FakeAdapter()
 
     provider = os.environ.get("LLM_PROVIDER", "claude-cli")
@@ -371,7 +375,7 @@ def _get_adapter(config: "SynthesisConfig") -> LLMAdapter:
         api_key = os.environ.get(config.anthropic_api_key_env)
         if not api_key:
             raise RuntimeError(
-                f"AMIS_SYNTHESIS_LIVE is set but {config.anthropic_api_key_env} "
+                f"LLM_PROVIDER=anthropic but {config.anthropic_api_key_env} "
                 "is empty — cannot call the Anthropic API"
             )
         return AnthropicAdapter(api_key=api_key)

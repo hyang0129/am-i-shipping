@@ -171,7 +171,7 @@ def _run(
 @pytest.fixture(autouse=True)
 def _scrub_live_env(monkeypatch: pytest.MonkeyPatch):
     """Guarantee offline mode (FakeAnthropicClient) for all tests here."""
-    monkeypatch.delenv("AMIS_SYNTHESIS_LIVE", raising=False)
+    monkeypatch.setenv("AMIS_SYNTHESIS_OFFLINE", "1")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     yield
 

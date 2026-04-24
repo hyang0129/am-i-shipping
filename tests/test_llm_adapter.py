@@ -55,8 +55,13 @@ def _make_completed_process(stdout: str, returncode: int = 0) -> subprocess.Comp
 
 @pytest.fixture(autouse=True)
 def _scrub_live_env(monkeypatch: pytest.MonkeyPatch):
-    """Unset live-mode and provider env vars before each test."""
-    monkeypatch.delenv("AMIS_SYNTHESIS_LIVE", raising=False)
+    """Reset env so each test in this file controls its own routing.
+
+    The repo-wide ``conftest.py`` autouse fixture sets
+    ``AMIS_SYNTHESIS_OFFLINE=1`` for every test. Routing tests below
+    selectively delete it to exercise live-mode branches.
+    """
+    monkeypatch.setenv("AMIS_SYNTHESIS_OFFLINE", "1")
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     yield
@@ -153,8 +158,8 @@ def test_claude_cli_adapter_raises_on_is_error():
 
 
 def test_get_adapter_offline_returns_fake(monkeypatch: pytest.MonkeyPatch):
-    """With AMIS_SYNTHESIS_LIVE unset, _get_adapter returns a _FakeAdapter."""
-    # autouse fixture already unsets AMIS_SYNTHESIS_LIVE
+    """With AMIS_SYNTHESIS_OFFLINE=1, _get_adapter returns a _FakeAdapter."""
+    # autouse fixture already sets AMIS_SYNTHESIS_OFFLINE=1
     adapter = _get_adapter(_make_cfg())
     assert isinstance(adapter, _FakeAdapter), (
         f"expected _FakeAdapter in offline mode, got {type(adapter)}"
@@ -162,10 +167,10 @@ def test_get_adapter_offline_returns_fake(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_get_adapter_live_default_is_claude_cli(monkeypatch: pytest.MonkeyPatch):
-    """With AMIS_SYNTHESIS_LIVE=1 and LLM_PROVIDER unset, returns ClaudeCliAdapter."""
+    """With AMIS_SYNTHESIS_OFFLINE unset and LLM_PROVIDER unset, returns ClaudeCliAdapter."""
     from synthesis.llm_adapter import ClaudeCliAdapter as _CCA
 
-    monkeypatch.setenv("AMIS_SYNTHESIS_LIVE", "1")
+    monkeypatch.delenv("AMIS_SYNTHESIS_OFFLINE", raising=False)
     # LLM_PROVIDER unset → default is claude-cli
 
     adapter = _get_adapter(_make_cfg())
@@ -175,10 +180,10 @@ def test_get_adapter_live_default_is_claude_cli(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_get_adapter_live_anthropic_with_key(monkeypatch: pytest.MonkeyPatch):
-    """With AMIS_SYNTHESIS_LIVE=1, LLM_PROVIDER=anthropic, and the key set, returns AnthropicAdapter."""
+    """With AMIS_SYNTHESIS_OFFLINE unset, LLM_PROVIDER=anthropic, and the key set, returns AnthropicAdapter."""
     from synthesis.llm_adapter import AnthropicAdapter
 
-    monkeypatch.setenv("AMIS_SYNTHESIS_LIVE", "1")
+    monkeypatch.delenv("AMIS_SYNTHESIS_OFFLINE", raising=False)
     monkeypatch.setenv("LLM_PROVIDER", "anthropic")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-live-key")
 
@@ -189,8 +194,8 @@ def test_get_adapter_live_anthropic_with_key(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_get_adapter_live_anthropic_missing_key_raises(monkeypatch: pytest.MonkeyPatch):
-    """With AMIS_SYNTHESIS_LIVE=1, LLM_PROVIDER=anthropic, but no API key: raises RuntimeError."""
-    monkeypatch.setenv("AMIS_SYNTHESIS_LIVE", "1")
+    """With AMIS_SYNTHESIS_OFFLINE unset, LLM_PROVIDER=anthropic, but no API key: raises RuntimeError."""
+    monkeypatch.delenv("AMIS_SYNTHESIS_OFFLINE", raising=False)
     monkeypatch.setenv("LLM_PROVIDER", "anthropic")
     # ANTHROPIC_API_KEY unset (autouse fixture already strips it)
 
@@ -200,8 +205,8 @@ def test_get_adapter_live_anthropic_missing_key_raises(monkeypatch: pytest.Monke
 
 
 def test_get_adapter_unknown_provider_raises(monkeypatch: pytest.MonkeyPatch):
-    """With AMIS_SYNTHESIS_LIVE=1 and an unknown LLM_PROVIDER: raises ValueError."""
-    monkeypatch.setenv("AMIS_SYNTHESIS_LIVE", "1")
+    """With AMIS_SYNTHESIS_OFFLINE unset and an unknown LLM_PROVIDER: raises ValueError."""
+    monkeypatch.delenv("AMIS_SYNTHESIS_OFFLINE", raising=False)
     monkeypatch.setenv("LLM_PROVIDER", "unknown-provider")
 
     with pytest.raises(ValueError, match="unknown-provider"):
