@@ -228,7 +228,7 @@ def compute_flags(
 
         # For each issue node_ref, fetch COALESCE(closed_at, updated_at, created_at).
         # node_ref = "{repo}#{number}", split on "#" with rpartition.
-        issue_activity: dict[str, Optional[str]] = {}
+        issue_activity: dict[str, str] = {}
         for ref in issue_refs:
             parsed = parse_repo_number(ref)
             if parsed is None:
@@ -242,7 +242,7 @@ def compute_flags(
             if row and row[0] is not None:
                 issue_activity[ref] = row[0]
 
-        pr_activity: dict[str, Optional[str]] = {}
+        pr_activity: dict[str, str] = {}
         for ref in pr_refs:
             parsed = parse_repo_number(ref)
             if parsed is None:
