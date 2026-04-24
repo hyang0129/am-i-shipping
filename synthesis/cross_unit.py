@@ -84,13 +84,12 @@ def _latest_node_ts(
     nodes: dict[str, Optional[str]],
     adj: dict[str, set[str]],
 ) -> Optional[datetime]:
-    """Return the latest activity timestamp reachable from *root_id*.
+    """Return the most-recent node timestamp reachable from *root_id*.
 
     Walks every node reachable from the unit's ``root_node_id`` via
     ``graph_edges`` within the week (BFS over the adjacency map), parses
-    each reachable node's latest activity timestamp via
-    :func:`metrics.parse_ts`, and returns the latest naive-UTC
-    ``datetime`` found.
+    each reachable node's timestamp via :func:`metrics.parse_ts`, and
+    returns the latest naive-UTC ``datetime`` found.
 
     Returns ``None`` when ``root_id`` is falsy, is not present in
     *nodes* (orphaned unit), or no reachable node has a parseable
@@ -100,10 +99,14 @@ def _latest_node_ts(
     ``graph_nodes`` / ``graph_edges`` reads out of the per-unit loop in
     :func:`compute_flags` and passes *nodes* + *adj* in so one scan
     serves every unit for the week (F-1-1). ``nodes`` maps
-    ``node_id -> latest_activity_ts``; for ``issue`` and ``pr`` nodes
-    this is ``COALESCE(closed_at/merged_at, updated_at, created_at)``
-    from the source table, falling back to ``graph_nodes.created_at``
-    when no source row is found. ``adj`` is an undirected adjacency
+    ``node_id -> ts`` where *ts* is the **first non-NULL value** from a
+    fixed priority chain: for ``issue`` nodes,
+    ``COALESCE(closed_at, updated_at, created_at)``; for ``pr`` nodes,
+    ``COALESCE(merged_at, updated_at, created_at)``; falling back to
+    ``graph_nodes.created_at`` when no source row is found. This is a
+    priority-ordered COALESCE — not a MAX — so ``closed_at``/``merged_at``
+    takes precedence over a later ``updated_at`` (e.g. a comment added
+    after close). ``adj`` is an undirected adjacency
     ``node_id -> set[node_id]``.
     """
     if not root_id or root_id not in nodes:
