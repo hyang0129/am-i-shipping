@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from synthesis import metrics
+from synthesis.unit_identifier import parse_repo_number
 
 
 # Metrics that participate in outlier detection. Order is stable so the
@@ -83,12 +84,12 @@ def _latest_node_ts(
     nodes: dict[str, Optional[str]],
     adj: dict[str, set[str]],
 ) -> Optional[datetime]:
-    """Return the latest ``graph_nodes.created_at`` reachable from *root_id*.
+    """Return the most-recent node timestamp reachable from *root_id*.
 
     Walks every node reachable from the unit's ``root_node_id`` via
     ``graph_edges`` within the week (BFS over the adjacency map), parses
-    each reachable node's ``created_at`` via :func:`metrics.parse_ts`,
-    and returns the latest naive-UTC ``datetime`` found.
+    each reachable node's timestamp via :func:`metrics.parse_ts`, and
+    returns the latest naive-UTC ``datetime`` found.
 
     Returns ``None`` when ``root_id`` is falsy, is not present in
     *nodes* (orphaned unit), or no reachable node has a parseable
@@ -98,7 +99,14 @@ def _latest_node_ts(
     ``graph_nodes`` / ``graph_edges`` reads out of the per-unit loop in
     :func:`compute_flags` and passes *nodes* + *adj* in so one scan
     serves every unit for the week (F-1-1). ``nodes`` maps
-    ``node_id -> created_at_text``; ``adj`` is an undirected adjacency
+    ``node_id -> ts`` where *ts* is the **first non-NULL value** from a
+    fixed priority chain: for ``issue`` nodes,
+    ``COALESCE(closed_at, updated_at, created_at)``; for ``pr`` nodes,
+    ``COALESCE(merged_at, updated_at, created_at)``; falling back to
+    ``graph_nodes.created_at`` when no source row is found. This is a
+    priority-ordered COALESCE — not a MAX — so ``closed_at``/``merged_at``
+    takes precedence over a later ``updated_at`` (e.g. a comment added
+    after close). ``adj`` is an undirected adjacency
     ``node_id -> set[node_id]``.
     """
     if not root_id or root_id not in nodes:
@@ -161,9 +169,11 @@ def compute_flags(
         the epic ADR value of ``2.0``. Matches
         :class:`am_i_shipping.config_loader.SynthesisConfig.outlier_sigma`.
     abandonment_days:
-        Units with no ``graph_nodes.created_at`` within the last
-        ``abandonment_days`` days (relative to *now*) are flagged. Epic
-        ADR default is ``14``.
+        Units with no activity within the last ``abandonment_days`` days
+        (relative to *now*) are flagged. For issue and PR nodes, activity
+        is ``COALESCE(closed_at/merged_at, updated_at, created_at)`` from
+        the source table; other node types fall back to
+        ``graph_nodes.created_at``. Epic ADR default is ``14``.
     now:
         Injection point for tests. Defaults to
         ``datetime.now(timezone.utc)``. Aware datetimes are normalised
@@ -200,14 +210,62 @@ def compute_flags(
         # week, so we execute them once and pass the materialised dicts
         # into ``_latest_node_ts`` below. Previously the per-unit loop
         # re-queried them, producing O(N) redundant DB round trips.
-        nodes: dict[str, Optional[str]] = {
-            nid: created_at
-            for nid, created_at in conn.execute(
-                "SELECT node_id, created_at FROM graph_nodes "
-                "WHERE week_start = ?",
-                (week_start,),
-            ).fetchall()
-        }
+        raw_nodes: list[tuple[str, str, Optional[str], Optional[str]]] = conn.execute(
+            "SELECT node_id, node_type, node_ref, created_at FROM graph_nodes "
+            "WHERE week_start = ?",
+            (week_start,),
+        ).fetchall()
+
+        # Collect issue and PR node_refs for the batch lookups below.
+        # node_ref format: "{repo}#{number}" (e.g. "owner/repo#42")
+        issue_refs: set[str] = set()
+        pr_refs: set[str] = set()
+        for _nid, ntype, nref, _cat in raw_nodes:
+            if nref and ntype == "issue":
+                issue_refs.add(nref)
+            elif nref and ntype == "pr":
+                pr_refs.add(nref)
+
+        # For each issue node_ref, fetch COALESCE(closed_at, updated_at, created_at).
+        # node_ref = "{repo}#{number}", split on "#" with rpartition.
+        issue_activity: dict[str, str] = {}
+        for ref in issue_refs:
+            parsed = parse_repo_number(ref)
+            if parsed is None:
+                continue
+            repo, num = parsed
+            row = conn.execute(
+                "SELECT COALESCE(closed_at, updated_at, created_at) "
+                "FROM issues WHERE repo = ? AND issue_number = ?",
+                (repo, num),
+            ).fetchone()
+            if row and row[0] is not None:
+                issue_activity[ref] = row[0]
+
+        pr_activity: dict[str, str] = {}
+        for ref in pr_refs:
+            parsed = parse_repo_number(ref)
+            if parsed is None:
+                continue
+            repo, num = parsed
+            row = conn.execute(
+                "SELECT COALESCE(merged_at, updated_at, created_at) "
+                "FROM pull_requests WHERE repo = ? AND pr_number = ?",
+                (repo, num),
+            ).fetchone()
+            if row and row[0] is not None:
+                pr_activity[ref] = row[0]
+
+        # Build the activity-aware nodes map.
+        nodes: dict[str, Optional[str]] = {}
+        for nid, ntype, nref, created_at in raw_nodes:
+            if ntype == "issue" and nref and nref in issue_activity:
+                nodes[nid] = issue_activity[nref]
+            elif ntype == "pr" and nref and nref in pr_activity:
+                nodes[nid] = pr_activity[nref]
+            else:
+                nodes[nid] = created_at
+
         adj: dict[str, set[str]] = {}
         for src, dst in conn.execute(
             "SELECT src_node_id, dst_node_id FROM graph_edges "

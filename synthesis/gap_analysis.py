@@ -25,7 +25,7 @@ Behavioral invariants (from the refined spec):
 * **Auto-confirm sweep.** Gap rows with ``computed_at`` older than 14
   days and ``auto_confirmed=0`` are flipped to 1 on every run. X-4 will
   read / override this column later.
-* **Offline parity.** When ``AMIS_SYNTHESIS_LIVE`` is unset the
+* **Offline parity.** When ``AMIS_SYNTHESIS_OFFLINE=1`` is set the
   :class:`FakeAnthropicClient` path returns a deterministic canned
   JSON; severity computation is a pure function and does not require an
   API call.

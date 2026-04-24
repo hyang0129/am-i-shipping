@@ -7,17 +7,17 @@ without a network call or an API key.
 Why in-tree instead of monkeypatching the real SDK
 ---------------------------------------------------
 The weekly runner picks between the live SDK and this fake based on the
-``AMIS_SYNTHESIS_LIVE`` env var. Co-locating the fake next to the
-production call site means:
+``AMIS_SYNTHESIS_OFFLINE`` env var (default live; ``=1`` opts into the
+fake). Co-locating the fake next to the production call site means:
 
 * The fake's return shape is type-compatible with
   :class:`anthropic.types.Message` at the narrow surface
-  :mod:`synthesis.weekly` consumes (``.content[0].text``) — so swapping
-  ``AMIS_SYNTHESIS_LIVE=1`` on flips to the real SDK without any
+  :mod:`synthesis.weekly` consumes (``.content[0].text``) — so unsetting
+  ``AMIS_SYNTHESIS_OFFLINE`` flips to the real SDK without any
   branching in callers beyond the client selection itself.
 * The deterministic payload is the anchor for the golden snapshot test
   in ``tests/fixtures/synthesis/expected_retrospective.md``: re-running
-  against ``AMIS_SYNTHESIS_LIVE`` unset must produce byte-identical
+  against ``AMIS_SYNTHESIS_OFFLINE=1`` must produce byte-identical
   output.
 
 The Markdown returned below conforms to the epic template:

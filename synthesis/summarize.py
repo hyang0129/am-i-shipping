@@ -13,7 +13,7 @@ regenerate all of them.
 Architecture decisions
 ----------------------
 * **Offline/live client selection** mirrors :func:`synthesis.llm_adapter._get_adapter`:
-  ``AMIS_SYNTHESIS_LIVE=1`` enables the live SDK; anything else uses
+  default is the live SDK; ``AMIS_SYNTHESIS_OFFLINE=1`` opts into
   :class:`FakeAnthropicClient`.
 * **Prompt caching**: the static system prompt is sent with
   ``cache_control: ephemeral`` in live mode so repeated runs pay a

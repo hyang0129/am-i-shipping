@@ -4,7 +4,7 @@ Assembles the weekly retrospective prompt from the synthesis tables
 (``units`` with cross-unit flags, ``graph_nodes`` / ``graph_edges`` for
 component resolution, ``sessions.raw_content_json`` for transcripts),
 calls the Anthropic API (or the offline :class:`FakeAnthropicClient`
-stand-in when ``AMIS_SYNTHESIS_LIVE`` is unset), and hands the
+stand-in when ``AMIS_SYNTHESIS_OFFLINE=1`` is set), and hands the
 rendered Markdown to :func:`synthesis.output_writer.write_retrospective`.
 
 Architecture decisions anchored here
@@ -28,7 +28,7 @@ What lives where
 * Adapter selection is handled by :func:`synthesis.llm_adapter._get_adapter`,
   which picks between the live SDK and
   :class:`synthesis.fake_client.FakeAnthropicClient` based on
-  ``AMIS_SYNTHESIS_LIVE``.
+  ``AMIS_SYNTHESIS_OFFLINE`` (default live; ``=1`` opts into the fake).
 
 Prompt caching
 --------------

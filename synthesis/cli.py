@@ -18,9 +18,9 @@ Coverage diagnostic (Issue #70 — pre-synthesis health check)::
 The bare ``--week`` form is preserved verbatim so scripts and cron entries
 that predate the coverage subcommand continue to work — no breaking change.
 
-When ``AMIS_SYNTHESIS_LIVE`` is unset, weekly runs use the offline
+When ``AMIS_SYNTHESIS_OFFLINE=1`` is set, weekly runs use the offline
 :class:`synthesis.fake_client.FakeAnthropicClient` and do not require an API
-key.
+key. The default is live.
 """
 
 from __future__ import annotations
