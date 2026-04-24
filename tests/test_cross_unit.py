@@ -566,6 +566,151 @@ class TestAbandonmentFlag:
             conn.close()
         assert row[0] == 1  # no recent activity → abandoned
 
+    def test_pr_merged_recently_is_not_abandoned(self, tmp_path: Path) -> None:
+        """PR created 30 days ago, merged 5 days ago → abandonment_flag=0."""
+        db_path = _make_db(tmp_path)
+        now = PINNED_NOW
+        conn = sqlite3.connect(str(db_path))
+        try:
+            _insert_unit(conn, unit_id="u-merged-pr", root_node_id="n-merged-pr")
+            old_ts = (now - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            recent_ts = (now - timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            conn.execute(
+                "INSERT INTO graph_nodes (week_start, node_id, node_type, node_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (WEEK_START, "n-merged-pr", "pr", "testrepo/repo#10", old_ts),
+            )
+            conn.execute(
+                "INSERT INTO pull_requests (repo, pr_number, created_at, merged_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("testrepo/repo", 10, old_ts, recent_ts, recent_ts),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        compute_flags(str(db_path), WEEK_START, now=now)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT abandonment_flag FROM units WHERE unit_id = ?", ("u-merged-pr",)
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == 0  # merged recently → not abandoned
+
+    def test_pr_old_no_activity_is_abandoned(self, tmp_path: Path) -> None:
+        """PR created 30 days ago, never updated, never merged → abandonment_flag=1."""
+        db_path = _make_db(tmp_path)
+        now = PINNED_NOW
+        conn = sqlite3.connect(str(db_path))
+        try:
+            _insert_unit(conn, unit_id="u-old-pr", root_node_id="n-old-pr")
+            old_ts = (now - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            conn.execute(
+                "INSERT INTO graph_nodes (week_start, node_id, node_type, node_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (WEEK_START, "n-old-pr", "pr", "testrepo/repo#11", old_ts),
+            )
+            conn.execute(
+                "INSERT INTO pull_requests (repo, pr_number, created_at, merged_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("testrepo/repo", 11, old_ts, None, None),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        compute_flags(str(db_path), WEEK_START, now=now)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT abandonment_flag FROM units WHERE unit_id = ?", ("u-old-pr",)
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == 1  # no recent activity → abandoned
+
+    def test_issue_with_unparseable_noderef_uses_graph_nodes_ts(
+        self, tmp_path: Path
+    ) -> None:
+        """node_ref with non-numeric issue number falls back to graph_nodes.created_at.
+
+        When the ``#<number>`` part of a node_ref cannot be parsed as an
+        integer, the issue-activity lookup is skipped (``continue``).
+        The nodes map therefore stores ``graph_nodes.created_at`` for that
+        node.  A recent ``created_at`` must yield ``abandonment_flag=0``.
+        """
+        db_path = _make_db(tmp_path)
+        now = PINNED_NOW
+        conn = sqlite3.connect(str(db_path))
+        try:
+            _insert_unit(conn, unit_id="u-badref", root_node_id="n-badref")
+            recent_ts = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            # node_ref has a non-numeric issue number — cannot be parsed as int
+            conn.execute(
+                "INSERT INTO graph_nodes "
+                "(week_start, node_id, node_type, node_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (WEEK_START, "n-badref", "issue", "testrepo/repo#not-a-number", recent_ts),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        compute_flags(str(db_path), WEEK_START, now=now)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT abandonment_flag FROM units WHERE unit_id = ?",
+                ("u-badref",),
+            ).fetchone()
+        finally:
+            conn.close()
+        # Fallback to graph_nodes.created_at (recent) → not abandoned
+        assert row[0] == 0
+
+    def test_issue_with_no_source_row_uses_graph_nodes_ts(
+        self, tmp_path: Path
+    ) -> None:
+        """node_ref pointing to a non-existent issue falls back to graph_nodes.created_at.
+
+        When the issue number parses successfully but no matching row
+        exists in the ``issues`` table, ``issue_activity`` has no entry
+        for that ref.  The nodes map therefore stores
+        ``graph_nodes.created_at`` for that node.  A recent
+        ``created_at`` must yield ``abandonment_flag=0``.
+        """
+        db_path = _make_db(tmp_path)
+        now = PINNED_NOW
+        conn = sqlite3.connect(str(db_path))
+        try:
+            _insert_unit(conn, unit_id="u-norow", root_node_id="n-norow")
+            recent_ts = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            # node_ref points to issue #99999 which does not exist in issues table
+            conn.execute(
+                "INSERT INTO graph_nodes "
+                "(week_start, node_id, node_type, node_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (WEEK_START, "n-norow", "issue", "owner/repo#99999", recent_ts),
+            )
+            # Intentionally NOT inserting a row into issues for owner/repo#99999
+            conn.commit()
+        finally:
+            conn.close()
+
+        compute_flags(str(db_path), WEEK_START, now=now)
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT abandonment_flag FROM units WHERE unit_id = ?",
+                ("u-norow",),
+            ).fetchone()
+        finally:
+            conn.close()
+        # Fallback to graph_nodes.created_at (recent) → not abandoned
+        assert row[0] == 0
+
     def test_abandonment_days_override(self, tmp_path: Path) -> None:
         """Passing abandonment_days=7 flags a 10-day-old event."""
         db_path = _make_db(tmp_path)

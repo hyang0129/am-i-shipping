@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from synthesis import metrics
+from synthesis.unit_identifier import parse_repo_number
 
 
 # Metrics that participate in outlier detection. Order is stable so the
@@ -206,7 +207,7 @@ def compute_flags(
         # week, so we execute them once and pass the materialised dicts
         # into ``_latest_node_ts`` below. Previously the per-unit loop
         # re-queried them, producing O(N) redundant DB round trips.
-        raw_nodes: list[tuple] = conn.execute(
+        raw_nodes: list[tuple[str, str, Optional[str], Optional[str]]] = conn.execute(
             "SELECT node_id, node_type, node_ref, created_at FROM graph_nodes "
             "WHERE week_start = ?",
             (week_start,),
@@ -226,32 +227,30 @@ def compute_flags(
         # node_ref = "{repo}#{number}", split on "#" with rpartition.
         issue_activity: dict[str, Optional[str]] = {}
         for ref in issue_refs:
-            repo, _, num_s = ref.rpartition("#")
-            try:
-                num = int(num_s)
-            except ValueError:
+            parsed = parse_repo_number(ref)
+            if parsed is None:
                 continue
+            repo, num = parsed
             row = conn.execute(
                 "SELECT COALESCE(closed_at, updated_at, created_at) "
                 "FROM issues WHERE repo = ? AND issue_number = ?",
                 (repo, num),
             ).fetchone()
-            if row:
+            if row and row[0] is not None:
                 issue_activity[ref] = row[0]
 
         pr_activity: dict[str, Optional[str]] = {}
         for ref in pr_refs:
-            repo, _, num_s = ref.rpartition("#")
-            try:
-                num = int(num_s)
-            except ValueError:
+            parsed = parse_repo_number(ref)
+            if parsed is None:
                 continue
+            repo, num = parsed
             row = conn.execute(
                 "SELECT COALESCE(merged_at, updated_at, created_at) "
                 "FROM pull_requests WHERE repo = ? AND pr_number = ?",
                 (repo, num),
             ).fetchone()
-            if row:
+            if row and row[0] is not None:
                 pr_activity[ref] = row[0]
 
         # Build the activity-aware nodes map.
