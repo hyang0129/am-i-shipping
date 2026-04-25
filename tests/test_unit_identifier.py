@@ -489,6 +489,200 @@ class TestUnitFilterByIssueOrPr:
         )
 
 
+class TestRootEligibilityWindow:
+    """Issue #100 follow-up: past-closed issues/PRs do not anchor units.
+
+    The graph builder may pull a past-closed issue into the week's graph as
+    *context* (in-week session commented on it; in-week PR linked to it).
+    The unit identifier must not promote such past-closed anchors to unit
+    roots, because doing so creates a "shipped this week" unit whose root
+    actually closed in a prior week — double-counting velocity.
+    """
+
+    def test_past_closed_issue_with_in_week_session_drops_unit(self, tmp_path):
+        """Issue closed before week_start + in-week session commenting on it
+        → no unit, even though the component has an issue node."""
+        gh_path, sess_path = _init_minimal_dbs(tmp_path)
+
+        week = "2025-01-06"
+        session_uuid = "ctx-session-uuid"
+        session_node_id = f"session:{session_uuid}"
+        issue_node_id = "example/repo#10"  # parsed from node_ref
+
+        conn = sqlite3.connect(str(gh_path))
+        try:
+            conn.execute(
+                "INSERT INTO graph_nodes "
+                "(week_start, node_id, node_type, node_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (week, session_node_id, "session", session_uuid,
+                 "2025-01-07T10:00:00Z"),
+            )
+            conn.execute(
+                "INSERT INTO graph_nodes "
+                "(week_start, node_id, node_type, node_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (week, f"issue:{issue_node_id}", "issue", issue_node_id,
+                 "2024-12-15T09:00:00Z"),
+            )
+            conn.execute(
+                "INSERT INTO graph_edges "
+                "(week_start, src_node_id, dst_node_id, edge_type) "
+                "VALUES (?, ?, ?, ?)",
+                (week, session_node_id, f"issue:{issue_node_id}",
+                 "session_refs_issue"),
+            )
+            # Issue closed two weeks before week_start — past-shipped
+            conn.execute(
+                "INSERT INTO issues "
+                "(repo, issue_number, title, type_label, state, body, "
+                " comments_json, created_at, closed_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("example/repo", 10, "Past issue", "feature", "closed",
+                 "", "[]", "2024-12-15T09:00:00Z", "2024-12-22T12:00:00Z",
+                 "2025-01-07T10:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        sess_conn = sqlite3.connect(str(sess_path))
+        try:
+            sess_conn.execute(
+                "INSERT OR IGNORE INTO sessions "
+                "(session_uuid, turn_count, tool_call_count, tool_failure_count, "
+                " reprompt_count, bail_out, session_duration_seconds, "
+                " working_directory, git_branch, raw_content_json, "
+                " input_tokens, output_tokens, cache_creation_tokens, "
+                " cache_read_tokens, fast_mode_turns, "
+                " session_started_at, session_ended_at) "
+                "VALUES (?, 1, 0, 0, 0, 0, 60.0, '/tmp', 'main', '[]', "
+                "        0, 0, 0, 0, 0, ?, ?)",
+                (session_uuid, "2025-01-07T10:00:00Z", "2025-01-07T10:01:00Z"),
+            )
+            sess_conn.commit()
+        finally:
+            sess_conn.close()
+
+        inserted = identify_units(gh_path, sess_path, week, now=PINNED_NOW)
+        assert inserted == 0, (
+            "Past-closed issue must not anchor a unit attributed to this week"
+        )
+
+    def test_in_week_pr_linked_to_past_issue_uses_pr_as_root(self, tmp_path):
+        """In-week PR + past-closed issue (linked) → unit created with PR
+        as root, not the past-closed issue."""
+        gh_path, sess_path = _init_minimal_dbs(tmp_path)
+
+        week = "2025-01-06"
+        issue_ref = "example/repo#10"
+        pr_ref = "example/repo#42"
+        issue_node_id = f"issue:{issue_ref}"
+        pr_node_id = f"pr:{pr_ref}"
+
+        conn = sqlite3.connect(str(gh_path))
+        try:
+            # Past-closed issue (closed 2 weeks before week_start)
+            conn.execute(
+                "INSERT INTO graph_nodes "
+                "(week_start, node_id, node_type, node_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (week, issue_node_id, "issue", issue_ref,
+                 "2024-12-15T09:00:00Z"),
+            )
+            # In-week PR (merged in-week)
+            conn.execute(
+                "INSERT INTO graph_nodes "
+                "(week_start, node_id, node_type, node_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (week, pr_node_id, "pr", pr_ref, "2025-01-07T08:00:00Z"),
+            )
+            conn.execute(
+                "INSERT INTO graph_edges "
+                "(week_start, src_node_id, dst_node_id, edge_type) "
+                "VALUES (?, ?, ?, ?)",
+                (week, pr_node_id, issue_node_id, "pr_closes_issue"),
+            )
+            conn.execute(
+                "INSERT INTO issues "
+                "(repo, issue_number, title, type_label, state, body, "
+                " comments_json, created_at, closed_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("example/repo", 10, "Past issue", "feature", "closed",
+                 "", "[]", "2024-12-15T09:00:00Z", "2024-12-22T12:00:00Z",
+                 "2025-01-07T08:30:00Z"),
+            )
+            conn.execute(
+                "INSERT INTO pull_requests "
+                "(repo, pr_number, head_ref, title, body, review_comments_json, "
+                " review_comment_count, push_count, created_at, merged_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("example/repo", 42, "feat/x", "PR title", "", "[]", 0, 1,
+                 "2025-01-07T08:00:00Z", "2025-01-07T11:00:00Z",
+                 "2025-01-07T11:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        inserted = identify_units(gh_path, sess_path, week, now=PINNED_NOW)
+        assert inserted == 1, (
+            f"In-week PR should still anchor a unit; got {inserted}"
+        )
+
+        conn = sqlite3.connect(str(gh_path))
+        try:
+            row = conn.execute(
+                "SELECT root_node_type, root_node_id FROM units "
+                "WHERE week_start = ?", (week,)
+            ).fetchone()
+        finally:
+            conn.close()
+
+        assert row is not None
+        assert row[0] == "pr", (
+            f"Past-closed issue must not be picked over in-window PR; got {row[0]!r}"
+        )
+        assert row[1] == pr_node_id
+
+    def test_open_issue_with_null_closed_at_is_eligible(self, tmp_path):
+        """An issue that is still open (closed_at IS NULL) must remain a
+        valid anchor regardless of when it was created."""
+        gh_path, sess_path = _init_minimal_dbs(tmp_path)
+
+        week = "2025-01-06"
+        issue_ref = "example/repo#11"
+        issue_node_id = f"issue:{issue_ref}"
+
+        conn = sqlite3.connect(str(gh_path))
+        try:
+            # Issue created last year, still open
+            conn.execute(
+                "INSERT INTO graph_nodes "
+                "(week_start, node_id, node_type, node_ref, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (week, issue_node_id, "issue", issue_ref,
+                 "2024-09-01T09:00:00Z"),
+            )
+            conn.execute(
+                "INSERT INTO issues "
+                "(repo, issue_number, title, type_label, state, body, "
+                " comments_json, created_at, closed_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("example/repo", 11, "Long-open issue", "feature", "open",
+                 "", "[]", "2024-09-01T09:00:00Z", None,
+                 "2025-01-08T10:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        inserted = identify_units(gh_path, sess_path, week, now=PINNED_NOW)
+        assert inserted == 1, (
+            "Long-open issue (closed_at IS NULL) must still anchor a unit"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Issue #68 — AS-2, AS-3, AS-4, AS-5, AS-8
 # Two-issue and issue-only fixture tests.
