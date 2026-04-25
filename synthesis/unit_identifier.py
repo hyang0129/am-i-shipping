@@ -542,6 +542,44 @@ def identify_units(
         if not node_rows:
             return 0
 
+        # --- compute root eligibility (issue #100 follow-up) ---------
+        # An issue/PR node may be in this week's graph as *context* — e.g.
+        # an in-week session commented on a past-closed issue, or an in-week
+        # PR linked to a past-closed issue.  Those past-closed anchors must
+        # not promote to unit roots: a "shipped this week" unit anchored on
+        # an issue that closed three weeks ago inflates this week's velocity
+        # and double-counts work already attributed to the earlier week.
+        #
+        # Eligibility rule: an issue/PR may anchor a unit for this week iff
+        # its terminal state is unset (still open) or >= week_start. Past
+        # closures/merges are kept in the component's node membership (so
+        # session attribution and metrics are unaffected) but are excluded
+        # from root selection and from the "has anchor" component test.
+        eligible_anchors: set[str] = set()
+        for node_id, node_type, node_ref in node_rows:
+            if node_type not in ("issue", "pr"):
+                continue
+            parsed = _parse_repo_number(node_ref)
+            if parsed is None:
+                continue
+            repo, num = parsed
+            if node_type == "issue":
+                row = gh.execute(
+                    "SELECT closed_at FROM issues "
+                    "WHERE repo = ? AND issue_number = ?",
+                    (repo, num),
+                ).fetchone()
+                terminal_ts = row[0] if row else None
+            else:  # pr
+                row = gh.execute(
+                    "SELECT merged_at FROM pull_requests "
+                    "WHERE repo = ? AND pr_number = ?",
+                    (repo, num),
+                ).fetchone()
+                terminal_ts = row[0] if row else None
+            if terminal_ts is None or terminal_ts >= week_start:
+                eligible_anchors.add(node_id)
+
         # --- build components -----------------------------------------
         uf = _UnionFind()
         for node_id, _type, _ref in node_rows:
@@ -583,39 +621,37 @@ def identify_units(
         # Pre-compute the set of issue node IDs that anchor their own
         # issue-rooted component.  A PR-only component is only dropped when
         # EVERY session in it is attributed exclusively to issues that are
-        # already anchors of issue-rooted components (i.e. components that
-        # contain at least one issue node).  This prevents erroneously
-        # dropping a PR component when the session was attributed to a
-        # *different* issue and the PR represents independent work.
-        issue_anchor_nodes: set[str] = set()
-        for comp in components:
-            if any(node_info[nid][0] == "issue" for nid in comp):
-                for nid in comp:
-                    if node_info[nid][0] == "issue":
-                        issue_anchor_nodes.add(nid)
+        # already anchors of issue-rooted components.  Only *eligible*
+        # issues (in-window or still-open) count as anchors — past-closed
+        # issues stay in the graph as context but never anchor a unit.
+        issue_anchor_nodes: set[str] = {
+            nid for nid in eligible_anchors if node_info[nid][0] == "issue"
+        }
 
         # --- write one row per component -----------------------------
         inserted = 0
         for comp in components:
-            # Drop components that have no issue or PR anchor — they are
-            # pure session noise and do not constitute a meaningful unit.
-            # Session-only components still retain their graph_nodes /
-            # graph_edges rows (the graph builder wrote them), but they
-            # are intentionally excluded from ``units`` because there is
-            # no issue or PR anchor to attribute the work to.  See
-            # issue #66 for the design rationale.
-            comp_types = {node_info[nid][0] for nid in comp}
-            if "issue" not in comp_types and "pr" not in comp_types:
+            # Drop components that have no eligible issue or PR anchor.
+            # Components without any issue/PR are pure session noise (Issue
+            # #66).  Components whose only issue/PR anchors are past-closed
+            # — pulled in as context for an in-week session/PR — also drop
+            # here: those represent prior-week work and would double-count
+            # if promoted to a unit attributed to this week (Issue #100
+            # follow-up).
+            eligible_in_comp = [nid for nid in comp if nid in eligible_anchors]
+            eligible_types_in_comp = {
+                node_info[nid][0] for nid in eligible_in_comp
+            }
+            if not eligible_in_comp:
                 continue
 
-            # Drop PR-only components (no issue anchor) when every session
-            # in the component is attributed *only* to issues that are
-            # already anchors of issue-rooted components this week.
-            # This prevents double-counting while retaining PR components
-            # that represent independent work for issues not yet linked by
-            # the poller (e.g. session attributed to issue #A but PR is for
-            # unrelated issue #B with no pr_closes_issue edge yet).
-            if "issue" not in comp_types and session_issue_nodes:
+            # Drop PR-only components (no eligible issue anchor) when every
+            # session in the component is attributed *only* to issues that
+            # are already anchors of issue-rooted components this week.
+            # Uses eligible-anchor types so a past-closed issue in the
+            # component does not falsely satisfy the "has issue anchor"
+            # condition.
+            if "issue" not in eligible_types_in_comp and session_issue_nodes:
                 session_nids_in_comp = {
                     nid for nid in comp if node_info[nid][0] == "session"
                 }
@@ -623,9 +659,6 @@ def identify_units(
                     comp_session_uuids = {
                         node_info[nid][1] for nid in session_nids_in_comp
                     }
-                    # Each session in the component must have at least one
-                    # attribution row, AND all attributed issues must be
-                    # anchors of issue-rooted components for this week.
                     all_attributed_to_anchors = all(
                         uuid in session_issue_nodes
                         and session_issue_nodes[uuid].issubset(issue_anchor_nodes)
@@ -636,7 +669,15 @@ def identify_units(
 
             unit_id = _unit_id_from_nodes(comp)
             nodes_in_unit = [(nid, *node_info[nid]) for nid in comp]
-            root_type, root_id = _pick_root(nodes_in_unit)
+            # Restrict root selection to eligible anchors. Past-closed
+            # issues/PRs remain in nodes_in_unit (so summaries still see
+            # the full membership for metrics) but cannot become the root.
+            eligible_nodes_for_root = [
+                (nid, ntype, nref)
+                for (nid, ntype, nref) in nodes_in_unit
+                if nid in eligible_anchors
+            ]
+            root_type, root_id = _pick_root(eligible_nodes_for_root)
             summary = _summarise_unit(
                 nodes_in_unit,
                 github_conn=gh,

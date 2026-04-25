@@ -355,6 +355,121 @@ class TestBuildGraphFixture:
             conn.close()
         assert sessions_next_week == 0
 
+    def test_week_start_excludes_stale_issue_and_pr_nodes(self, tmp_path):
+        """When ``week_start`` is provided, issue and PR nodes with no in-week
+        activity are excluded from the graph (Issue #100 regression guard).
+
+        The golden fixture contains:
+          - issue 201: closed in-week (2025-01-08) → included
+          - issue 202: open, updated 2024-12-11 (stale) → excluded
+          - PR 301: created+merged 2025-01-06 (in-week) → included
+          - PR 302: created+merged 2025-01-08 (in-week) → included
+          - PR 303: created 2024-12-11, merged=NULL (stale, not in-week) → excluded
+        """
+        db = _fresh_fixture(tmp_path)
+        build_graph(db, db, week_start="2025-01-06")
+
+        conn = sqlite3.connect(str(db))
+        try:
+            counts = dict(
+                conn.execute(
+                    "SELECT node_type, COUNT(*) FROM graph_nodes "
+                    "WHERE week_start = ? GROUP BY node_type",
+                    ("2025-01-06",),
+                ).fetchall()
+            )
+            node_ids = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT node_id FROM graph_nodes WHERE week_start = ?",
+                    ("2025-01-06",),
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+
+        # Only the in-week issue should appear
+        assert counts.get("issue") == 1, (
+            f"Expected 1 issue node (only in-week), got {counts.get('issue')}; "
+            f"nodes: {node_ids}"
+        )
+        assert "issue:example/repo#201" in node_ids, "In-week closed issue must be included"
+        assert "issue:example/repo#202" not in node_ids, "Stale open issue must be excluded"
+
+        # Only the two in-week PRs should appear
+        assert counts.get("pr") == 2, (
+            f"Expected 2 PR nodes (only in-week), got {counts.get('pr')}; "
+            f"nodes: {node_ids}"
+        )
+        assert "pr:example/repo#301" in node_ids, "In-week PR 301 must be included"
+        assert "pr:example/repo#302" in node_ids, "In-week PR 302 must be included"
+        assert "pr:example/repo#303" not in node_ids, "Stale PR 303 must be excluded"
+
+    def test_pr_to_issue_pull_in(self, tmp_path):
+        """An issue with no direct in-week timestamps is pulled in when it is
+        linked to an in-week PR via ``pr_issues`` (Issue #100 spec criterion 4).
+
+        We create a stale closed issue (closed before the week) but link it
+        to an in-week PR. The issue must appear as a graph node.
+        """
+        from am_i_shipping.db import init_github_db, init_sessions_db
+
+        gh_db = tmp_path / "github.db"
+        sess_db = tmp_path / "sessions.db"
+        init_github_db(gh_db)
+        init_sessions_db(sess_db)
+
+        week = "2025-01-06"
+
+        gh_conn = sqlite3.connect(str(gh_db))
+        try:
+            # Stale issue: closed before the week, not updated in-week
+            gh_conn.execute(
+                "INSERT INTO issues "
+                "(repo, issue_number, title, type_label, state, body, comments_json, "
+                " created_at, closed_at, updated_at) "
+                "VALUES (?, ?, 'Old issue', 'bug', 'closed', '', '[]', "
+                " '2024-12-01T10:00:00Z', '2024-12-05T10:00:00Z', '2024-12-05T10:00:00Z')",
+                (REPO, 77),
+            )
+            # In-week PR
+            gh_conn.execute(
+                "INSERT INTO pull_requests "
+                "(repo, pr_number, head_ref, title, body, comments_json, "
+                " review_comments_json, review_comment_count, push_count, "
+                " created_at, merged_at, updated_at) "
+                "VALUES (?, ?, 'fix/old-issue', 'Fix old issue', '', '[]', '[]', 0, 0, "
+                " '2025-01-07T09:00:00Z', '2025-01-07T10:00:00Z', '2025-01-07T10:00:00Z')",
+                (REPO, 55),
+            )
+            # pr_issues linkage: in-week PR 55 closes stale issue 77
+            gh_conn.execute(
+                "INSERT INTO pr_issues (repo, pr_number, issue_number) VALUES (?, ?, ?)",
+                (REPO, 55, 77),
+            )
+            gh_conn.commit()
+        finally:
+            gh_conn.close()
+
+        build_graph(sess_db, gh_db, week_start=week)
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            node_ids = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT node_id FROM graph_nodes WHERE week_start = ?",
+                    (week,),
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+
+        assert f"pr:{REPO}#55" in node_ids, "In-week PR must be present"
+        assert f"issue:{REPO}#77" in node_ids, (
+            "Stale issue linked to an in-week PR must be pulled into the graph"
+        )
+
     def test_separate_sessions_and_github_dbs(self, tmp_path):
         """Realistic shape: sessions.db and github.db are distinct files.
 

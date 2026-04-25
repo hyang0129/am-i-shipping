@@ -25,5 +25,7 @@ Thumbs.db
 # Claude work directory
 .claude-work/
 
-# Synthesis dry-run artifacts
+# Synthesis outputs (generated at runtime)
+retrospectives/*.md
+retrospectives/*/
 retrospectives/.dry-run/
