@@ -126,16 +126,74 @@ def session_matches_pr(
 # ---------------------------------------------------------------------------
 
 
-def _read_issues(conn: sqlite3.Connection) -> list[tuple]:
+def _read_issues(
+    conn: sqlite3.Connection,
+    week_start: Optional[str] = None,
+    week_end: Optional[str] = None,
+) -> list[tuple]:
+    """Return issues rows, optionally filtered to those with in-week activity.
+
+    An issue is included if **any** of the following holds:
+
+    * ``created_at`` in ``[week_start, week_end)``  — opened this week
+    * ``closed_at``  in ``[week_start, week_end)``  — closed this week
+    * ``updated_at`` in ``[week_start, week_end)``
+      AND ``state = 'open'``                          — touched this week while open
+    * ``updated_at IS NULL`` AND ``state = 'open'``  — open with no update timestamp
+      (treated as eligible to have been worked on)
+
+    When ``week_start`` is ``None`` all rows are returned unchanged (backward
+    compatibility with the ``week_start=None`` / ``"all"`` partition).
+    """
+    if week_start is None or week_end is None:
+        return conn.execute(
+            "SELECT repo, issue_number, created_at FROM issues ORDER BY repo, issue_number"
+        ).fetchall()
+
     return conn.execute(
-        "SELECT repo, issue_number, created_at FROM issues ORDER BY repo, issue_number"
+        "SELECT repo, issue_number, created_at FROM issues "
+        "WHERE "
+        "  (created_at IS NOT NULL AND created_at >= ? AND created_at < ?) "
+        "  OR (closed_at  IS NOT NULL AND closed_at  >= ? AND closed_at  < ?) "
+        "  OR (updated_at IS NOT NULL AND updated_at >= ? AND updated_at < ? AND state = 'open') "
+        "  OR (updated_at IS NULL AND state = 'open') "
+        "ORDER BY repo, issue_number",
+        (week_start, week_end, week_start, week_end, week_start, week_end),
     ).fetchall()
 
 
-def _read_prs(conn: sqlite3.Connection) -> list[tuple]:
+def _read_prs(
+    conn: sqlite3.Connection,
+    week_start: Optional[str] = None,
+    week_end: Optional[str] = None,
+) -> list[tuple]:
+    """Return pull_requests rows, optionally filtered to those with in-week activity.
+
+    A PR is included if **any** of the following holds:
+
+    * ``created_at`` in ``[week_start, week_end)``  — opened this week
+    * ``merged_at``  in ``[week_start, week_end)``  — merged this week
+    * ``updated_at`` in ``[week_start, week_end)``
+      AND ``merged_at IS NULL``                       — touched this week while open
+    * ``updated_at IS NULL`` AND ``merged_at IS NULL``— open PR with no update timestamp
+
+    When ``week_start`` is ``None`` all rows are returned unchanged.
+    """
+    if week_start is None or week_end is None:
+        return conn.execute(
+            "SELECT repo, pr_number, head_ref, body, created_at "
+            "FROM pull_requests ORDER BY repo, pr_number"
+        ).fetchall()
+
     return conn.execute(
-        "SELECT repo, pr_number, head_ref, body, created_at "
-        "FROM pull_requests ORDER BY repo, pr_number"
+        "SELECT repo, pr_number, head_ref, body, created_at FROM pull_requests "
+        "WHERE "
+        "  (created_at IS NOT NULL AND created_at >= ? AND created_at < ?) "
+        "  OR (merged_at  IS NOT NULL AND merged_at  >= ? AND merged_at  < ?) "
+        "  OR (updated_at IS NOT NULL AND updated_at >= ? AND updated_at < ? AND merged_at IS NULL) "
+        "  OR (updated_at IS NULL AND merged_at IS NULL) "
+        "ORDER BY repo, pr_number",
+        (week_start, week_end, week_start, week_end, week_start, week_end),
     ).fetchall()
 
 
@@ -300,7 +358,10 @@ def build_graph(
         Path to github.db. All graph rows are written here.
     week_start:
         Optional YYYY-MM-DD string. When provided, only sessions active in
-        that 7-day window are included. When ``None``, every session is
+        that 7-day window are included, and issue/PR nodes are restricted to
+        those with in-week activity (created, closed/merged, updated-while-open,
+        or open with no timestamp) — plus any issues reachable from an in-week
+        PR via ``pr_issues`` linkage. When ``None``, every session/issue/PR is
         included and rows are written under the sentinel ``"all"`` partition.
 
     Side effects
@@ -314,9 +375,14 @@ def build_graph(
 
     gh = sqlite3.connect(str(gh_path))
     sess = gh if sess_path == gh_path else sqlite3.connect(str(sess_path))
+
+    # Compute the week end date once so readers can use the same window
+    # as the session filter already applied by ``_read_sessions``.
+    week_end: Optional[str] = _add_days(week_start, 7) if week_start else None
+
     try:
-        issues = _read_issues(gh)
-        prs = _read_prs(gh)
+        issues = _read_issues(gh, week_start=week_start, week_end=week_end)
+        prs = _read_prs(gh, week_start=week_start, week_end=week_end)
         pr_issues = _read_pr_issues(gh)
         pr_sessions = _read_pr_sessions(gh)
         commits = _read_commits(gh)
@@ -336,10 +402,38 @@ def build_graph(
         pr_by_key: dict[tuple[str, int], tuple[str, str]] = {}
         # (repo, pr_number) -> (head_ref, body) — needed for the text-based
         # close-ref scan below.
+        in_week_pr_keys: set[tuple[str, int]] = set()
         for repo, number, head_ref, body, created_at in prs:
             nid = _pr_node(repo, number)
             nodes.setdefault(nid, ("pr", f"{repo}#{number}", created_at or ""))
             pr_by_key[(repo, number)] = (head_ref or "", body or "")
+            if week_start is not None:
+                # Track which PRs are in-week so we can pull in linked issues.
+                in_week_pr_keys.add((repo, number))
+
+        # Pull in issues linked to in-week PRs via pr_issues (even when the
+        # issue itself has no direct in-week timestamps). This implements the
+        # "linked to an in-week PR" criterion from the spec.
+        if week_start is not None and in_week_pr_keys:
+            linked_issue_numbers: set[tuple[str, int]] = set()
+            for repo, pr_number, issue_number in pr_issues:
+                if (repo, pr_number) in in_week_pr_keys:
+                    linked_issue_numbers.add((repo, issue_number))
+            if linked_issue_numbers:
+                # Fetch the full row for each missing issue so we have created_at.
+                for repo, issue_number in linked_issue_numbers:
+                    nid = _issue_node(repo, issue_number)
+                    if nid not in nodes:
+                        row = gh.execute(
+                            "SELECT repo, issue_number, created_at FROM issues "
+                            "WHERE repo = ? AND issue_number = ?",
+                            (repo, issue_number),
+                        ).fetchone()
+                        if row:
+                            nodes.setdefault(
+                                nid,
+                                ("issue", f"{repo}#{issue_number}", row[2] or ""),
+                            )
 
         commit_by_sha: dict[str, tuple[str, Optional[int], str]] = {}
         for repo, sha, pr_number, message, authored_at in commits:
@@ -518,10 +612,23 @@ def build_graph(
             if event_type in ("issue_create", "issue_comment"):
                 dst = _issue_node(repo, ref_int)
                 # Bootstrap stub node for issue_create events (AS-4).
+                # For issue_comment events, pull in any pre-existing issue that
+                # was filtered out of _read_issues but is referenced by an
+                # in-week session — this constitutes real in-week activity even
+                # if the issue's own timestamps fall outside the window.
                 if dst not in nodes:
-                    if event_type != "issue_create":
-                        continue
-                    nodes[dst] = ("issue", f"{repo}#{ref_int}", "")
+                    if event_type == "issue_create":
+                        nodes[dst] = ("issue", f"{repo}#{ref_int}", "")
+                    else:
+                        # issue_comment: fetch the row if it exists in the DB
+                        row = gh.execute(
+                            "SELECT repo, issue_number, created_at FROM issues "
+                            "WHERE repo = ? AND issue_number = ?",
+                            (repo, ref_int),
+                        ).fetchone()
+                        if row is None:
+                            continue
+                        nodes[dst] = ("issue", f"{repo}#{ref_int}", row[2] or "")
                 # Collect for attribution table — do NOT add to edges.
                 attribution_map.setdefault(session_uuid, set()).add(
                     (repo, ref_int)
