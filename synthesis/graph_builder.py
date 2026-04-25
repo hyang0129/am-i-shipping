@@ -672,7 +672,7 @@ def build_graph(
         sorted_edges = sorted(edges)
 
         gh.execute(
-            "DELETE FROM graph_nodes WHERE week_start = ? AND created_at = '' AND node_type IN ('issue', 'pr')",
+            "DELETE FROM graph_nodes WHERE week_start = ? AND node_type IN ('issue', 'pr')",
             (partition,),
         )
         for node_id, (node_type, node_ref, created_at) in sorted_nodes:
