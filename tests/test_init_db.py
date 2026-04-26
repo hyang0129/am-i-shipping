@@ -505,3 +505,156 @@ class TestStateReasonMigration:
         assert "state_reason" in EXPECTED_GITHUB_TABLES["issues"], (
             "EXPECTED_GITHUB_TABLES['issues'] must list 'state_reason'"
         )
+
+
+# ---------------------------------------------------------------------------
+# Epic #93 — Slice 1 (#102) — graph_edges.traversal column migration
+# ---------------------------------------------------------------------------
+
+
+class TestGraphEdgesTraversalMigration:
+    """``traversal TEXT NOT NULL DEFAULT 'ref'`` is added to graph_edges.
+
+    Slice 1 of the graph-directionality overhaul (Epic #93). This slice is
+    schema-only — no edge writer or BFS walker changes. Subsequent slices
+    populate ``traversal='own'`` for unit-internal edges and update walkers
+    to filter on ``traversal``.
+    """
+
+    def test_fresh_db_has_traversal_column(self, tmp_path):
+        """Fresh DB created by init_github_db includes traversal on graph_edges."""
+        from am_i_shipping.db import init_github_db
+
+        db_path = tmp_path / "github.db"
+        init_github_db(str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            info = conn.execute("PRAGMA table_info('graph_edges')").fetchall()
+        finally:
+            conn.close()
+
+        # PRAGMA table_info: cid, name, type, notnull, dflt_value, pk
+        by_name = {r[1]: r for r in info}
+        assert "traversal" in by_name, "graph_edges must have traversal column"
+        assert by_name["traversal"][2] == "TEXT"
+        assert by_name["traversal"][3] == 1, "traversal must be NOT NULL"
+        # SQLite stores the literal default with quotes
+        assert by_name["traversal"][4] == "'ref'", (
+            f"traversal default must be 'ref', got {by_name['traversal'][4]!r}"
+        )
+        # NOT in primary key — load-bearing for INSERT OR IGNORE idempotency
+        assert by_name["traversal"][5] == 0, (
+            "traversal must NOT be in PRIMARY KEY"
+        )
+
+    def test_migration_adds_traversal_to_legacy_db(self, tmp_path):
+        """Running init_github_db on a 4-column graph_edges adds traversal idempotently."""
+        from am_i_shipping.db import init_github_db
+
+        db_path = tmp_path / "github.db"
+
+        # Hand-craft a pre-migration graph_edges (4 columns, no traversal)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                """
+                CREATE TABLE graph_edges (
+                    week_start   TEXT NOT NULL,
+                    src_node_id  TEXT NOT NULL,
+                    dst_node_id  TEXT NOT NULL,
+                    edge_type    TEXT NOT NULL,
+                    PRIMARY KEY (week_start, src_node_id, dst_node_id, edge_type)
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO graph_edges VALUES (?, ?, ?, ?)",
+                ("2026-04-14", "n1", "n2", "issue_refs_issue"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Run twice to verify idempotency
+        init_github_db(str(db_path))
+        init_github_db(str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            info = conn.execute("PRAGMA table_info('graph_edges')").fetchall()
+            # Legacy row should still exist with default 'ref' filled in
+            row = conn.execute(
+                "SELECT traversal FROM graph_edges WHERE src_node_id='n1'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        cols = [r[1] for r in info]
+        assert "traversal" in cols
+        # Should be exactly 5 columns — not added twice
+        assert len(cols) == 5, f"expected 5 columns, got {cols}"
+        assert row is not None
+        assert row[0] == "ref", (
+            f"legacy row must get the default 'ref', got {row[0]!r}"
+        )
+
+    def test_expected_github_tables_includes_traversal(self):
+        """EXPECTED_GITHUB_TABLES['graph_edges'] includes 'traversal'."""
+        from am_i_shipping.db import EXPECTED_GITHUB_TABLES
+
+        assert "traversal" in EXPECTED_GITHUB_TABLES["graph_edges"], (
+            "EXPECTED_GITHUB_TABLES['graph_edges'] must list 'traversal'"
+        )
+
+    def test_pk_idempotency_unchanged(self, tmp_path):
+        """INSERT OR IGNORE on the same 4-tuple with different traversal is ignored.
+
+        Guards against accidentally adding traversal to the PRIMARY KEY clause —
+        which would let two logically-identical rows coexist and break the
+        graph builder's edge-dedup assumption.
+        """
+        from am_i_shipping.db import init_github_db
+
+        db_path = tmp_path / "github.db"
+        init_github_db(str(db_path))
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            # First insert — traversal omitted, default 'ref' fires
+            conn.execute(
+                "INSERT OR IGNORE INTO graph_edges "
+                "(week_start, src_node_id, dst_node_id, edge_type) "
+                "VALUES (?, ?, ?, ?)",
+                ("2026-04-14", "s1", "i1", "session_refs_issue"),
+            )
+            # Second insert — same 4-tuple, traversal='own' explicit
+            conn.execute(
+                "INSERT OR IGNORE INTO graph_edges "
+                "(week_start, src_node_id, dst_node_id, edge_type, traversal) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("2026-04-14", "s1", "i1", "session_refs_issue", "own"),
+            )
+            conn.commit()
+
+            count = conn.execute(
+                "SELECT COUNT(*) FROM graph_edges "
+                "WHERE week_start=? AND src_node_id=? AND dst_node_id=? "
+                "AND edge_type=?",
+                ("2026-04-14", "s1", "i1", "session_refs_issue"),
+            ).fetchone()[0]
+            traversal = conn.execute(
+                "SELECT traversal FROM graph_edges "
+                "WHERE week_start=? AND src_node_id=? AND dst_node_id=? "
+                "AND edge_type=?",
+                ("2026-04-14", "s1", "i1", "session_refs_issue"),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert count == 1, (
+            f"INSERT OR IGNORE must dedup on 4-tuple PK, got {count} rows"
+        )
+        assert traversal == "ref", (
+            f"first-write 'ref' must win, second insert ignored — got {traversal!r}"
+        )
