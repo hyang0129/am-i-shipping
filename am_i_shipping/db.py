@@ -924,15 +924,10 @@ def init_github_db(db_path: Path) -> None:
         conn.execute(SYNTHESIS_SKILL_INVOCATIONS_SCHEMA)
         conn.execute(SYNTHESIS_SKILL_INVOCATIONS_INDEX)
         conn.execute(SYNTHESIS_PR_REVIEW_FIX_EVENTS_SCHEMA)
-        # Purge stale bridging edges from prior runs so they don't leak into
-        # component computations. graph_edges may not exist on very first init
-        # (all CREATE TABLEs above run first, so this is safe after them).
-        try:
-            conn.execute(
-                "DELETE FROM graph_edges WHERE edge_type='session_refs_issue'"
-            )
-        except Exception:
-            pass  # table absent — nothing to purge
+        # Epic #93 / Slice 2: the legacy ``session_refs_issue`` purge (Issue
+        # #68) is removed. Session→issue linkage now lives in graph_edges as
+        # ``issue_has_session`` / ``issue_refs_session`` (issue → session,
+        # ``traversal='own'``); these are intentional, not stale.
         for migration in _GITHUB_MIGRATIONS:
             try:
                 conn.execute(migration)

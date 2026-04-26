@@ -183,22 +183,22 @@ class TestBuildGraphFixture:
         finally:
             conn.close()
 
-        # Unit 1 closes — from pr_issues
+        # Unit 1 closes — from pr_issues (Epic #93: issue→PR, inverted)
         assert (
-            "pr:example/repo#301",
             "issue:example/repo#201",
-            "pr_closes_issue",
+            "pr:example/repo#301",
+            "issue_has_pr",
         ) in edges
         assert (
-            "pr:example/repo#302",
             "issue:example/repo#201",
-            "pr_closes_issue",
+            "pr:example/repo#302",
+            "issue_has_pr",
         ) in edges
         # Unit 2 closes — from pr_issues
         assert (
-            "pr:example/repo#303",
             "issue:example/repo#202",
-            "pr_closes_issue",
+            "pr:example/repo#303",
+            "issue_has_pr",
         ) in edges
 
         # pr_has_commit — each commit in the fixture is linked to its PR
@@ -218,16 +218,16 @@ class TestBuildGraphFixture:
             "pr_has_commit",
         ) in edges
 
-        # session_on_pr — from pr_sessions (collector-written rows)
+        # pr_has_session — from pr_sessions (Epic #93: PR→session, inverted)
         assert (
-            "session:00000000-0000-0000-0000-000000000101",
             "pr:example/repo#301",
-            "session_on_pr",
+            "session:00000000-0000-0000-0000-000000000101",
+            "pr_has_session",
         ) in edges
         assert (
-            "session:00000000-0000-0000-0000-000000000102",
             "pr:example/repo#302",
-            "session_on_pr",
+            "session:00000000-0000-0000-0000-000000000102",
+            "pr_has_session",
         ) in edges
 
     def test_singleton_session_has_node_no_edges(self, tmp_path):
@@ -627,19 +627,52 @@ REPO = "owner/repo"
 WEEK = "2025-01-06"
 
 
-class TestSessionRefsIssueEdge:
-    """Issue #68 (AS-1, Shape A): build_graph must NOT write session_refs_issue
-    rows to graph_edges; attribution lives in session_issue_attribution instead.
-
-    The former test ``test_session_refs_issue_edge_emitted`` asserted the
-    presence of those rows — that assertion is flipped here per the ACCEPTED
-    ADR (Shape A).  The session↔issue relationship is still captured; it just
-    lives in the ``session_issue_attribution`` table, not ``graph_edges``.
+class TestIssueHasSessionEdge:
+    """Epic #93 / Slice 2: build_graph emits issue_has_session /
+    issue_refs_session edges (issue → session, traversal='own') from
+    session_gh_events. The legacy ``session_refs_issue`` edge type is
+    abandoned. Session→issue linkage is now first-class topology, and
+    ``session_issue_attribution`` is a derived cache projected from these
+    edges.
     """
 
-    def test_session_refs_issue_edge_absent_from_graph_edges(self, tmp_path):
-        """AS-1 (Shape A): issue_comment event must NOT create a
-        session_refs_issue row in graph_edges."""
+    def test_issue_create_emits_issue_has_session_edge(self, tmp_path):
+        """An issue_create event emits an issue_has_session edge (issue → session)."""
+        gh_db = _make_gh_db(tmp_path)
+        sess_db = _make_sess_db(tmp_path)
+
+        gh_conn = sqlite3.connect(str(gh_db))
+        sess_conn = sqlite3.connect(str(sess_db))
+        try:
+            _seed_issue(gh_conn, REPO, 42)
+            _seed_session_gh_event(
+                gh_conn, SESSION_UUID, "issue_create", REPO, "42"
+            )
+            gh_conn.commit()
+            _seed_session(sess_conn, SESSION_UUID, "2025-01-10T10:00:00Z")
+            sess_conn.commit()
+        finally:
+            gh_conn.close()
+            sess_conn.close()
+
+        build_graph(sess_db, gh_db)
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            rows = conn.execute(
+                "SELECT src_node_id, dst_node_id, edge_type, traversal "
+                "FROM graph_edges WHERE edge_type = 'issue_has_session'"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert (f"issue:{REPO}#42", f"session:{SESSION_UUID}",
+                "issue_has_session", "own") in rows, (
+            f"Expected issue_has_session edge issue->session traversal=own; got {rows}"
+        )
+
+    def test_issue_comment_emits_issue_refs_session_edge(self, tmp_path):
+        """An issue_comment event emits an issue_refs_session edge."""
         gh_db = _make_gh_db(tmp_path)
         sess_db = _make_sess_db(tmp_path)
 
@@ -651,7 +684,6 @@ class TestSessionRefsIssueEdge:
                 gh_conn, SESSION_UUID, "issue_comment", REPO, "42"
             )
             gh_conn.commit()
-
             _seed_session(sess_conn, SESSION_UUID, "2025-01-10T10:00:00Z")
             sess_conn.commit()
         finally:
@@ -662,25 +694,20 @@ class TestSessionRefsIssueEdge:
 
         conn = sqlite3.connect(str(gh_db))
         try:
-            refs_issue_edges = [
-                (src, dst, etype)
-                for _week, src, dst, etype in conn.execute(
-                    "SELECT week_start, src_node_id, dst_node_id, edge_type "
-                    "FROM graph_edges"
-                ).fetchall()
-                if etype == "session_refs_issue"
-            ]
+            rows = conn.execute(
+                "SELECT src_node_id, dst_node_id, edge_type, traversal "
+                "FROM graph_edges WHERE edge_type = 'issue_refs_session'"
+            ).fetchall()
         finally:
             conn.close()
 
-        assert refs_issue_edges == [], (
-            f"AS-1 (Shape A): session_refs_issue rows must not exist in graph_edges. "
-            f"Found: {refs_issue_edges}"
+        assert (f"issue:{REPO}#42", f"session:{SESSION_UUID}",
+                "issue_refs_session", "own") in rows, (
+            f"Expected issue_refs_session edge issue->session traversal=own; got {rows}"
         )
 
-    def test_session_issue_attribution_row_written_instead(self, tmp_path):
-        """AS-1 (Shape A): issue_comment event writes a row to
-        session_issue_attribution, not graph_edges."""
+    def test_session_issue_attribution_row_still_written(self, tmp_path):
+        """The derived attribution cache is still populated alongside the new edges."""
         gh_db = _make_gh_db(tmp_path)
         sess_db = _make_sess_db(tmp_path)
 
@@ -713,12 +740,13 @@ class TestSessionRefsIssueEdge:
             conn.close()
 
         assert len(rows) == 1, (
-            f"AS-1 (Shape A): expected 1 session_issue_attribution row for "
-            f"session={SESSION_UUID}, issue={REPO}#42; got {len(rows)}: {rows}"
+            f"Expected 1 session_issue_attribution row (derived from edges), "
+            f"got {len(rows)}: {rows}"
         )
 
-    def test_session_refs_issue_skipped_when_issue_missing(self, tmp_path):
-        """No edge is emitted when the target issue node does not exist."""
+    def test_no_edge_when_issue_missing(self, tmp_path):
+        """No edge is emitted when the target issue node does not exist
+        (and the event is issue_comment, not issue_create which bootstraps)."""
         gh_db = _make_gh_db(tmp_path)
         sess_db = _make_sess_db(tmp_path)
 
@@ -730,7 +758,6 @@ class TestSessionRefsIssueEdge:
                 gh_conn, SESSION_UUID, "issue_comment", REPO, "42"
             )
             gh_conn.commit()
-
             _seed_session(sess_conn, SESSION_UUID, "2025-01-10T10:00:00Z")
             sess_conn.commit()
         finally:
@@ -741,52 +768,36 @@ class TestSessionRefsIssueEdge:
 
         conn = sqlite3.connect(str(gh_db))
         try:
-            edges = [
-                (src, dst, etype)
-                for _week, src, dst, etype in conn.execute(
-                    "SELECT week_start, src_node_id, dst_node_id, edge_type "
-                    "FROM graph_edges"
-                ).fetchall()
-            ]
+            edges = conn.execute(
+                "SELECT edge_type FROM graph_edges"
+            ).fetchall()
             nodes = [
-                nid
-                for _week, nid, *_ in conn.execute(
-                    "SELECT week_start, node_id, node_type, node_ref, created_at "
-                    "FROM graph_nodes"
+                nid for nid, in conn.execute(
+                    "SELECT node_id FROM graph_nodes"
                 ).fetchall()
             ]
         finally:
             conn.close()
 
-        # No session_refs_issue edge should exist
-        refs_issue_edges = [
-            e for e in edges if e[2] == "session_refs_issue"
-        ]
-        assert refs_issue_edges == [], (
-            f"Expected no session_refs_issue edge, got: {refs_issue_edges}"
+        assert all(e[0] not in ("issue_has_session", "issue_refs_session")
+                   for e in edges), (
+            f"No issue→session edge should exist when issue node is missing; got {edges}"
         )
-
-        # No stub node for the missing issue
-        issue_node = f"issue:{REPO}#42"
-        assert issue_node not in nodes, (
-            f"Stub node {issue_node!r} must not be created when issue is missing"
-        )
+        assert f"issue:{REPO}#42" not in nodes
 
     def test_git_push_does_not_emit_edge(self, tmp_path):
-        """git_push events in session_gh_events do not produce any session_refs edge."""
+        """git_push events do not produce any issue/PR-session edge."""
         gh_db = _make_gh_db(tmp_path)
         sess_db = _make_sess_db(tmp_path)
 
         gh_conn = sqlite3.connect(str(gh_db))
         sess_conn = sqlite3.connect(str(sess_db))
         try:
-            # Add an issue so the session *could* link (but shouldn't via git_push)
             _seed_issue(gh_conn, REPO, 42)
             _seed_session_gh_event(
                 gh_conn, SESSION_UUID, "git_push", REPO, "feature-x"
             )
             gh_conn.commit()
-
             _seed_session(sess_conn, SESSION_UUID, "2025-01-10T10:00:00Z")
             sess_conn.commit()
         finally:
@@ -797,28 +808,21 @@ class TestSessionRefsIssueEdge:
 
         conn = sqlite3.connect(str(gh_db))
         try:
-            edges = [
-                (src, dst, etype)
-                for _week, src, dst, etype in conn.execute(
-                    "SELECT week_start, src_node_id, dst_node_id, edge_type "
-                    "FROM graph_edges"
-                ).fetchall()
-            ]
+            edges = conn.execute(
+                "SELECT edge_type FROM graph_edges"
+            ).fetchall()
         finally:
             conn.close()
 
-        # No session_refs_* edge should come from the git_push event
-        session_refs_edges = [
-            e for e in edges
-            if e[0].startswith(f"session:{SESSION_UUID}")
-            and e[2].startswith("session_refs")
-        ]
-        assert session_refs_edges == [], (
-            f"git_push must not emit session_refs edge, got: {session_refs_edges}"
+        bad_types = {"issue_has_session", "issue_refs_session",
+                     "pr_has_session", "pr_refs_session"}
+        assert not any(e[0] in bad_types for e in edges), (
+            f"git_push must not emit any session-link edge, got: {edges}"
         )
 
-    def test_session_refs_pr_edge_emitted(self, tmp_path):
-        """A pr_comment event pointing to an existing PR creates a session_refs_pr edge."""
+    def test_pr_comment_emits_pr_refs_session_edge(self, tmp_path):
+        """A pr_comment event creates a pr_refs_session edge (PR → session,
+        inverted from legacy session_refs_pr per Epic #93)."""
         gh_db = _make_gh_db(tmp_path)
         sess_db = _make_sess_db(tmp_path)
 
@@ -830,7 +834,6 @@ class TestSessionRefsIssueEdge:
                 gh_conn, SESSION_UUID, "pr_comment", REPO, "99"
             )
             gh_conn.commit()
-
             _seed_session(sess_conn, SESSION_UUID, "2025-01-10T10:00:00Z")
             sess_conn.commit()
         finally:
@@ -842,19 +845,18 @@ class TestSessionRefsIssueEdge:
         conn = sqlite3.connect(str(gh_db))
         try:
             edges = {
-                (src, dst, etype)
-                for _week, src, dst, etype in conn.execute(
-                    "SELECT week_start, src_node_id, dst_node_id, edge_type "
+                (src, dst, etype, trav)
+                for src, dst, etype, trav in conn.execute(
+                    "SELECT src_node_id, dst_node_id, edge_type, traversal "
                     "FROM graph_edges"
                 ).fetchall()
             }
         finally:
             conn.close()
 
-        expected_src = f"session:{SESSION_UUID}"
-        expected_dst = f"pr:{REPO}#99"
-        assert (expected_src, expected_dst, "session_refs_pr") in edges, (
-            f"Expected session_refs_pr edge not found. Edges present: {edges}"
+        assert (f"pr:{REPO}#99", f"session:{SESSION_UUID}",
+                "pr_refs_session", "own") in edges, (
+            f"Expected pr_refs_session edge pr->session traversal=own; got: {edges}"
         )
 
     def test_pending_ref_skipped(self, tmp_path):
@@ -866,12 +868,10 @@ class TestSessionRefsIssueEdge:
         sess_conn = sqlite3.connect(str(sess_db))
         try:
             _seed_issue(gh_conn, REPO, 1)
-            # Seed with ref="pending" — should be ignored by graph builder
             _seed_session_gh_event(
                 gh_conn, SESSION_UUID, "issue_create", REPO, "pending"
             )
             gh_conn.commit()
-
             _seed_session(sess_conn, SESSION_UUID, "2025-01-10T10:00:00Z")
             sess_conn.commit()
         finally:
@@ -882,19 +882,15 @@ class TestSessionRefsIssueEdge:
 
         conn = sqlite3.connect(str(gh_db))
         try:
-            refs_issue_edges = [
-                (src, dst, etype)
-                for _week, src, dst, etype in conn.execute(
-                    "SELECT week_start, src_node_id, dst_node_id, edge_type "
-                    "FROM graph_edges"
-                ).fetchall()
-                if etype == "session_refs_issue"
-            ]
+            edges = conn.execute(
+                "SELECT edge_type FROM graph_edges"
+            ).fetchall()
         finally:
             conn.close()
 
-        assert refs_issue_edges == [], (
-            f"ref='pending' must not produce an edge, got: {refs_issue_edges}"
+        bad_types = {"issue_has_session", "issue_refs_session"}
+        assert not any(e[0] in bad_types for e in edges), (
+            f"ref='pending' must not produce an issue→session edge, got: {edges}"
         )
 
 
@@ -929,17 +925,16 @@ def _ingest_two_issue_fixture(tmp_path: Path) -> tuple:
     return sess_db, gh_db
 
 
-class TestIssue68NoSessionRefsIssueInGraphEdges:
-    """AS-1: build_graph must not write session_refs_issue rows to graph_edges.
-
-    Under Shape A (ACCEPTED), session->issue attribution is stored in the
-    ``session_issue_attribution`` table instead; ``graph_edges`` is a pure
-    topology table with no session↔issue rows.
+class TestEpic93IssueHasSessionInGraphEdges:
+    """Epic #93 / Slice 2: session→issue linkage now lives in graph_edges
+    as ``issue_has_session`` / ``issue_refs_session`` (issue → session,
+    traversal='own'). PR bridging uses the inverted ``pr_has_session`` /
+    ``pr_refs_session`` edges.
     """
 
-    def test_no_session_refs_issue_rows_in_graph_edges(self, tmp_path):
-        """After build_graph on the two-issue fixture, graph_edges has 0
-        session_refs_issue rows (AS-1, Shape A)."""
+    def test_issue_has_or_refs_session_rows_present(self, tmp_path):
+        """After build_graph on the two-issue fixture, graph_edges has
+        issue_has_session or issue_refs_session rows for the session."""
         sess_db, gh_db = _ingest_two_issue_fixture(tmp_path)
         build_graph(sess_db, gh_db, week_start=TWO_ISSUE_WEEK)
 
@@ -947,18 +942,19 @@ class TestIssue68NoSessionRefsIssueInGraphEdges:
         try:
             count = conn.execute(
                 "SELECT COUNT(*) FROM graph_edges "
-                "WHERE edge_type = 'session_refs_issue'",
+                "WHERE edge_type IN ('issue_has_session', 'issue_refs_session') "
+                "AND traversal = 'own'",
             ).fetchone()[0]
         finally:
             conn.close()
 
-        assert count == 0, (
-            f"Expected 0 session_refs_issue rows in graph_edges (Shape A), "
-            f"got {count}"
+        assert count > 0, (
+            f"Expected issue_has_session/issue_refs_session rows in graph_edges "
+            f"(Epic #93), got {count}"
         )
 
-    def test_session_refs_pr_rows_still_present(self, tmp_path):
-        """session_refs_pr edges must still exist in graph_edges (AS-3)."""
+    def test_pr_session_rows_still_present(self, tmp_path):
+        """pr_has_session / pr_refs_session edges still exist in graph_edges."""
         sess_db, gh_db = _ingest_two_issue_fixture(tmp_path)
         build_graph(sess_db, gh_db, week_start=TWO_ISSUE_WEEK)
 
@@ -966,14 +962,14 @@ class TestIssue68NoSessionRefsIssueInGraphEdges:
         try:
             pr_edge_count = conn.execute(
                 "SELECT COUNT(*) FROM graph_edges "
-                "WHERE edge_type IN ('session_refs_pr', 'session_on_pr')",
+                "WHERE edge_type IN ('pr_refs_session', 'pr_has_session')",
             ).fetchone()[0]
         finally:
             conn.close()
 
         assert pr_edge_count > 0, (
-            "session_refs_pr / session_on_pr edges must remain in graph_edges "
-            "for PR bridging (AS-3)"
+            "pr_refs_session / pr_has_session edges must exist in graph_edges "
+            "for PR bridging (Epic #93)"
         )
 
 

@@ -12,34 +12,43 @@ Node types
 * ``commit``   — one per ``commits`` row. ``node_id = "commit:{sha}"``
 * ``session``  — one per session row. ``node_id = "session:{uuid}"``
 
-Edge types (src → dst)
-----------------------
-* ``pr_closes_issue`` — from ``pr_issues`` rows, plus ``link_resolver`` scan
-  of each PR's ``head_ref`` + ``body``.
-* ``pr_has_commit``   — every ``commits`` row with a ``pr_number`` contributes
-  one edge from the owning PR to the commit.
-* ``session_on_pr``   — from ``pr_sessions`` (collector) plus the same
-  ``(branch, working_directory)`` predicate ``session_linker`` uses, so the
-  graph can still be built when ``pr_sessions`` is sparse (Issue #36 note:
-  ``pr_sessions`` has 0 live rows — expected).
-* ``commit_refs_issue`` — ``#N`` scan of commit messages.
-* ``timeline_ref``    — ``cross-referenced`` / ``referenced`` events link the
-  originating issue to the referenced issue or PR.
-* ``session_refs_pr``    — a session row in ``session_gh_events`` with
-  ``event_type`` in ``("pr_create", "pr_comment")`` links the session to the
-  referenced PR (only when the PR node already exists).
+Edge types (src → dst, with ``traversal`` flag — Epic #93 / Slice 2)
+----------------------------------------------------------------------
+Downward (``traversal='own'``) edges — these participate in BFS / union-find:
 
-Attribution (separate from graph topology)
-------------------------------------------
-Session → issue linkage is **not** stored in ``graph_edges`` and therefore
-does not participate in union-find / connected-components.  Instead, each
-(session, repo, issue) pair is written to the ``session_issue_attribution``
-table with a ``fraction = 1/N`` (where N is the number of distinct issues
-touched by that session) and a ``phase`` field (``"planning"`` when an
-``issue_create`` event exists for the pair; ``"execution"`` otherwise).
-Stub issue nodes bootstrapped from ``issue_create`` events are still written
-to ``graph_nodes`` so downstream consumers that traverse node lists still
-find them, but the session→issue edge is absent from ``graph_edges``.
+* ``issue_has_pr``    — issue → PR. From ``pr_issues`` linkage table plus
+  ``link_resolver`` scan of each PR's ``head_ref`` + ``body``. (Inverted from
+  the legacy ``pr_closes_issue`` direction; see Epic #93.)
+* ``pr_has_commit``   — PR → commit. Every ``commits`` row with a
+  ``pr_number`` contributes one edge from the owning PR to the commit.
+* ``pr_has_session``  — PR → session. From ``pr_sessions`` (collector) plus
+  the same ``(branch, working_directory)`` predicate ``session_linker`` uses,
+  so the graph can still be built when ``pr_sessions`` is sparse. (Inverted
+  from legacy ``session_on_pr``.)
+* ``pr_refs_session`` — PR → session. From ``session_gh_events`` rows with
+  ``event_type`` in ``("pr_create", "pr_comment")``. (Inverted from legacy
+  ``session_refs_pr``.)
+* ``issue_has_session`` / ``issue_refs_session`` — issue → session. New in
+  Epic #93. Built from ``session_gh_events`` rows with ``event_type`` in
+  ``("issue_create", "issue_comment")``: ``issue_create`` produces
+  ``issue_has_session`` (table-driven / planning); ``issue_comment`` produces
+  ``issue_refs_session`` (event-driven / execution).
+
+Cross-reference (``traversal='ref'``) edges — informational, NOT followed by
+union-find walkers:
+
+* ``commit_refs_issue`` — commit → issue. ``#N`` scan of commit messages.
+* ``timeline_ref``    — issue → issue/PR. ``cross-referenced`` / ``referenced``
+  events linking the originating issue to the referenced issue or PR.
+
+Attribution (derived projection of ``issue_has_session`` / ``issue_refs_session``)
+----------------------------------------------------------------------------------
+``session_issue_attribution`` is now a derived cache populated from the new
+issue→session edges. Each (session, repo, issue) row encodes a ``fraction =
+1/N`` (where N is the number of distinct issues touched by that session) and
+a ``phase`` field (``"planning"`` when an ``issue_create`` event exists for
+the pair; ``"execution"`` otherwise). The 5 production consumers continue to
+read this table unchanged.
 
 Determinism
 -----------
@@ -461,20 +470,27 @@ def build_graph(
         session_gh_events = _read_session_gh_events(gh, in_window_session_uuids)
 
         # --- edges -----------------------------------------------------
-        # (src_node_id, dst_node_id, edge_type) — set-dedup, then sorted.
-        edges: set[tuple[str, str, str]] = set()
+        # (src_node_id, dst_node_id, edge_type, traversal) — set-dedup,
+        # then sorted. Per Epic #93 / Slice 2:
+        #   traversal='own' — downward ownership edges, followed by BFS /
+        #     union-find walkers.
+        #   traversal='ref' — informational cross-references; walkers must
+        #     filter these out.
+        edges: set[tuple[str, str, str, str]] = set()
 
-        # pr_closes_issue (from pr_issues linkage table)
+        # issue_has_pr (from pr_issues linkage table — INVERTED from legacy
+        # pr_closes_issue per Epic #93. Issue is now src, PR is dst.)
         for repo, pr_number, issue_number in pr_issues:
             edges.add(
                 (
-                    _pr_node(repo, pr_number),
                     _issue_node(repo, issue_number),
-                    "pr_closes_issue",
+                    _pr_node(repo, pr_number),
+                    "issue_has_pr",
+                    "own",
                 )
             )
 
-        # pr_closes_issue (text-based; re-use link_resolver so branch/body
+        # issue_has_pr (text-based; re-use link_resolver so branch/body
         # parsing stays in one place)
         for (repo, pr_number), (head_ref, body) in pr_by_key.items():
             resolved = resolve_link(head_ref, body)
@@ -486,10 +502,10 @@ def build_graph(
             # issue would otherwise dangle.
             if issue_nid in nodes:
                 edges.add(
-                    (_pr_node(repo, pr_number), issue_nid, "pr_closes_issue")
+                    (issue_nid, _pr_node(repo, pr_number), "issue_has_pr", "own")
                 )
 
-        # pr_has_commit
+        # pr_has_commit (already downward — just flagged as 'own')
         for sha, (repo, pr_number, _message) in commit_by_sha.items():
             if pr_number is None:
                 continue
@@ -499,9 +515,10 @@ def build_graph(
                 # surface the commit as a standalone node but don't invent
                 # a dangling edge.
                 continue
-            edges.add((pr_nid, _commit_node(sha), "pr_has_commit"))
+            edges.add((pr_nid, _commit_node(sha), "pr_has_commit", "own"))
 
-        # session_on_pr (from the pr_sessions linkage table)
+        # pr_has_session (from the pr_sessions linkage table — INVERTED from
+        # legacy session_on_pr per Epic #93. PR is now src, session is dst.)
         session_nids = {nid for nid, (t, *_rest) in nodes.items() if t == "session"}
         for repo, pr_number, session_uuid in pr_sessions:
             sess_nid = _session_node(session_uuid)
@@ -512,13 +529,14 @@ def build_graph(
                 continue
             edges.add(
                 (
-                    sess_nid,
                     _pr_node(repo, pr_number),
-                    "session_on_pr",
+                    sess_nid,
+                    "pr_has_session",
+                    "own",
                 )
             )
 
-        # session_on_pr (fallback: same predicate session_linker uses, so
+        # pr_has_session (fallback: same predicate session_linker uses, so
         # sparse pr_sessions data still produces useful edges). ``head_ref``
         # is the PR's branch; the matching session's branch is also
         # ``head_ref`` by virtue of being keyed in ``sessions_by_branch``.
@@ -535,23 +553,24 @@ def build_graph(
                     continue
                 edges.add(
                     (
-                        _session_node(uuid),
                         _pr_node(repo, pr_number),
-                        "session_on_pr",
+                        _session_node(uuid),
+                        "pr_has_session",
+                        "own",
                     )
                 )
 
-        # commit_refs_issue (#N scan of commit messages)
+        # commit_refs_issue (#N scan of commit messages — informational ref)
         for sha, (repo, _pr_number, message) in commit_by_sha.items():
             for issue_number in _extract_hash_refs(message):
                 issue_nid = _issue_node(repo, issue_number)
                 if issue_nid not in nodes:
                     continue
                 edges.add(
-                    (_commit_node(sha), issue_nid, "commit_refs_issue")
+                    (_commit_node(sha), issue_nid, "commit_refs_issue", "ref")
                 )
 
-        # timeline_ref (cross_referenced / referenced events)
+        # timeline_ref (cross_referenced / referenced events — informational)
         for repo, issue_number, _event_id, event_type, payload_json, _created_at in timeline:
             if event_type not in ("cross-referenced", "cross_referenced", "referenced"):
                 continue
@@ -571,27 +590,24 @@ def build_graph(
                 dst_nid = _issue_node(repo, referenced_number)
             if dst_nid not in nodes:
                 continue
-            edges.add((src_nid, dst_nid, "timeline_ref"))
+            edges.add((src_nid, dst_nid, "timeline_ref", "ref"))
 
-        # session_refs_pr / session_issue_attribution (from session_gh_events)
+        # issue_has_session / issue_refs_session / pr_refs_session
+        # (from session_gh_events). Epic #93 / Slice 2:
         #
-        # session→PR edges still go into graph_edges so they bridge session
-        # nodes into PR-rooted components via union-find (AS-3).
+        # - issue_create → issue_has_session edge (issue → session, 'own',
+        #   table-driven / planning).
+        # - issue_comment → issue_refs_session edge (issue → session, 'own',
+        #   event-driven / execution).
+        # - pr_create / pr_comment → pr_refs_session edge (PR → session, 'own',
+        #   inverted from legacy session_refs_pr).
         #
-        # session→issue linkage is intentionally NOT added to graph_edges.
-        # Instead we collect (session_uuid, repo, issue_number) pairs per
-        # session and write them to session_issue_attribution below (AS-1).
-        # Stub issue nodes from issue_create events are still bootstrapped
-        # into graph_nodes (AS-4).
+        # Stub issue / PR nodes from create-events are still bootstrapped into
+        # graph_nodes.
         #
-        # attribution_map: session_uuid -> set of (repo, issue_number)
-        # phase_map: (session_uuid, repo, issue_number) -> phase
-        # Phase rule (ADR): "planning" if any issue_create event exists for the
-        # (session, repo, issue) pair; else "execution". Keying on
-        # (repo, issue_number) only ensures one distinct issue creates exactly
-        # one attribution row regardless of how many event types are emitted
-        # (e.g. issue_create + issue_comment for the same issue in one session).
-        attribution_map: dict[str, set[tuple[str, int]]] = {}
+        # Phase information is preserved in phase_map so the
+        # session_issue_attribution table can be derived from the new edges
+        # downstream.
         phase_map: dict[tuple[str, str, int], str] = {}
         for session_uuid, event_type, repo, ref in session_gh_events:
             # Skip pending or empty refs, and non-numeric refs.
@@ -610,15 +626,15 @@ def build_graph(
             if sess_nid not in nodes:
                 continue
             if event_type in ("issue_create", "issue_comment"):
-                dst = _issue_node(repo, ref_int)
-                # Bootstrap stub node for issue_create events (AS-4).
+                issue_nid = _issue_node(repo, ref_int)
+                # Bootstrap stub node for issue_create events.
                 # For issue_comment events, pull in any pre-existing issue that
                 # was filtered out of _read_issues but is referenced by an
                 # in-week session — this constitutes real in-week activity even
                 # if the issue's own timestamps fall outside the window.
-                if dst not in nodes:
+                if issue_nid not in nodes:
                     if event_type == "issue_create":
-                        nodes[dst] = ("issue", f"{repo}#{ref_int}", "")
+                        nodes[issue_nid] = ("issue", f"{repo}#{ref_int}", "")
                     else:
                         # issue_comment: fetch the row if it exists in the DB
                         row = gh.execute(
@@ -628,35 +644,66 @@ def build_graph(
                         ).fetchone()
                         if row is None:
                             continue
-                        nodes[dst] = ("issue", f"{repo}#{ref_int}", row[2] or "")
-                # Collect for attribution table — do NOT add to edges.
-                attribution_map.setdefault(session_uuid, set()).add(
-                    (repo, ref_int)
+                        nodes[issue_nid] = ("issue", f"{repo}#{ref_int}", row[2] or "")
+                # Emit directional issue→session edge with traversal='own'.
+                # issue_create maps to issue_has_session (table-driven /
+                # planning), issue_comment maps to issue_refs_session
+                # (event-driven / execution).
+                edge_type = (
+                    "issue_has_session"
+                    if event_type == "issue_create"
+                    else "issue_refs_session"
                 )
-                # "planning" wins over "execution" if both event types appear
-                # for the same (session, repo, issue) pair.
+                edges.add((issue_nid, sess_nid, edge_type, "own"))
+                # Track phase per (session, repo, issue) so the attribution
+                # cache derived from edges below preserves planning/execution
+                # semantics. "planning" wins over "execution" when both event
+                # types appear for the same pair.
                 key = (session_uuid, repo, ref_int)
                 if event_type == "issue_create" or key not in phase_map:
                     phase_map[key] = (
                         "planning" if event_type == "issue_create" else "execution"
                     )
             elif event_type in ("pr_create", "pr_comment"):
-                dst = _pr_node(repo, ref_int)
+                pr_nid = _pr_node(repo, ref_int)
                 # Bootstrap stub PR node for pr_create events.
-                if dst not in nodes:
+                if pr_nid not in nodes:
                     if event_type != "pr_create":
                         continue
-                    nodes[dst] = ("pr", f"{repo}#{ref_int}", "")
-                # session_refs_pr still participates in graph_edges / union-find.
-                edges.add((sess_nid, dst, "session_refs_pr"))
+                    nodes[pr_nid] = ("pr", f"{repo}#{ref_int}", "")
+                # pr_refs_session: PR → session, traversal='own'. Inverted
+                # from legacy session_refs_pr per Epic #93.
+                edges.add((pr_nid, sess_nid, "pr_refs_session", "own"))
             else:
                 # git_push and other event types have no target node.
                 continue
 
-        # --- build session_issue_attribution rows (AS-5, AS-8) ----------
-        # fraction = 1/N where N = distinct issues touched by this session.
-        # phase determined per (session, issue): "planning" if issue_create
-        # event exists for this pair, else "execution".
+        # --- build session_issue_attribution rows (derived from new edges) ---
+        # Decision 2 (intent): session_issue_attribution stays as a derived
+        # cache — populated from the issue_has_session / issue_refs_session
+        # edges emitted above so the 5 production consumers continue reading
+        # it unchanged. fraction = 1/N where N = distinct issues touched by
+        # this session; phase from phase_map (planning if issue_create, else
+        # execution).
+        # Project edges back to (session_uuid -> set of (repo, issue_number)).
+        attribution_map: dict[str, set[tuple[str, int]]] = {}
+        for src, dst, etype, _trav in edges:
+            if etype not in ("issue_has_session", "issue_refs_session"):
+                continue
+            # src = issue:{repo}#{number}, dst = session:{uuid}
+            if not src.startswith("issue:") or not dst.startswith("session:"):
+                continue
+            ref = src[len("issue:"):]
+            # ref is "{repo}#{number}"
+            try:
+                repo_part, num_part = ref.rsplit("#", 1)
+                issue_number = int(num_part)
+            except (ValueError, AttributeError):
+                continue
+            session_uuid = dst[len("session:"):]
+            attribution_map.setdefault(session_uuid, set()).add(
+                (repo_part, issue_number)
+            )
         attribution_rows: list[tuple[str, str, str, int, float, str]] = []
         for session_uuid, issue_set in attribution_map.items():
             n = len(issue_set)
@@ -694,16 +741,22 @@ def build_graph(
             "  )",
             (partition, partition, partition),
         )
-        for src, dst, etype in sorted_edges:
+        for src, dst, etype, traversal in sorted_edges:
             gh.execute(
                 "INSERT OR IGNORE INTO graph_edges "
-                "(week_start, src_node_id, dst_node_id, edge_type) "
-                "VALUES (?, ?, ?, ?)",
-                (partition, src, dst, etype),
+                "(week_start, src_node_id, dst_node_id, edge_type, traversal) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (partition, src, dst, etype, traversal),
             )
-        # Write session_issue_attribution rows (AS-5, AS-8).
-        # INSERT OR REPLACE so re-runs recalculate fraction correctly if the
-        # session's issue-set changes between runs.
+        # Write session_issue_attribution rows as a derived cache projection
+        # from the issue_has_session / issue_refs_session edges (Epic #93,
+        # Decision 2). Delete-by-week first so a session whose issue-set
+        # shrunk between runs does not leak stale rows; INSERT OR REPLACE
+        # then handles fraction recalculation for surviving rows.
+        gh.execute(
+            "DELETE FROM session_issue_attribution WHERE week_start = ?",
+            (partition,),
+        )
         for row in sorted(attribution_rows):
             gh.execute(
                 "INSERT OR REPLACE INTO session_issue_attribution "
