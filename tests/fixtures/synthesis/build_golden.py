@@ -308,8 +308,14 @@ def build(path: Path = FIXTURE_PATH) -> None:
             "INSERT INTO graph_nodes VALUES (?, ?, ?, ?, ?)",
             GRAPH_NODES,
         )
+        # Epic #93 / Slice 2: synthetic ownership edges in the golden
+        # fixture are tagged traversal='own' so BFS walkers still pick them
+        # up. The synthetic edge types ('closes', 'produced_by') are not
+        # real vocabulary; they exist to give the fixture two connected
+        # components.
         conn.executemany(
-            "INSERT INTO graph_edges (week_start, src_node_id, dst_node_id, edge_type) VALUES (?, ?, ?, ?)",
+            "INSERT INTO graph_edges (week_start, src_node_id, dst_node_id, edge_type, traversal) "
+            "VALUES (?, ?, ?, ?, 'own')",
             GRAPH_EDGES,
         )
         conn.executemany(
