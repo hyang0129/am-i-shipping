@@ -287,3 +287,133 @@ class TestUpsertSessionGhEvents:
             conn.close()
 
         assert count == 0
+
+
+class TestUpsertSessionPrSessions:
+    """upsert_session writes pr_sessions rows for pr_link events (Issue #111)."""
+
+    def _make_pr_link_record(self, session_uuid: str = "pr-link-test-uuid") -> "SessionRecord":
+        from am_i_shipping.db import init_github_db  # noqa: F401 (used in tests)
+
+        return SessionRecord(
+            session_uuid=session_uuid,
+            turn_count=1,
+            tool_call_count=0,
+            tool_failure_count=0,
+            reprompt_count=0,
+            bail_out=False,
+            session_duration_seconds=60.0,
+            working_directory="/tmp/test",
+            git_branch="main",
+            raw_content_json="[]",
+            input_tokens=0,
+            output_tokens=0,
+            cache_creation_tokens=0,
+            cache_read_tokens=0,
+            fast_mode_turns=0,
+            gh_events=[
+                {
+                    "event_type": "pr_link",
+                    "repo": "hyang0129/am-i-shipping",
+                    "ref": "130",
+                    "url": "https://github.com/hyang0129/am-i-shipping/pull/130",
+                    "confidence": "high",
+                    "created_at": "2026-01-10T10:00:01Z",
+                }
+            ],
+        )
+
+    def test_pr_link_event_writes_pr_sessions_row(self, tmp_path):
+        """upsert_session with a pr_link gh_event writes 1 row to pr_sessions."""
+        from am_i_shipping.db import init_github_db
+
+        db_path = tmp_path / "sessions.db"
+        gh_db_path = tmp_path / "github.db"
+        init_github_db(gh_db_path)
+
+        record = self._make_pr_link_record()
+        upsert_session(record, db_path=db_path, data_dir=tmp_path)
+
+        conn = sqlite3.connect(str(gh_db_path))
+        try:
+            rows = conn.execute(
+                "SELECT repo, pr_number, session_uuid FROM pr_sessions "
+                "WHERE session_uuid = ?",
+                (record.session_uuid,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert len(rows) == 1
+        repo, pr_number, session_uuid = rows[0]
+        assert repo == "hyang0129/am-i-shipping"
+        assert pr_number == 130
+        assert session_uuid == "pr-link-test-uuid"
+
+    def test_pr_sessions_idempotent_on_second_upsert(self, tmp_path):
+        """Two upsert calls for the same session produce exactly 1 pr_sessions row."""
+        from am_i_shipping.db import init_github_db
+
+        db_path = tmp_path / "sessions.db"
+        gh_db_path = tmp_path / "github.db"
+        init_github_db(gh_db_path)
+
+        record = self._make_pr_link_record()
+        upsert_session(record, db_path=db_path, data_dir=tmp_path)
+        upsert_session(record, db_path=db_path, data_dir=tmp_path)
+
+        conn = sqlite3.connect(str(gh_db_path))
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM pr_sessions WHERE session_uuid = ?",
+                (record.session_uuid,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert count == 1
+
+    def test_non_pr_link_event_does_not_write_pr_sessions(self, tmp_path):
+        """upsert_session with issue_comment event writes 0 pr_sessions rows."""
+        from am_i_shipping.db import init_github_db
+
+        db_path = tmp_path / "sessions.db"
+        gh_db_path = tmp_path / "github.db"
+        init_github_db(gh_db_path)
+
+        record = SessionRecord(
+            session_uuid="non-pr-link-uuid",
+            turn_count=1,
+            tool_call_count=0,
+            tool_failure_count=0,
+            reprompt_count=0,
+            bail_out=False,
+            session_duration_seconds=60.0,
+            working_directory="/tmp/test",
+            git_branch="main",
+            raw_content_json="[]",
+            input_tokens=0,
+            output_tokens=0,
+            cache_creation_tokens=0,
+            cache_read_tokens=0,
+            fast_mode_turns=0,
+            gh_events=[
+                {
+                    "event_type": "issue_comment",
+                    "repo": "hyang0129/am-i-shipping",
+                    "ref": "42",
+                    "url": "",
+                    "confidence": "high",
+                    "created_at": "2026-01-10T10:00:00Z",
+                }
+            ],
+        )
+        upsert_session(record, db_path=db_path, data_dir=tmp_path)
+
+        conn = sqlite3.connect(str(gh_db_path))
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM pr_sessions").fetchone()[0]
+        finally:
+            conn.close()
+
+        assert count == 0

@@ -14,7 +14,12 @@ from pathlib import Path
 
 import pytest
 
-from collector.session_parser import SessionRecord, _extract_gh_events, parse_session
+from collector.session_parser import (
+    SessionRecord,
+    _extract_gh_events,
+    _extract_pr_link_event,
+    parse_session,
+)
 from collector.store import upsert_session
 from am_i_shipping.db import init_github_db
 
@@ -596,3 +601,194 @@ class TestUpsertSessionGhEventsPersistence:
             conn.close()
 
         assert count == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests for pr-link event type (Issue #111)
+# ---------------------------------------------------------------------------
+
+FIXTURES = Path(__file__).parent / "fixtures"
+PR_LINK_FIXTURE = FIXTURES / "pr_link_session.jsonl"
+
+
+class TestExtractPrLinkEvent:
+    """Unit tests for _extract_pr_link_event helper."""
+
+    def test_well_formed_entry_returns_event(self):
+        entry = {
+            "type": "pr-link",
+            "sessionId": "test-pr-link-uuid",
+            "timestamp": "2026-01-10T10:00:01Z",
+            "prNumber": 130,
+            "prRepository": "hyang0129/am-i-shipping",
+            "prUrl": "https://github.com/hyang0129/am-i-shipping/pull/130",
+        }
+        ev = _extract_pr_link_event(entry)
+        assert ev is not None
+        assert ev["event_type"] == "pr_link"
+        assert ev["repo"] == "hyang0129/am-i-shipping"
+        assert ev["ref"] == "130"
+        assert ev["url"] == "https://github.com/hyang0129/am-i-shipping/pull/130"
+        assert ev["confidence"] == "high"
+        assert ev["created_at"] == "2026-01-10T10:00:01Z"
+
+    def test_missing_pr_number_returns_none(self):
+        entry = {
+            "type": "pr-link",
+            "prRepository": "hyang0129/am-i-shipping",
+        }
+        assert _extract_pr_link_event(entry) is None
+
+    def test_missing_pr_repository_returns_none(self):
+        entry = {
+            "type": "pr-link",
+            "prNumber": 130,
+        }
+        assert _extract_pr_link_event(entry) is None
+
+    def test_missing_url_defaults_to_empty_string(self):
+        entry = {
+            "type": "pr-link",
+            "prNumber": 99,
+            "prRepository": "hyang0129/am-i-shipping",
+            "timestamp": "2026-01-10T10:00:00Z",
+        }
+        ev = _extract_pr_link_event(entry)
+        assert ev is not None
+        assert ev["url"] == ""
+
+    def test_pr_number_coerced_to_string_ref(self):
+        entry = {
+            "type": "pr-link",
+            "prNumber": 42,
+            "prRepository": "owner/repo",
+        }
+        ev = _extract_pr_link_event(entry)
+        assert ev["ref"] == "42"
+        assert isinstance(ev["ref"], str)
+
+
+class TestParsePrLinkSession:
+    """Integration tests: parse_session correctly handles pr-link JSONL entries."""
+
+    def test_three_repeated_pr_links_collapse_to_one_gh_event(self):
+        """Fixture has 3 identical pr-link entries; dedup must produce 1 gh_event."""
+        record = parse_session(PR_LINK_FIXTURE)
+        pr_link_events = [
+            ev for ev in record.gh_events if ev["event_type"] == "pr_link"
+        ]
+        assert len(pr_link_events) == 1, (
+            f"Expected 1 pr_link event after dedup, got {len(pr_link_events)}: "
+            f"{pr_link_events}"
+        )
+
+    def test_pr_link_event_has_correct_fields(self):
+        record = parse_session(PR_LINK_FIXTURE)
+        ev = next(e for e in record.gh_events if e["event_type"] == "pr_link")
+        assert ev["repo"] == "hyang0129/am-i-shipping"
+        assert ev["ref"] == "130"
+        assert ev["confidence"] == "high"
+
+    def test_session_uuid_extracted(self):
+        record = parse_session(PR_LINK_FIXTURE)
+        assert record.session_uuid == "test-pr-link-uuid"
+
+    def test_user_assistant_entries_still_parsed(self):
+        """pr-link entries must not prevent normal user/assistant parsing."""
+        record = parse_session(PR_LINK_FIXTURE)
+        assert record.turn_count >= 1
+
+    def test_extract_gh_events_not_called_for_pr_link(self, tmp_path):
+        """_extract_gh_events should never see a pr-link entry (outer loop handles it)."""
+        # Verify that _extract_gh_events returns [] for a pr-link entry (the guard at line 247).
+        pr_link_entry = {
+            "type": "pr-link",
+            "prNumber": 130,
+            "prRepository": "hyang0129/am-i-shipping",
+            "timestamp": "2026-01-10T10:00:00Z",
+        }
+        result = _extract_gh_events(pr_link_entry, {})
+        assert result == [], (
+            "_extract_gh_events must return [] for pr-link entries "
+            "(outer loop handles them before _extract_gh_events is called)"
+        )
+
+
+class TestUpsertPrLinkPrSessions:
+    """Tests that upsert_session writes pr_sessions rows for pr_link events (Issue #111)."""
+
+    def test_pr_link_event_writes_pr_sessions_row(self, tmp_path):
+        """A SessionRecord with a pr_link gh_event produces 1 pr_sessions row."""
+        github_db = tmp_path / "github.db"
+        sessions_db = tmp_path / "sessions.db"
+        init_github_db(github_db)
+
+        record = parse_session(PR_LINK_FIXTURE)
+        upsert_session(
+            record,
+            db_path=sessions_db,
+            data_dir=tmp_path,
+            skip_health=True,
+        )
+
+        conn = sqlite3.connect(str(github_db))
+        try:
+            rows = conn.execute(
+                "SELECT repo, pr_number, session_uuid FROM pr_sessions "
+                "WHERE session_uuid = ?",
+                (record.session_uuid,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert len(rows) == 1
+        repo, pr_number, session_uuid = rows[0]
+        assert repo == "hyang0129/am-i-shipping"
+        assert pr_number == 130
+        assert session_uuid == "test-pr-link-uuid"
+
+    def test_pr_sessions_row_idempotent_on_second_upsert(self, tmp_path):
+        """Calling upsert_session twice for the same pr-link session leaves 1 pr_sessions row."""
+        github_db = tmp_path / "github.db"
+        sessions_db = tmp_path / "sessions.db"
+        init_github_db(github_db)
+
+        record = parse_session(PR_LINK_FIXTURE)
+        upsert_session(record, db_path=sessions_db, data_dir=tmp_path, skip_health=True)
+        upsert_session(record, db_path=sessions_db, data_dir=tmp_path, skip_health=True)
+
+        conn = sqlite3.connect(str(github_db))
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM pr_sessions WHERE session_uuid = ?",
+                (record.session_uuid,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert count == 1
+
+    def test_session_gh_events_audit_row_written(self, tmp_path):
+        """upsert_session also writes a session_gh_events row with event_type='pr_link'."""
+        github_db = tmp_path / "github.db"
+        sessions_db = tmp_path / "sessions.db"
+        init_github_db(github_db)
+
+        record = parse_session(PR_LINK_FIXTURE)
+        upsert_session(record, db_path=sessions_db, data_dir=tmp_path, skip_health=True)
+
+        conn = sqlite3.connect(str(github_db))
+        try:
+            rows = conn.execute(
+                "SELECT event_type, repo, ref FROM session_gh_events "
+                "WHERE session_uuid = ? AND event_type = 'pr_link'",
+                (record.session_uuid,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert len(rows) == 1
+        event_type, repo, ref = rows[0]
+        assert event_type == "pr_link"
+        assert repo == "hyang0129/am-i-shipping"
+        assert ref == "130"

@@ -225,6 +225,42 @@ def _strip_content_blocks(content: Any) -> Any:
     return content
 
 
+def _extract_pr_link_event(entry: dict) -> "dict | None":
+    """Extract a gh_event dict from a top-level ``pr-link`` JSONL entry.
+
+    ``pr-link`` entries are emitted by Claude Code when a session is explicitly
+    linked to a PR.  They carry authoritative linkage — strictly more reliable
+    than the head_ref/git_branch/working-directory heuristic in
+    ``session_linker.py``.
+
+    Expected shape::
+
+        {
+            "type": "pr-link",
+            "sessionId": "...",
+            "timestamp": "2026-...",
+            "prNumber": 130,
+            "prRepository": "owner/repo",
+            "prUrl": "https://github.com/owner/repo/pull/130",
+        }
+
+    Returns a gh_event dict with ``event_type='pr_link'``, or ``None`` if the
+    entry is missing required fields (``prNumber`` or ``prRepository``).
+    """
+    pr_number = entry.get("prNumber")
+    pr_repository = entry.get("prRepository")
+    if pr_number is None or not pr_repository:
+        return None
+    return {
+        "event_type": "pr_link",
+        "repo": str(pr_repository),
+        "ref": str(pr_number),
+        "url": entry.get("prUrl", ""),
+        "confidence": "high",
+        "created_at": entry.get("timestamp", ""),
+    }
+
+
 def _extract_gh_events(entry: dict, pending_creates: dict) -> list:
     """Extract GitHub/git CLI events from a single JSONL entry.
 
@@ -567,6 +603,17 @@ def parse_session(filepath: str | Path, threshold: int = 3) -> SessionRecord:
                         timestamps.append(ts)
                     except ValueError:
                         pass
+
+                # Handle pr-link entries (top-level, not user/assistant messages).
+                # These carry authoritative PR linkage emitted by Claude Code when a
+                # session is explicitly linked to a PR. Shape:
+                # {"type": "pr-link", "sessionId": "...", "timestamp": "...",
+                #  "prNumber": N, "prRepository": "owner/repo", "prUrl": "https://..."}
+                if entry_type == "pr-link":
+                    pr_link_ev = _extract_pr_link_event(entry)
+                    if pr_link_ev is not None:
+                        gh_events_list.append(pr_link_ev)
+                    continue
 
                 # Only process user/assistant message entries
                 if entry_type not in ("user", "assistant"):
