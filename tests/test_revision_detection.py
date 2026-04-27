@@ -307,8 +307,8 @@ def _seed_unit_and_graph(
             )
             conn.execute(
                 "INSERT INTO graph_edges "
-                "(week_start, src_node_id, dst_node_id, edge_type) "
-                "VALUES (?, ?, ?, 'unit_contains_session')",
+                "(week_start, src_node_id, dst_node_id, edge_type, traversal) "
+                "VALUES (?, ?, ?, 'unit_contains_session', 'own')",
                 (week_start, root_node_id, sid),
             )
         conn.commit()

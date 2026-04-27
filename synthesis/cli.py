@@ -266,6 +266,7 @@ def _run_coverage(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     data_dir: Path = config.data_path
     sessions_db = data_dir / "sessions.db"
+    github_db = data_dir / "github.db"
     projects_path = Path(config.session.projects_path)
     return run_coverage(
         sessions_db=sessions_db,
@@ -275,6 +276,9 @@ def _run_coverage(args: argparse.Namespace) -> int:
         emit_json=bool(getattr(args, "emit_json", False)),
         do_backfill=bool(getattr(args, "backfill", False)),
         full_rebuild=bool(getattr(args, "full", False)),
+        graph_mode=bool(getattr(args, "graph_mode", False)),
+        github_db=github_db,
+        week=getattr(args, "week", None),
     )
 
 

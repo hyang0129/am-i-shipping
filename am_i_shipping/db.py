@@ -230,6 +230,7 @@ CREATE TABLE IF NOT EXISTS graph_edges (
     src_node_id  TEXT NOT NULL,
     dst_node_id  TEXT NOT NULL,
     edge_type    TEXT NOT NULL,
+    traversal    TEXT NOT NULL DEFAULT 'ref',
     PRIMARY KEY (week_start, src_node_id, dst_node_id, edge_type)
 );
 """
@@ -595,6 +596,18 @@ _GITHUB_MIGRATIONS = [
     # value and are treated as ``closed-unknown`` by ``_summarise_unit``
     # when there is no merged linked PR.
     "ALTER TABLE issues ADD COLUMN state_reason TEXT",
+    # Epic #93 — Slice 1 (#102): graph directionality. ``traversal``
+    # classifies each edge as either ``'own'`` (the edge participates in
+    # the unit's own graph — e.g. session→issue, issue→PR) or ``'ref'``
+    # (cross-reference — issue mentions another issue). Default ``'ref'``
+    # is load-bearing: every edge written before this migration is a
+    # cross-reference (session→issue edges were excluded from
+    # ``graph_edges`` per Issue #68), so legacy rows are correctly
+    # classified for downstream BFS walkers that filter ``traversal='own'``
+    # in subsequent slices. NOT in PRIMARY KEY — duplicate semantically-
+    # equivalent rows would break the ``INSERT OR IGNORE`` idempotency
+    # the graph builder depends on.
+    "ALTER TABLE graph_edges ADD COLUMN traversal TEXT NOT NULL DEFAULT 'ref'",
 ]
 
 APPSWITCH_SCHEMA = """
@@ -728,6 +741,7 @@ EXPECTED_GITHUB_TABLES: dict[str, set[str]] = {
         "src_node_id",
         "dst_node_id",
         "edge_type",
+        "traversal",
     },
     "units": {
         "week_start",
@@ -910,15 +924,10 @@ def init_github_db(db_path: Path) -> None:
         conn.execute(SYNTHESIS_SKILL_INVOCATIONS_SCHEMA)
         conn.execute(SYNTHESIS_SKILL_INVOCATIONS_INDEX)
         conn.execute(SYNTHESIS_PR_REVIEW_FIX_EVENTS_SCHEMA)
-        # Purge stale bridging edges from prior runs so they don't leak into
-        # component computations. graph_edges may not exist on very first init
-        # (all CREATE TABLEs above run first, so this is safe after them).
-        try:
-            conn.execute(
-                "DELETE FROM graph_edges WHERE edge_type='session_refs_issue'"
-            )
-        except Exception:
-            pass  # table absent — nothing to purge
+        # Epic #93 / Slice 2: the legacy ``session_refs_issue`` purge (Issue
+        # #68) is removed. Session→issue linkage now lives in graph_edges as
+        # ``issue_has_session`` / ``issue_refs_session`` (issue → session,
+        # ``traversal='own'``); these are intentional, not stale.
         for migration in _GITHUB_MIGRATIONS:
             try:
                 conn.execute(migration)

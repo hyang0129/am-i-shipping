@@ -398,10 +398,16 @@ def _summarise_unit(
         # merged linked PR exists via the pr_closes_issue graph edges.
         #
         # Helper: does a merged linked PR exist for any anchor issue in
-        # the unit?  We look up ``pr_closes_issue`` edges in graph_edges
+        # the unit?  We look up ``issue_has_pr`` edges in graph_edges
         # (joining through pull_requests to check merged_at).  The
         # graph_edges query is only run when we have issue_refs AND a
         # week_start, because graph edges are week-partitioned.
+        #
+        # Epic #93 / Slice 2: edge direction inverted from the legacy
+        # ``pr_closes_issue`` (PR→issue) to ``issue_has_pr`` (issue→PR).
+        # This is a LOGIC INVERSION: PR is now the dst, issue is now the
+        # src. The traversal='own' filter is explicit per the BFS
+        # invariant in Section 8 of the epic intent doc.
         def _has_merged_linked_pr() -> bool:
             if not issue_refs or not week_start:
                 # Fall back: check if any PR in the component itself is merged.
@@ -410,16 +416,17 @@ def _summarise_unit(
             issue_node_ids = {
                 f"issue:{repo}#{num}" for repo, num in issue_refs
             }
-            # Find PR node IDs that have a pr_closes_issue edge pointing
-            # at one of our anchor issue nodes.
+            # Find PR node IDs that have an issue_has_pr edge originating
+            # from one of our anchor issue nodes.
             placeholders = ",".join("?" * len(issue_node_ids))
             try:
                 linked_pr_node_ids = {
                     row[0]
                     for row in github_conn.execute(
-                        f"SELECT src_node_id FROM graph_edges "
-                        f"WHERE week_start = ? AND edge_type = 'pr_closes_issue' "
-                        f"AND dst_node_id IN ({placeholders})",
+                        f"SELECT dst_node_id FROM graph_edges "
+                        f"WHERE week_start = ? AND traversal = 'own' "
+                        f"AND edge_type = 'issue_has_pr' "
+                        f"AND src_node_id IN ({placeholders})",
                         [week_start, *issue_node_ids],
                     ).fetchall()
                 }
@@ -428,7 +435,7 @@ def _summarise_unit(
                 return any(merged for (_c, merged, _u) in pr_rows if merged)
 
             if not linked_pr_node_ids:
-                # No pr_closes_issue edges — check component PRs directly.
+                # No issue_has_pr edges — check component PRs directly.
                 return any(merged for (_c, merged, _u) in pr_rows if merged)
 
             # Check if any of the linked PRs has merged_at set.
@@ -533,9 +540,14 @@ def identify_units(
             "WHERE week_start = ? ORDER BY node_id",
             (week_start,),
         ).fetchall()
+        # Epic #93 / Slice 2: union-find only walks ownership ('own') edges.
+        # Cross-reference edges (commit_refs_issue, timeline_ref) are
+        # excluded so unrelated units don't get spuriously merged via
+        # informational links.
         edge_rows = gh.execute(
             "SELECT src_node_id, dst_node_id FROM graph_edges "
-            "WHERE week_start = ? ORDER BY src_node_id, dst_node_id",
+            "WHERE week_start = ? AND traversal = 'own' "
+            "ORDER BY src_node_id, dst_node_id",
             (week_start,),
         ).fetchall()
 
@@ -580,21 +592,36 @@ def identify_units(
             if terminal_ts is None or terminal_ts >= week_start:
                 eligible_anchors.add(node_id)
 
-        # --- build components -----------------------------------------
-        uf = _UnionFind()
-        for node_id, _type, _ref in node_rows:
-            uf.add(node_id)
+        # --- build components (Epic #93 / Slice 2 — directed) ---------
+        # Components are now computed as directed downward-reachability
+        # from each eligible anchor. Two issues sharing a CHILD PR (the
+        # original spurious-merge case Scenario 3 protects against) end
+        # up in SEPARATE components: the PR is in both, but neither
+        # issue can reach the other through the PR (edges are followed
+        # src→dst only). When two anchors *can* reach each other (e.g. a
+        # PR closes an issue, so issue→PR→… and the issue is reachable
+        # downward from itself), they are merged via union-find on
+        # anchors.
         node_set = {nid for nid, *_ in node_rows}
-        for src, dst in edge_rows:
-            # Guard against edges that reference nodes outside this
-            # week's partition. The graph builder shouldn't produce
-            # these, but tolerating them keeps the identifier robust to
-            # hand-edited debugging DBs.
-            if src in node_set and dst in node_set:
-                uf.union(src, dst)
-
         node_info = {nid: (nt, nr) for nid, nt, nr in node_rows}
-        components = uf.components()
+
+        # Directed adjacency: src → set(dsts).
+        adj: dict[str, set[str]] = {}
+        for src, dst in edge_rows:
+            if src in node_set and dst in node_set:
+                adj.setdefault(src, set()).add(dst)
+
+        def _downward_reachable(seed: str) -> set[str]:
+            seen = {seed}
+            stack = [seed]
+            while stack:
+                cur = stack.pop()
+                for nxt in adj.get(cur, ()):
+                    if nxt not in seen:
+                        seen.add(nxt)
+                        stack.append(nxt)
+            return seen
+
 
         # Build a map of (session_uuid, issue_node_id) → True for every
         # session_issue_attribution row in this week.  Used below to detect
@@ -627,6 +654,68 @@ def identify_units(
         issue_anchor_nodes: set[str] = {
             nid for nid in eligible_anchors if node_info[nid][0] == "issue"
         }
+
+        # --- compute directed components from anchors -----------------
+        # For each eligible anchor, the component is the set of nodes
+        # downward-reachable from it (via 'own' edges). Two anchors
+        # share a component only when each can reach the other (mutual
+        # reachability) — so two issues sharing a child PR end up in
+        # SEPARATE components even though both contain the PR (Epic #93
+        # Scenario 3). Non-anchor nodes (sessions, commits, child PRs)
+        # may appear in multiple components — that's intentional, the
+        # ``unit_id`` hash dedupes when two anchors produce identical
+        # node sets.
+        anchor_reach: dict[str, set[str]] = {}
+        for nid in sorted(eligible_anchors):
+            anchor_reach[nid] = _downward_reachable(nid)
+
+        anchor_uf = _UnionFind()
+        for nid in anchor_reach:
+            anchor_uf.add(nid)
+        anchor_list = list(anchor_reach.keys())
+        # Compute, for each anchor, the set of OTHER anchors that can
+        # reach it. An anchor with exactly one parent anchor merges into
+        # that parent's component; an anchor with multiple parents stays
+        # separate (Epic #93 Scenario 3 — two issues sharing a child PR
+        # do NOT merge into one unit).
+        parents_of: dict[str, list[str]] = {a: [] for a in anchor_list}
+        for parent in anchor_list:
+            for child in anchor_list:
+                if parent == child:
+                    continue
+                if child in anchor_reach[parent]:
+                    parents_of[child].append(parent)
+        for child, parents in parents_of.items():
+            if len(parents) == 1:
+                anchor_uf.union(parents[0], child)
+            # 0 parents: child is its own root. >1 parents: child stays
+            # in its own component to prevent spurious merges.
+
+        # One component per anchor-group. Group's nodes = union of all
+        # anchors' downward-reachable sets in the group.
+        anchor_groups: dict[str, list[str]] = {}
+        for nid in anchor_reach:
+            anchor_groups.setdefault(anchor_uf.find(nid), []).append(nid)
+
+        comp_map: dict[str, set[str]] = {}
+        for root, anchors in anchor_groups.items():
+            group_nodes: set[str] = set()
+            for a in anchors:
+                group_nodes |= anchor_reach[a]
+            comp_map[root] = group_nodes
+
+        # Add orphan nodes (no anchor reaches them) as singletons so
+        # the existing "drop components without an eligible anchor"
+        # logic below still drops pure-session components.
+        anchor_covered = set().union(*comp_map.values()) if comp_map else set()
+        for nid in node_set:
+            if nid not in anchor_covered:
+                comp_map.setdefault(nid, set()).add(nid)
+
+        components = sorted(
+            (sorted(group) for group in comp_map.values()),
+            key=lambda g: g[0],
+        )
 
         # --- write one row per component -----------------------------
         inserted = 0

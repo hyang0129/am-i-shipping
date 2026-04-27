@@ -403,12 +403,12 @@ class TestUnitFilterByIssueOrPr:
                 "VALUES (?, ?, ?, ?, ?)",
                 (week, issue_node_id, "issue", "example/repo#10", "2025-01-06T09:00:00Z"),
             )
-            # Edge connecting session to issue
+            # Edge connecting issue to session (Epic #93: issue→session)
             conn.execute(
                 "INSERT INTO graph_edges "
-                "(week_start, src_node_id, dst_node_id, edge_type) "
-                "VALUES (?, ?, ?, ?)",
-                (week, session_node_id, issue_node_id, "session_refs_issue"),
+                "(week_start, src_node_id, dst_node_id, edge_type, traversal) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (week, issue_node_id, session_node_id, "issue_has_session", "own"),
             )
             # Seed issues row for metric aggregation
             conn.execute(
@@ -527,10 +527,10 @@ class TestRootEligibilityWindow:
             )
             conn.execute(
                 "INSERT INTO graph_edges "
-                "(week_start, src_node_id, dst_node_id, edge_type) "
-                "VALUES (?, ?, ?, ?)",
-                (week, session_node_id, f"issue:{issue_node_id}",
-                 "session_refs_issue"),
+                "(week_start, src_node_id, dst_node_id, edge_type, traversal) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (week, f"issue:{issue_node_id}", session_node_id,
+                 "issue_has_session", "own"),
             )
             # Issue closed two weeks before week_start — past-shipped
             conn.execute(
@@ -599,9 +599,9 @@ class TestRootEligibilityWindow:
             )
             conn.execute(
                 "INSERT INTO graph_edges "
-                "(week_start, src_node_id, dst_node_id, edge_type) "
-                "VALUES (?, ?, ?, ?)",
-                (week, pr_node_id, issue_node_id, "pr_closes_issue"),
+                "(week_start, src_node_id, dst_node_id, edge_type, traversal) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (week, issue_node_id, pr_node_id, "issue_has_pr", "own"),
             )
             conn.execute(
                 "INSERT INTO issues "
@@ -756,9 +756,9 @@ class TestIssue68TwoIssueFixture:
             f"Expected issue:{TWO_ISSUE_REPO}#312 as a unit root, got: {root_ids}"
         )
 
-    def test_session_refs_pr_bridges_session_to_prs(self, tmp_path):
-        """AS-3: session_refs_pr / session_on_pr edges keep the session in
-        the same component as both PRs #306 and #313."""
+    def test_pr_session_edges_bridge_session_to_prs(self, tmp_path):
+        """Epic #93: pr_refs_session / pr_has_session edges (PR → session,
+        traversal='own') keep the session in the same component as the PRs."""
         from synthesis.graph_builder import build_graph
 
         sess_db, gh_db = _ingest_fixture(tmp_path, TWO_ISSUE_FIXTURE)
@@ -768,18 +768,19 @@ class TestIssue68TwoIssueFixture:
         try:
             pr_edges = conn.execute(
                 "SELECT src_node_id, dst_node_id, edge_type FROM graph_edges "
-                "WHERE edge_type IN ('session_refs_pr', 'session_on_pr') "
-                "AND week_start = ?",
+                "WHERE edge_type IN ('pr_refs_session', 'pr_has_session') "
+                "AND week_start = ? AND traversal = 'own'",
                 (TWO_ISSUE_WEEK,),
             ).fetchall()
         finally:
             conn.close()
 
-        pr_dsts = {dst for _, dst, _ in pr_edges}
-        assert f"pr:{TWO_ISSUE_REPO}#306" in pr_dsts or any(
-            src == f"session:{TWO_ISSUE_SESSION_UUID}" for src, _, _ in pr_edges
+        pr_srcs = {src for src, _, _ in pr_edges}
+        sess_dsts = {dst for _, dst, _ in pr_edges}
+        assert f"pr:{TWO_ISSUE_REPO}#306" in pr_srcs or (
+            f"session:{TWO_ISSUE_SESSION_UUID}" in sess_dsts
         ), (
-            "Expected session↔PR edges bridging the session to PR #306 (AS-3). "
+            "Expected PR↔session edges bridging the session to PR #306. "
             f"PR edges found: {pr_edges}"
         )
 
@@ -1090,21 +1091,21 @@ def _seed_status_fixture(
                  "2025-01-08T10:00:00Z"),
             )
             nodes.append(pr_node_id)
-            # Add pr_closes_issue edge if requested
+            # Add issue_has_pr edge if requested (Epic #93: issue→PR inversion)
             if has_pr_closes_issue_edge:
                 conn.execute(
                     "INSERT INTO graph_edges "
-                    "(week_start, src_node_id, dst_node_id, edge_type) "
-                    "VALUES (?, ?, ?, ?)",
-                    (week, pr_node_id, issue_node_id, "pr_closes_issue"),
+                    "(week_start, src_node_id, dst_node_id, edge_type, traversal) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (week, issue_node_id, pr_node_id, "issue_has_pr", "own"),
                 )
-            # Always connect PR to issue with a generic edge so they end up
-            # in the same component
+            # Always connect PR to issue with a generic ownership edge so
+            # union-find puts them in the same component.
             conn.execute(
                 "INSERT OR IGNORE INTO graph_edges "
-                "(week_start, src_node_id, dst_node_id, edge_type) "
-                "VALUES (?, ?, ?, ?)",
-                (week, pr_node_id, issue_node_id, "closes"),
+                "(week_start, src_node_id, dst_node_id, edge_type, traversal) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (week, issue_node_id, pr_node_id, "closes", "own"),
             )
 
         conn.commit()

@@ -266,10 +266,15 @@ def compute_flags(
             else:
                 nodes[nid] = created_at
 
+        # Epic #93 / Slice 2: walk only ownership ('own') edges. The
+        # adjacency is symmetric (we add both directions below) for the
+        # latest-activity propagation, but the *set* of edges considered is
+        # restricted to ownership so cross-references can't pull stale
+        # timestamps in across unrelated units.
         adj: dict[str, set[str]] = {}
         for src, dst in conn.execute(
             "SELECT src_node_id, dst_node_id FROM graph_edges "
-            "WHERE week_start = ?",
+            "WHERE week_start = ? AND traversal = 'own'",
             (week_start,),
         ).fetchall():
             adj.setdefault(src, set()).add(dst)

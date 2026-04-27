@@ -350,6 +350,229 @@ class CoverageReport:
         return json.dumps(d, sort_keys=True, indent=2, ensure_ascii=False)
 
 
+# ---------------------------------------------------------------------------
+# Graph coverage diagnostic (Epic #93 — Slice 4 / Issue #105)
+# ---------------------------------------------------------------------------
+#
+# Read-only diagnostic over ``github.db``'s ``graph_nodes`` / ``graph_edges``
+# tables. Reports two ratios per ``week_start``:
+#
+#   1. ``session_reachability_ratio`` — fraction of session nodes reachable
+#      from any issue or PR root via ``traversal='own'`` edges. The filter
+#      MUST match the BFS walker filter introduced in Slice 2 — a different
+#      filter would measure a different graph than the walkers walk and is
+#      meaningless. The early-warning purpose: a future BFS walker added
+#      without the ``traversal`` filter silently re-introduces spurious
+#      merges; this diagnostic surfaces the orphan ratio creeping back up.
+#
+#   2. ``issue_linkage_ratio`` — fraction of issue nodes with at least one
+#      outgoing ``issue_has_session`` or ``issue_refs_session`` edge
+#      (``traversal='own'``). This is the linkage coverage acceptance bar
+#      from intent Section 6: ≥90% per week.
+#
+# STRONG invariant: this lives in ``synthesis/coverage.py`` and NOT in
+# ``am_i_shipping/health_check.py``. ``health_check.py`` stays staleness-only.
+
+
+_OWN_LINKAGE_EDGE_TYPES = ("issue_has_session", "issue_refs_session")
+
+
+@dataclass
+class GraphWeekRow:
+    """Per-week graph coverage row.
+
+    ``session_reachability_ratio`` and ``issue_linkage_ratio`` are ``None``
+    when the denominator is zero — the report explicitly distinguishes
+    "no data" from "0% reachability" (acceptance Scenario 6).
+    """
+
+    week_start: str
+    total_session_nodes: int = 0
+    reachable_session_nodes: int = 0
+    session_reachability_ratio: Optional[float] = None
+    total_issue_nodes: int = 0
+    issues_with_linked_session: int = 0
+    issue_linkage_ratio: Optional[float] = None
+
+
+@dataclass
+class GraphCoverageReport:
+    weeks: List[GraphWeekRow] = field(default_factory=list)
+
+    def to_json(self) -> str:
+        """Deterministic JSON serialization (weeks sorted by week_start)."""
+        d = {"weeks": [asdict(w) for w in sorted(self.weeks, key=lambda r: r.week_start)]}
+        return json.dumps(d, sort_keys=True, indent=2, ensure_ascii=False)
+
+
+def _ratio(num: int, den: int) -> Optional[float]:
+    if den <= 0:
+        return None
+    return num / den
+
+
+def collect_graph_coverage(
+    github_db: Path,
+    *,
+    week_start: Optional[str] = None,
+) -> GraphCoverageReport:
+    """Read ``github.db`` and return per-week graph coverage ratios.
+
+    Pure / read-only. No writes to any table. When ``week_start`` is set,
+    only that week is reported. When ``None``, every week appearing in
+    ``graph_nodes`` is reported (sorted ascending by ``week_start``).
+
+    Reachability is computed by a recursive CTE over ``graph_edges`` filtered
+    by ``traversal='own'``. The seed set is every issue or PR node for the
+    week. Reachable session nodes are counted by intersecting the closure
+    with ``graph_nodes`` rows of type ``session``.
+    """
+    report = GraphCoverageReport()
+    if not github_db.exists():
+        return report
+
+    conn = sqlite3.connect(str(github_db))
+    try:
+        # ---- Week list ----
+        if week_start is not None:
+            weeks = [week_start]
+        else:
+            try:
+                weeks = [
+                    row[0] for row in conn.execute(
+                        "SELECT DISTINCT week_start FROM graph_nodes "
+                        "ORDER BY week_start ASC"
+                    ).fetchall()
+                ]
+            except sqlite3.OperationalError:
+                # graph_nodes table missing — empty report.
+                return report
+
+        for wk in weeks:
+            row = _collect_week(conn, wk)
+            report.weeks.append(row)
+    finally:
+        conn.close()
+    return report
+
+
+def _collect_week(conn: sqlite3.Connection, wk: str) -> GraphWeekRow:
+    """Compute one ``GraphWeekRow`` from an open connection."""
+    # ---- Total session nodes ----
+    try:
+        total_session_nodes = conn.execute(
+            "SELECT COUNT(*) FROM graph_nodes "
+            "WHERE week_start = ? AND node_type = 'session'",
+            (wk,),
+        ).fetchone()[0]
+        total_issue_nodes = conn.execute(
+            "SELECT COUNT(*) FROM graph_nodes "
+            "WHERE week_start = ? AND node_type = 'issue'",
+            (wk,),
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        return GraphWeekRow(week_start=wk)
+
+    # ---- Reachable session nodes ----
+    # Recursive CTE: seed = all issue/PR nodes for the week; expand along
+    # ``traversal='own'`` edges. Filter ``graph_nodes`` to the same week so
+    # multi-week DBs don't cross-pollinate. SQLite supports recursive CTEs.
+    try:
+        reachable_session_nodes = conn.execute(
+            """
+            WITH RECURSIVE
+              seed(node_id) AS (
+                SELECT node_id FROM graph_nodes
+                 WHERE week_start = ?
+                   AND node_type IN ('issue', 'pr')
+              ),
+              reach(node_id) AS (
+                SELECT node_id FROM seed
+                UNION
+                SELECT e.dst_node_id
+                  FROM graph_edges e
+                  JOIN reach r ON e.src_node_id = r.node_id
+                 WHERE e.week_start = ?
+                   AND e.traversal = 'own'
+              )
+            SELECT COUNT(*) FROM reach r
+              JOIN graph_nodes n
+                ON n.week_start = ? AND n.node_id = r.node_id
+             WHERE n.node_type = 'session'
+            """,
+            (wk, wk, wk),
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        reachable_session_nodes = 0
+
+    # ---- Issues with at least one linked session ----
+    placeholders = ",".join("?" for _ in _OWN_LINKAGE_EDGE_TYPES)
+    try:
+        issues_with_linked_session = conn.execute(
+            f"""
+            SELECT COUNT(*) FROM (
+                SELECT DISTINCT e.src_node_id
+                  FROM graph_edges e
+                  JOIN graph_nodes n
+                    ON n.week_start = e.week_start AND n.node_id = e.src_node_id
+                 WHERE e.week_start = ?
+                   AND e.traversal = 'own'
+                   AND e.edge_type IN ({placeholders})
+                   AND n.node_type = 'issue'
+            )
+            """,
+            (wk, *_OWN_LINKAGE_EDGE_TYPES),
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        issues_with_linked_session = 0
+
+    return GraphWeekRow(
+        week_start=wk,
+        total_session_nodes=total_session_nodes,
+        reachable_session_nodes=reachable_session_nodes,
+        session_reachability_ratio=_ratio(reachable_session_nodes, total_session_nodes),
+        total_issue_nodes=total_issue_nodes,
+        issues_with_linked_session=issues_with_linked_session,
+        issue_linkage_ratio=_ratio(issues_with_linked_session, total_issue_nodes),
+    )
+
+
+def format_graph_text(report: GraphCoverageReport) -> str:
+    """Human-readable per-week graph coverage table."""
+    lines: List[str] = []
+    title = "Graph coverage diagnostic — graph_nodes × graph_edges (traversal='own')"
+    lines.append(title)
+    lines.append("=" * len(title))
+    if not report.weeks:
+        lines.append("  (no data)")
+        return "\n".join(lines) + "\n"
+
+    header = (
+        "Per week (ratios use traversal='own' filter — matches BFS walkers)"
+    )
+    lines.append(header)
+    lines.append("-" * len(header))
+    for row in sorted(report.weeks, key=lambda r: r.week_start):
+        sr = (
+            f"{row.session_reachability_ratio:.2f}"
+            if row.session_reachability_ratio is not None
+            else "n/a"
+        )
+        il = (
+            f"{row.issue_linkage_ratio:.2f}"
+            if row.issue_linkage_ratio is not None
+            else "n/a"
+        )
+        lines.append(
+            f"  {row.week_start}: "
+            f"session_reachability={sr} "
+            f"({row.reachable_session_nodes}/{row.total_session_nodes})   "
+            f"issue_linkage={il} "
+            f"({row.issues_with_linked_session}/{row.total_issue_nodes})"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def _bump(bucket: Dict[str, Dict[str, int]], key: str, fill: str) -> None:
     row = bucket.setdefault(
         key,
@@ -701,6 +924,30 @@ def backfill_full(
 # ---------------------------------------------------------------------------
 
 
+def run_graph_coverage(
+    *,
+    github_db: Path,
+    week: Optional[str] = None,
+    emit_json: bool = False,
+    stdout=None,
+    stderr=None,
+) -> int:
+    """Dispatch ``am-synthesize coverage --graph``. Read-only.
+
+    When ``week`` is ``None`` every week in ``graph_nodes`` is reported.
+    """
+    if stdout is None:
+        stdout = sys.stdout
+    if stderr is None:
+        stderr = sys.stderr
+    report = collect_graph_coverage(github_db, week_start=week)
+    if emit_json:
+        stdout.write(report.to_json() + "\n")
+    else:
+        stdout.write(format_graph_text(report))
+    return 0
+
+
 def run_coverage(
     *,
     sessions_db: Path,
@@ -710,6 +957,9 @@ def run_coverage(
     emit_json: bool = False,
     do_backfill: bool = False,
     full_rebuild: bool = False,
+    graph_mode: bool = False,
+    github_db: Optional[Path] = None,
+    week: Optional[str] = None,
     stdout=None,
     stderr=None,
 ) -> int:
@@ -729,6 +979,21 @@ def run_coverage(
         stdout = sys.stdout
     if stderr is None:
         stderr = sys.stderr
+    if graph_mode:
+        if do_backfill or full_rebuild:
+            print("--graph cannot be combined with --backfill/--full", file=stderr)
+            return 2
+        if github_db is None:
+            print("--graph requires github_db path", file=stderr)
+            return 2
+        return run_graph_coverage(
+            github_db=github_db,
+            week=week,
+            emit_json=emit_json,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
     if full_rebuild and not do_backfill:
         print("--full requires --backfill", file=stderr)
         return 2
@@ -792,6 +1057,23 @@ def add_coverage_subparser(subparsers: argparse._SubParsersAction) -> None:
             "With --backfill: re-parse every JSONL on disk and overwrite "
             "the matching DB row's columns in place (atomic per session, "
             "via ON CONFLICT DO UPDATE). Orphan rows are preserved."
+        ),
+    )
+    p.add_argument(
+        "--graph", dest="graph_mode", action="store_true",
+        help=(
+            "Graph coverage mode (Epic #93 / Issue #105). Read-only "
+            "diagnostic over github.db's graph_nodes/graph_edges tables. "
+            "Reports per-week session-reachability and issue-linkage ratios "
+            "computed under the traversal='own' filter that matches the BFS "
+            "walkers. Mutually exclusive with --backfill/--full."
+        ),
+    )
+    p.add_argument(
+        "--week", default=None,
+        help=(
+            "With --graph: restrict the report to a single week_start "
+            "(YYYY-MM-DD). Default: every week in graph_nodes."
         ),
     )
     p.add_argument(

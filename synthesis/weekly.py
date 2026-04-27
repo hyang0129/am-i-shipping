@@ -378,10 +378,12 @@ def _unit_nodes(
             (week_start,),
         ).fetchall()
     }
+    # Epic #93 / Slice 2: walk only ownership ('own') edges so unit-node
+    # composition mirrors union-find component membership exactly.
     adj: dict[str, set[str]] = {}
     for src, dst in github_conn.execute(
         "SELECT src_node_id, dst_node_id FROM graph_edges "
-        "WHERE week_start = ?",
+        "WHERE week_start = ? AND traversal = 'own'",
         (week_start,),
     ).fetchall():
         adj.setdefault(src, set()).add(dst)
