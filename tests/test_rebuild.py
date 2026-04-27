@@ -342,3 +342,91 @@ class TestCli:
             ).fetchone()[0]
         assert n_extra == 0, "extra week was rebuilt despite --week filter"
         assert n_main > 0, "filtered week was not rebuilt"
+
+
+# ---------------------------------------------------------------------------
+# Issue #111 — backfill regression: rebuild re-parses sessions for pr-link
+# ---------------------------------------------------------------------------
+
+PR_LINK_FIXTURE = Path(__file__).parent / "fixtures" / "pr_link_session.jsonl"
+
+
+class TestRebuildPrLinkBackfill:
+    """Verify that rebuild_history calls backfill_full and populates pr_sessions.
+
+    Uses a real JSONL fixture containing pr-link entries.  The test seeds
+    sessions.db and github.db from the golden SQLite fixture (which has no
+    pr_sessions rows for the test session), then runs rebuild_history with
+    projects_path pointing at a temp directory containing the pr-link JSONL.
+    After rebuild, pr_sessions must contain the expected row.
+    """
+
+    def _setup_projects_dir(self, tmp_path: Path) -> Path:
+        """Create a minimal projects_path structure with the pr-link fixture."""
+        # backfill_full uses _build_uuid_index which walks projects_path for
+        # <sessionId>/<sessionId>.jsonl or similar patterns.  Mirror the
+        # directory structure that Claude Code uses: each project is a dir,
+        # each session is a JSONL file named <uuid>.jsonl.
+        session_uuid = "test-pr-link-uuid"
+        project_dir = tmp_path / "projects" / "test-project"
+        project_dir.mkdir(parents=True)
+        dest = project_dir / f"{session_uuid}.jsonl"
+        shutil.copy(PR_LINK_FIXTURE, dest)
+        return tmp_path / "projects"
+
+    def test_rebuild_populates_pr_sessions_from_pr_link_fixture(
+        self, tmp_path: Path
+    ) -> None:
+        """After rebuild_history with projects_path, pr_sessions has the expected row."""
+        from am_i_shipping.db import init_github_db, init_sessions_db
+        from synthesis.rebuild import GITHUB_DROP_TABLES, rebuild_history
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        gh_db = data_dir / "github.db"
+        sess_db = data_dir / "sessions.db"
+        exp_db = data_dir / "expectations.db"
+
+        # Seed DBs from the golden fixture (has graph_nodes so weeks are known).
+        shutil.copy(FIXTURE_SRC, gh_db)
+        shutil.copy(FIXTURE_SRC, sess_db)
+        init_expectations_db(exp_db)
+
+        projects_path = self._setup_projects_dir(tmp_path)
+
+        rebuild_history(
+            gh_db,
+            sess_db,
+            exp_db,
+            projects_path=projects_path,
+            abandonment_days=14,
+            outlier_sigma=2.0,
+        )
+
+        conn = sqlite3.connect(str(gh_db))
+        try:
+            rows = conn.execute(
+                "SELECT repo, pr_number, session_uuid FROM pr_sessions "
+                "WHERE session_uuid = 'test-pr-link-uuid'",
+            ).fetchall()
+        finally:
+            conn.close()
+
+        assert len(rows) == 1, (
+            f"Expected 1 pr_sessions row for test-pr-link-uuid after rebuild, got {rows}"
+        )
+        repo, pr_number, session_uuid = rows[0]
+        assert repo == "hyang0129/am-i-shipping"
+        assert pr_number == 130
+        assert session_uuid == "test-pr-link-uuid"
+
+    def test_github_drop_tables_includes_session_keyed_tables(self) -> None:
+        """GITHUB_DROP_TABLES must include session_gh_events and pr_sessions (Issue #111)."""
+        from synthesis.rebuild import GITHUB_DROP_TABLES
+
+        assert "session_gh_events" in GITHUB_DROP_TABLES, (
+            "session_gh_events must be in GITHUB_DROP_TABLES so rebuild re-populates it"
+        )
+        assert "pr_sessions" in GITHUB_DROP_TABLES, (
+            "pr_sessions must be in GITHUB_DROP_TABLES so rebuild re-populates it"
+        )

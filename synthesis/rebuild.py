@@ -61,6 +61,13 @@ GITHUB_DROP_TABLES: tuple[str, ...] = (
     "session_issue_attribution",
     "graph_edges",
     "graph_nodes",
+    # Issue #111: session-keyed linkage tables must be rebuilt when the
+    # session parser gains new event-type support (e.g. pr-link).  Dropping
+    # them here causes the backfill_full call (below) to re-populate them
+    # from the JSONLs on disk, recovering any previously-missing pr_sessions
+    # rows without requiring a separate migration step.
+    "session_gh_events",
+    "pr_sessions",
 )
 
 EXPECTATIONS_DROP_TABLES: tuple[str, ...] = (
@@ -190,6 +197,7 @@ def rebuild_history(
     sessions_db: Path,
     expectations_db: Path,
     *,
+    projects_path: Optional[Path] = None,
     abandonment_days: int,
     outlier_sigma: float,
     backup_dir: Optional[Path] = None,
@@ -201,6 +209,14 @@ def rebuild_history(
     ----------
     github_db, sessions_db, expectations_db:
         Filesystem paths to the three DBs.
+    projects_path:
+        Root directory of Claude Code session JSONLs (same as
+        ``config.session.projects_path``).  When provided, ``backfill_full``
+        is called before ``build_graph`` so that newly-supported JSONL event
+        types (e.g. ``pr-link``) are re-parsed from every session on disk
+        and the freshly-dropped ``session_gh_events`` / ``pr_sessions``
+        tables are repopulated.  If ``None``, the backfill step is skipped
+        (the existing ``sessions.db`` rows drive the rebuild as before).
     abandonment_days, outlier_sigma:
         Forwarded to ``compute_flags`` (matches ``am-prepare-week``
         behaviour exactly so consumers see no semantic drift in
@@ -276,6 +292,31 @@ def rebuild_history(
         # ``traversal`` column migration on legacy DBs).
         init_github_db(github_db)
         init_expectations_db(expectations_db)
+
+        # Issue #111: re-parse all sessions so newly-supported event types
+        # (pr-link) populate the freshly-dropped session_gh_events /
+        # pr_sessions tables.  backfill_full is atomic per-session (upsert
+        # semantics) and has no max_files_per_run cap — preferred over
+        # delete-sessions + run_batch (ADR Decision 1).
+        if projects_path is not None:
+            from synthesis.coverage import backfill_full  # avoid circular at module level
+
+            logger.info(
+                "Issue #111 backfill: re-parsing all sessions via backfill_full "
+                "(projects_path=%s)",
+                projects_path,
+            )
+            bf_summary = backfill_full(
+                sessions_db,
+                projects_path,
+                data_dir=github_db.parent,
+            )
+            logger.info(
+                "backfill_full complete: reingested=%d errored=%d orphans_preserved=%d",
+                bf_summary.reingested,
+                bf_summary.errored,
+                bf_summary.orphans_preserved,
+            )
 
         for idx, week in enumerate(resolved_weeks, start=1):
             logger.info(
@@ -381,6 +422,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             github_db,
             sessions_db,
             expectations_db,
+            projects_path=Path(config.session.projects_path),
             abandonment_days=synthesis_cfg.abandonment_days,
             outlier_sigma=synthesis_cfg.outlier_sigma,
             backup_dir=backup_dir,

@@ -149,6 +149,23 @@ def upsert_session(
                         ev.get("created_at"),
                     ),
                 )
+                # Issue #111: for pr-link events, also write the graph-linkage row
+                # directly into pr_sessions.  The INSERT OR IGNORE on the PK
+                # (repo, pr_number, session_uuid) provides idempotency — repeated
+                # pr-link entries in the same JSONL (observed up to 3×) collapse to
+                # one row after the deduplication in parse_session, but even if
+                # called multiple times the write is safe.
+                if ev["event_type"] == "pr_link":
+                    gh_conn.execute(
+                        "INSERT OR IGNORE INTO pr_sessions "
+                        "(repo, pr_number, session_uuid) "
+                        "VALUES (?, ?, ?)",
+                        (
+                            ev["repo"],
+                            int(ev["ref"]),
+                            record.session_uuid,
+                        ),
+                    )
             # Issue #86: skill invocations. Use INSERT OR REPLACE so re-parsing
             # an already-ingested session overwrites rather than leaves stale
             # target_repo/target_ref in place.
